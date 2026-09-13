@@ -173,6 +173,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Kept separate from supports_explicit_spec_verify_replay_update() so the
   // two capabilities can diverge for future targets.
   bool requires_uniform_validate_width() const;
+  // A DCP block-table entry covers one logical KV page per KV split. All
+  // speculative cache-slot and expanded-attention metadata must use this
+  // logical size rather than the per-rank physical allocator block size.
+  int32_t logical_block_size() const;
   int64_t spec_verify_block_table_width(
       const torch::Tensor& block_tables) const;
   // Returns true when validation must use chunked-prefill to avoid the
@@ -237,6 +241,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
     std::vector<int32_t> dp_global_token_nums;
+    std::vector<int32_t> dp_global_sequence_nums;
     std::vector<int32_t> raw_dp_global_token_nums;
     std::vector<uint64_t> dp_global_batch_generations;
     std::optional<ForwardOutput> output;

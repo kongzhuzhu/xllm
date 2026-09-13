@@ -238,7 +238,29 @@ TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
       py::arg("page_size") = kBlockSize, py::arg("is_mla") = false);
 
   ModelInputParams params;
+  // MTP may rewrite num_sequences to execution rows. The Python graph limit
+  // must use the original requests, including a truly empty peer rank.
+  params.meta.num_sequences = 6;
+  params.parallel.dp_global_token_nums = {6, 0};
+  params.parallel.dp_global_sequence_nums = {3, 0};
+  params.parallel = params.parallel.to(torch::Device(torch::kCPU));
   py::object py_metadata = py::cast(PyAttentionMetadataView(metadata, params));
+  EXPECT_EQ(
+      py_metadata.attr("dp_global_sequence_nums").cast<std::vector<int32_t>>(),
+      (std::vector<int32_t>{3, 0}));
+  EXPECT_EQ(py_metadata.attr("dp_execution_token_counts")
+                .cast<std::vector<int32_t>>(),
+            (std::vector<int32_t>{6, 1}));
+  runner.attr("dp_size") = 2;
+  runner.attr("num_decoding_tokens") = 1;
+  runner.attr("dp_rank") = 0;
+  EXPECT_EQ(runner.attr("_decode_batch_sizes")(torch::arange(6), py_metadata)
+                .cast<std::vector<int32_t>>(),
+            (std::vector<int32_t>{3, 3}));
+  runner.attr("dp_rank") = 1;
+  EXPECT_EQ(runner.attr("_decode_batch_sizes")(torch::arange(1), py_metadata)
+                .cast<std::vector<int32_t>>(),
+            (std::vector<int32_t>{0, 3}));
   py::tuple selected = runner.attr("_decode_metadata")(py_metadata);
 
   EXPECT_TRUE(torch::equal(selected[0].cast<torch::Tensor>(),

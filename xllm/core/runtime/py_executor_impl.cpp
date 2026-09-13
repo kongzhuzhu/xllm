@@ -119,9 +119,18 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   ensure_xllm_runtime_module();
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
+  // These values belong to the executor, not the checkpoint. In particular,
+  // the MTP draft has different speculative options from its target.
+  py::dict executor_config = py_causal_lm_->config_dict().attr("copy")();
+  executor_config["enable_disagg_pd"] = options_.enable_disagg_pd();
+  executor_config["instance_role"] = options_.instance_role().to_string();
+  executor_config["task_type"] = options_.task_type();
+  executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  executor_config["speculative_algorithm"] = options_.speculative_algorithm();
+  executor_config["is_draft_engine"] = options_.is_draft_engine();
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
-      py_causal_lm_->config_dict(),
+      executor_config,
       options_.max_seqs_per_batch(),
       options_.num_decoding_tokens(),
       ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());

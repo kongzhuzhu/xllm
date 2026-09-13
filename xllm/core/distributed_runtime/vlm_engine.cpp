@@ -521,6 +521,7 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   batched_inputs.reserve(dp_size_);
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
+  std::vector<int32_t> dp_global_sequence_nums(dp_size_);
   std::vector<int32_t> dp_global_kv_max_seq_lens(dp_size_);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
@@ -541,6 +542,8 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     }
     dp_global_token_nums[dp_rank] =
         static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
+    dp_global_sequence_nums[dp_rank] =
+        batched_inputs[dp_rank].input_params.meta.num_sequences;
     dp_global_kv_max_seq_lens[dp_rank] =
         batched_inputs[dp_rank].input_params.meta.kv_max_seq_len;
     if (batch_forward_type.is_empty() &&
@@ -571,6 +574,8 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
     batched_inputs[dp_rank].input_params.parallel.dp_global_token_nums =
         dp_global_token_nums;
+    batched_inputs[dp_rank].input_params.parallel.dp_global_sequence_nums =
+        dp_global_sequence_nums;
     batched_inputs[dp_rank].input_params.parallel.raw_dp_global_token_nums =
         dp_global_token_nums;
     batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =

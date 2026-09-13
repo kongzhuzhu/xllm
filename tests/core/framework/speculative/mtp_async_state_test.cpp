@@ -34,7 +34,7 @@ TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
       {"qwen3_next", TargetSpecVerifyMode::GENERIC},
       {"qwen3_5_mtp", TargetSpecVerifyMode::GENERIC},
       {"qwen3_5_moe_mtp", TargetSpecVerifyMode::GENERIC},
-      {"glm_moe_dsa", TargetSpecVerifyMode::GENERIC},
+      {"glm_moe_dsa", TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY},
       {"mimo_mtp", TargetSpecVerifyMode::GENERIC},
       {"unknown_model", TargetSpecVerifyMode::GENERIC},
   };

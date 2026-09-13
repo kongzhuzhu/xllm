@@ -498,6 +498,12 @@ size_t Sequence::num_valid_tokens() const {
   return 0;
 }
 
+size_t Sequence::num_valid_generated_tokens() const {
+  const size_t valid_tokens = num_valid_tokens();
+  return valid_tokens > num_prompt_tokens_ ? valid_tokens - num_prompt_tokens_
+                                           : 0;
+}
+
 std::optional<SequenceOutput> Sequence::generate_streaming_output(
     size_t /*size*/,
     const Tokenizer& tokenizer) {

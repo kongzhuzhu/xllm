@@ -32,17 +32,39 @@ from xllm.python.platform import current_platform
 
 
 def _resolve_graph_backend(config: dict) -> str:
-    if config.get("model_type") == "glm_moe_dsa_mtp":
-        # Cross-draft DSA top-k state is row-selected by the C++ scheduler and
-        # changes between MTP steps. Keep this model eager until ACL Graph owns
-        # that additional dynamic input/output contract.
-        return "off"
     graph_backend = str(config.get("python_graph_backend", "off")).lower()
     graph_disabled = graph_backend in ("", "off", "none", "0")
     if graph_disabled and config.get("enable_graph", False):
         if current_platform.is_npu():
             return "aclgraph"
     return graph_backend
+
+
+def _validate_npu_cp_model_config(config: dict, num_decoding_tokens: int) -> None:
+    """Mirror model-side CP admission for callers without the C++ master."""
+    model_type = config.get("model_type", "")
+    if model_type not in ("qwen3", "glm_moe_dsa"):
+        raise NotImplementedError(
+            f"Python model-side CP does not support model_type={model_type!r}; "
+            "supported models are qwen3 and glm_moe_dsa"
+        )
+    if config.get("task_type", "generate") != "generate":
+        raise NotImplementedError("Python model-side CP supports only the generate task")
+    role = config.get("instance_role", "DEFAULT")
+    if role not in ("DEFAULT", "PREFILL"):
+        raise NotImplementedError("Python model-side CP supports only DEFAULT or PREFILL roles")
+    speculative = int(config.get("num_speculative_tokens", 0)) > 0 or num_decoding_tokens > 1
+    algorithm = str(config.get("speculative_algorithm", "mtp")).lower()
+    if speculative and algorithm in ("eagle3", "dflash", "dflash2", "dspark"):
+        raise NotImplementedError("Python model-side CP does not support aux-hidden-capture speculative algorithms")
+    if model_type == "glm_moe_dsa" and speculative and algorithm == "mtp":
+        raise NotImplementedError("Python model-side CP does not support MTP speculative verification; use cp_size=1")
+    kv_split = int(config.get("kv_split_size", 0)) or int(config["cp_size"])
+    if model_type == "glm_moe_dsa" and kv_split > 1:
+        if not config.get("enable_disagg_pd", False) or role != "PREFILL":
+            raise NotImplementedError(
+                "Python GLM CP with kv_split_size > 1 requires disaggregated PD with the PREFILL role"
+            )
 
 
 def _create_attention_backend(
@@ -131,6 +153,43 @@ class ModelExecutor:
     ) -> None:
         self.model = model
         self._kv_bound = False
+        cp_size = int(config.get("cp_size", 1))
+        cp_rank = int(config.get("cp_rank", 0))
+        dp_size = int(config.get("dp_size", 1))
+        if cp_size < 1:
+            raise ValueError("cp_size must be greater than or equal to 1")
+        if dp_size < 1:
+            raise ValueError("dp_size must be greater than or equal to 1")
+        if not 0 <= cp_rank < cp_size:
+            raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+        if cp_size > 1 and dp_size > 1:
+            raise NotImplementedError("Python CP requires dp_size == 1")
+        if current_platform.is_npu():
+            kv_split_size = int(config.get("kv_split_size", 0))
+            if kv_split_size < 0:
+                raise ValueError("kv_split_size must be nonnegative; 0 follows cp_size")
+            effective_kv_split = kv_split_size or cp_size
+            if cp_size > 1 and cp_size % effective_kv_split != 0:
+                raise ValueError("Python CP requires effective kv_split_size to be a positive divisor of cp_size")
+            if cp_size == 1 and effective_kv_split > 1 and dp_size > 1:
+                raise NotImplementedError("Python DCP requires dp_size == 1 until DP-local KV groups are implemented")
+        graph_backend = _resolve_graph_backend(config)
+        if (
+            current_platform.is_npu()
+            and config.get("model_type") == "glm_moe_dsa_mtp"
+            and graph_backend not in ("", "off", "none", "0", "aclgraph")
+        ):
+            # Cross-draft top-k and repair rows require the ACL runner's
+            # persistent inputs. Other graph runners cannot retain that state.
+            raise NotImplementedError(f"Python NPU GLM MTP requires graph_backend=off/aclgraph; got '{graph_backend}'")
+        if cp_size > 1 and graph_backend not in ("", "off", "none", "0", "aclgraph"):
+            # Only decode-only ACL graphs preserve CP prefill on EagerRunner.
+            # Match the C++ admission gate before allocating backend state.
+            raise NotImplementedError(
+                f"Context-Parallel requires eager Prefill with graph_backend=off/aclgraph; got '{graph_backend}'"
+            )
+        if current_platform.is_npu() and cp_size > 1:
+            _validate_npu_cp_model_config(config, int(num_decoding_tokens))
 
         attention_layers = [module for module in model.modules() if isinstance(module, Attention)]
         if not attention_layers:
@@ -144,21 +203,28 @@ class ModelExecutor:
 
         first_parameter = next(model.parameters())
         device = first_parameter.device
+        num_decoding_tokens = max(1, int(num_decoding_tokens))
+        # GLM MTP can prepend a repair row after all draft tokens are accepted.
+        # Two requests then need up to four attention rows, even though later
+        # draft steps still decode one token per request.
+        max_decode_rows_per_request = num_decoding_tokens
+        if config.get("model_type") == "glm_moe_dsa_mtp":
+            max_decode_rows_per_request = max(max_decode_rows_per_request, 2)
         self._num_attention_layers = len(attention_layers)
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
             first_parameter.dtype,
             config,
-            max_seqs_per_batch,
+            max(max_seqs_per_batch, 1) * max_decode_rows_per_request,
         )
 
         execution_model = model.model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
         # Context-Parallel: shard prefill sequences across the CP group. Decode
         # stays on the non-CP path (CP is prefill-only, eager-only in v1).
-        self.eager_runner.cp_size = int(config.get("cp_size", 1))
-        self.eager_runner.cp_rank = int(config.get("cp_rank", 0))
+        self.eager_runner.cp_size = cp_size
+        self.eager_runner.cp_rank = cp_rank
         self.layerwise_split_size = int(config.get("layerwise_split_size", 1))
         self.layerwise_split_rank = int(config.get("layerwise_split_rank", 0))
         if self.layerwise_split_size > 1 and config.get("model_type") != "glm_moe_dsa":
@@ -166,13 +232,11 @@ class ModelExecutor:
         self.decode_graph_runner = None
         self.inductor_runner = None
 
-        graph_backend = _resolve_graph_backend(config)
         if self.layerwise_split_size > 1 and graph_backend not in ("", "off", "none", "0"):
             raise NotImplementedError(
                 "Python GLM5.2 layerwise split requires eager execution; "
                 f"graph backend '{graph_backend}' is not supported."
             )
-        dp_size = int(config.get("dp_size", 1))
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
         if dp_size > 1 and graph_backend not in (
@@ -205,17 +269,20 @@ class ModelExecutor:
                 DecodeAclGraphRunner,
             )
 
-            num_decoding_tokens = max(1, int(num_decoding_tokens))
             decode_batch_size_limit = (
                 None if acl_graph_decode_batch_size_limit is None else max(1, int(acl_graph_decode_batch_size_limit))
             )
-            graph_sequence_capacity = max_seqs_per_batch
+            # The configured sequence budget is global, while the decode
+            # limit is per DP rank. Round sequences before expanding MTP rows
+            # so an uneven request split retains every row of the last request.
+            local_graph_sequence_capacity = (max_seqs_per_batch + dp_size - 1) // dp_size
             if decode_batch_size_limit is not None:
-                graph_sequence_capacity = min(
-                    graph_sequence_capacity,
+                local_graph_sequence_capacity = min(
+                    local_graph_sequence_capacity,
                     decode_batch_size_limit,
                 )
-            max_graph_tokens = graph_sequence_capacity * num_decoding_tokens
+            # The runner accepts a global token capacity and divides it by DP.
+            max_graph_tokens = local_graph_sequence_capacity * max_decode_rows_per_request * dp_size
             self.decode_graph_runner = DecodeAclGraphRunner(
                 execution_model,
                 self.attention_backend,
@@ -232,16 +299,6 @@ class ModelExecutor:
                 raise NotImplementedError(
                     "Python layerwise split requires eager execution; graph "
                     f"backend '{graph_backend}' is not supported."
-                )
-            if self.eager_runner.cp_size > 1:
-                # CP is prefill-only and lives on eager_runner; a compile
-                # backend serves prefill through InductorRunner, which carries
-                # no cp_context, so CP would silently no-op. Reject rather than
-                # run without the requested sharding.
-                raise NotImplementedError(
-                    "Context-Parallel (cp_size > 1) is not supported with the "
-                    f"'{graph_backend}' graph backend; CP is eager-only. Use "
-                    "graph_backend=off/aclgraph, or set cp_size=1."
                 )
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
@@ -295,18 +352,28 @@ class ModelExecutor:
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
         graph_runner = self.decode_graph_runner
-        if (
-            mtp_topk_indices is None
-            and graph_runner is not None
-            and graph_runner.can_execute(input_ids, metadata, input_embedding)
-        ):
-            graph_runner.warmup(
+        graph_kwargs = {}
+        if mtp_topk_indices is not None:
+            from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
+
+            if isinstance(graph_runner, DecodeAclGraphRunner):
+                graph_kwargs["mtp_topk_indices"] = mtp_topk_indices
+            else:
+                graph_runner = None
+        if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding, **graph_kwargs):
+            from xllm.python.model_executor.runners.decode_cuda_graph import DecodeCudaGraphRunner
+
+            # CUDA can_execute only admits previously captured buckets. ACL
+            # captures lazily with scheduler metadata and MTP inputs.
+            if not isinstance(graph_runner, DecodeCudaGraphRunner):
+                graph_runner.warmup(input_ids, positions, metadata, input_embedding, **graph_kwargs)
+            return graph_runner.execute(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
+                **graph_kwargs,
             )
-            return graph_runner.execute(input_ids, positions, metadata, input_embedding)
         if mtp_topk_indices is None and self.inductor_runner is not None:
             return self.inductor_runner.execute(
                 input_ids,

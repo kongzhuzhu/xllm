@@ -189,6 +189,8 @@ class Sequence {
   size_t num_generated_tokens() const {
     return num_tokens_ - num_prompt_tokens_;
   }
+  // Generated tokens excluding trailing scheduler placeholders.
+  size_t num_valid_generated_tokens() const;
   Slice<int32_t> tokens() const { return {tokens_, num_tokens_}; }
   // get tokens in kv cache
   Slice<int32_t> cached_tokens() const {

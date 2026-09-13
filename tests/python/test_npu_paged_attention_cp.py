@@ -28,7 +28,7 @@ from xllm.python.attention.npu_paged_attention import (  # noqa: E402
     NpuPagedAttentionBackend,
     _build_stable_sfa_page_layout,
 )
-from xllm.python.model_executor.cp_utils import build_cp_context  # noqa: E402
+from xllm.python.model_executor.cp_utils import build_cp_context, cp_shard_rows  # noqa: E402
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     _StaticAttentionMetadata,
 )
@@ -209,6 +209,45 @@ def test_stable_sfa_layout_handles_multiple_sequences_and_invalid_tail() -> None
         [7, 6, 8],
     ]
     assert layout.page_count == 9
+
+
+@pytest.mark.parametrize(
+    ("query_lengths", "kv_lengths", "cp_size", "cp_rank", "message"),
+    [
+        ([1], [1], 1, 0, "cp_size must be greater than 1"),
+        ([1], [1], 0, 0, "cp_size must be greater than 1"),
+        ([1], [1], 2, -1, "cp_rank must be in"),
+        ([1], [1], 2, 2, "cp_rank must be in"),
+        ([1, 2], [1], 2, 0, "same number of requests"),
+        ([-1], [0], 2, 0, "query length must be nonnegative"),
+        ([3], [2], 2, 0, "KV length must be at least the query length"),
+        ([0], [-1], 2, 0, "KV length must be at least the query length"),
+    ],
+)
+def test_cp_context_rejects_invalid_metadata_before_native_op(
+    query_lengths: list[int],
+    kv_lengths: list[int],
+    cp_size: int,
+    cp_rank: int,
+    message: str,
+) -> None:
+    with patch.object(torch.ops.xllm_ops, "build_cp_context", create=True) as native_op:
+        with pytest.raises(ValueError, match=message):
+            build_cp_context(query_lengths, kv_lengths, cp_size, cp_rank, torch.device("cpu"))
+        native_op.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_empty_query_rank_zeros_padding_even_when_source_row_is_nonfinite(dtype: torch.dtype) -> None:
+    # With one global token and cp_size=2, rank 1 owns only padding. Its
+    # placeholder gather indices still point at the real token on rank 0.
+    context = SimpleNamespace(
+        shard_gather_index=torch.tensor([0, 0], dtype=torch.int64),
+        shard_valid_mask=torch.tensor([False, False]),
+    )
+    hidden = torch.tensor([[float("nan"), float("inf"), -float("inf")]], dtype=dtype)
+    local = cp_shard_rows(hidden, context)
+    torch.testing.assert_close(local, torch.zeros(2, 3, dtype=dtype), rtol=0, atol=0)
 
 
 def test_build_cp_context_materializes_mla_segment_lengths_on_device() -> None:

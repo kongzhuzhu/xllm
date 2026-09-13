@@ -852,6 +852,10 @@ struct MultiModalInput {
 struct ParallelInput {
   // num tokens of all workers, mainly used for dp case
   std::vector<int32_t> dp_global_token_nums;
+  // Logical sequence counts before speculative/MTP rows are expanded. This
+  // remains stable when one request contributes a repair row and token counts
+  // are scaled for graph/collective execution.
+  std::vector<int32_t> dp_global_sequence_nums;
   // Original DP token counts before empty ranks are padded to one fake token.
   // Attention/FFN paths may need the padded counts, while lm_head output
   // compaction must skip true empty DP ranks.
@@ -885,6 +889,7 @@ struct ParallelInput {
   ParallelInput to(const torch::Device& device) const {
     ParallelInput out;
     out.dp_global_token_nums = dp_global_token_nums;
+    out.dp_global_sequence_nums = dp_global_sequence_nums;
     out.raw_dp_global_token_nums = raw_dp_global_token_nums;
     out.dp_global_batch_generations = dp_global_batch_generations;
     out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;

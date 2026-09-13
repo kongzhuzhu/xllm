@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from operator import index
 
 import torch
 
@@ -122,6 +123,24 @@ def build_cp_context(
     path); this wrapper just packs the returned tensors into a ``CpContext``.
     Returns index tensors on ``device``.
     """
+    # Reject malformed host plans before the native builder can terminate a
+    # worker with CHECK, or any backend can enter a CP collective.
+    cp_size = index(cp_size)
+    cp_rank = index(cp_rank)
+    if cp_size <= 1:
+        raise ValueError("CP context cp_size must be greater than 1")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"CP context cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if len(q_seq_lens) != len(kv_seq_lens):
+        raise ValueError("CP query and KV lengths must describe the same number of requests")
+    query_lengths = [index(length) for length in q_seq_lens]
+    kv_lengths = [index(length) for length in kv_seq_lens]
+    for request_id, (query_length, kv_length) in enumerate(zip(query_lengths, kv_lengths, strict=True)):
+        if query_length < 0:
+            raise ValueError(f"CP request {request_id}: query length must be nonnegative")
+        if kv_length < query_length:
+            raise ValueError(f"CP request {request_id}: KV length must be at least the query length")
+
     (
         shard_index,
         shard_gather_index,
@@ -135,8 +154,8 @@ def build_cp_context(
         segment_kv_seq_lens,
         total_local,
     ) = torch.ops.xllm_ops.build_cp_context(
-        [int(length) for length in q_seq_lens],
-        [int(length) for length in kv_seq_lens],
+        query_lengths,
+        kv_lengths,
         cp_size,
         cp_rank,
         device,
@@ -162,7 +181,7 @@ def build_cp_context(
             dtype=torch.int32,
             device=device,
         ),
-        has_prefix=any(kv != q for q, kv in zip(q_seq_lens, kv_seq_lens, strict=True)),
+        has_prefix=any(kv != q for q, kv in zip(query_lengths, kv_lengths, strict=True)),
     )
 
 
@@ -172,11 +191,12 @@ def cp_shard_rows(x: torch.Tensor, ctx: CpContext) -> torch.Tensor:
     Padding rows are zeroed. Returns ``[total_local, ...]``.
     """
     local = x.index_select(0, ctx.shard_gather_index)
-    # Always apply the mask (matching cp_shard_positions). Guarding on
+    # Always apply the mask. Guarding on
     # ``bool(mask.all())`` would force a device->host sync on the prefill
-    # critical path; the elementwise multiply is cheap and graph-safe.
+    # critical path. Multiplication cannot clear a nonfinite gathered row:
+    # NaN * 0 and Inf * 0 remain NaN on a rank owning only padding.
     mask_shape = [ctx.shard_valid_mask.shape[0]] + [1] * (x.dim() - 1)
-    return local * ctx.shard_valid_mask.view(mask_shape).to(local.dtype)
+    return local.masked_fill(~ctx.shard_valid_mask.view(mask_shape), 0)
 
 
 def cp_shard_positions(positions: torch.Tensor, ctx: CpContext) -> torch.Tensor:

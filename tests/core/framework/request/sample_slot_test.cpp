@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "core/framework/config/rec_config.h"
@@ -247,6 +248,61 @@ TEST(RequestTest, GenerateOutputReturnsSequenceFailureStatus) {
   ASSERT_TRUE(output.usage.has_value());
   EXPECT_EQ(output.usage->num_generated_tokens, 0u);
 }
+
+class RequestUsageTest
+    : public ::testing::TestWithParam<std::tuple<bool, int32_t, int32_t>> {};
+
+TEST_P(RequestUsageTest, CountsRealTokensWithoutAssumingAnOverlapPlaceholder) {
+  const bool overlap = std::get<0>(GetParam());
+  const int32_t real_tokens = std::get<1>(GetParam());
+  const int32_t placeholders = std::get<2>(GetParam());
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  RequestState state(
+      "abc",
+      std::vector<int32_t>{1, 'a', 'b', 'c'},
+      sampling_param,
+      SchedulerParam{},
+      stopping_checker,
+      /*seq_capacity=*/16,
+      /*n=*/1,
+      /*best_of=*/1,
+      /*logprobs=*/false,
+      /*stream=*/false,
+      /*echo=*/false,
+      /*skip_special_tokens=*/true,
+      /*enable_schedule_overlap=*/overlap,
+      [](const RequestOutput&) { return true; },
+      OutputsFunc{});
+  Request request("usage-overlap", "", "", std::move(state));
+  Sequence& sequence = *request.sequences().front();
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  for (int32_t i = 0; i < real_tokens; ++i) {
+    sequence.append_token(Token('X'));
+  }
+  for (int32_t i = 0; i < placeholders; ++i) {
+    sequence.append_token(Token(-1));
+  }
+
+  CharTokenizer tokenizer;
+  const RequestOutput output = request.generate_output(tokenizer);
+  ASSERT_TRUE(output.usage.has_value());
+  EXPECT_EQ(output.usage->num_prompt_tokens, 4u);
+  EXPECT_EQ(output.usage->num_generated_tokens, real_tokens);
+  EXPECT_EQ(output.usage->num_total_tokens, 4 + real_tokens);
+  ASSERT_EQ(output.outputs.size(), 1u);
+  EXPECT_EQ(output.outputs.front().text,
+            std::string(static_cast<size_t>(real_tokens), 'X'));
+}
+
+INSTANTIATE_TEST_SUITE_P(OverlapPlaceholders,
+                         RequestUsageTest,
+                         ::testing::Values(std::make_tuple(false, 2, 0),
+                                           std::make_tuple(true, 2, 0),
+                                           std::make_tuple(true, 2, 1),
+                                           std::make_tuple(true, 2, 2),
+                                           std::make_tuple(true, 0, 0),
+                                           std::make_tuple(true, 0, 2)));
 
 TEST(SampleSlotTest, RequestOutputSplitsSampleResultsBySampleId) {
   torch::Device device(Platform::type_torch(), 0);

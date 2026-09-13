@@ -47,7 +47,11 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
   if (is_qwen3_5_target_model_type(model_type)) {
     return TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY;
   }
-  if (model_type == "deepseek_v32") {
+  // GLM-5.2/5.3 uses the same DSA expanded target-verify layout as
+  // DeepSeek-V3.2.  Keep the shared mode so the Python target executor can
+  // receive expanded block-table/KV metadata without enabling it for other
+  // generic models.
+  if (model_type == "deepseek_v32" || model_type == "glm_moe_dsa") {
     return TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY;
   }
   if (model_type == "mimo") {

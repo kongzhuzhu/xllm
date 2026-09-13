@@ -42,6 +42,9 @@ def _per_seq_lens_from_metadata(
     kv_lens = metadata.kv_seq_lens_host if include_prefix else q_lens
     if q_lens is None or kv_lens is None:
         return None
+    for name, lengths in (("query", q_lens), ("KV", kv_lens)):
+        if lengths.device.type != "cpu" or lengths.ndim != 1 or lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"CP {name} host lengths must be a CPU int32/int64 vector")
     return q_lens.tolist(), kv_lens.tolist()
 
 
@@ -78,6 +81,15 @@ class EagerRunner(BaseRunner):
                     raise RuntimeError("Python Context-Parallel requires host query and KV sequence lengths")
             else:
                 q_seq_lens, kv_seq_lens = seq_lens
+                packed_rows = sum(q_seq_lens)
+                if input_ids.ndim != 1 or input_ids.numel() != packed_rows:
+                    raise ValueError("CP packed input_ids must contain one token per host query row")
+                if positions.ndim != 1 or positions.numel() != packed_rows:
+                    raise ValueError("CP packed positions must contain one position per host query row")
+                if input_embedding is not None and (
+                    input_embedding.ndim == 0 or input_embedding.shape[0] != packed_rows
+                ):
+                    raise ValueError("CP packed input_embedding must contain one embedding per host query row")
                 cp_context = build_cp_context(
                     q_seq_lens,
                     kv_seq_lens,

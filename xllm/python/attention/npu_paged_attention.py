@@ -254,7 +254,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         graph_mode: bool = False,
     ) -> None:
         self._metadata = metadata
-        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.page_size)
+        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
         self._use_expanded_decode = expanded is not None
         block_table = expanded.block_table if expanded is not None else metadata.block_table
         kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
@@ -427,7 +427,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 # Scalar tiling metadata must remain valid across graph replay.
                 self._mla_max_seqlen_k = _mla_graph_max_seqlen_k(
                     self._block_table_i32,
-                    self.page_size,
+                    self.logical_page_size,
                 )
             elif kv_seq_lens_host_values:
                 self._mla_max_seqlen_k = max(kv_seq_lens_host_values)

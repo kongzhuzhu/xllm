@@ -77,9 +77,12 @@ def test_full_world_ep_partitions_glm_experts() -> None:
     assert moe.local_expert_end == 8
     assert moe.num_local_experts == 2
 
+    assert moe.experts_w13.numel() == 0
+    assert moe.experts_w2.numel() == 0
     moe.allocate_experts_w13_for_loading()
-    moe.allocate_experts_w2_for_loading()
     assert moe.experts_w13.shape == (2, 16, 16)
+    assert moe.experts_w2.numel() == 0
+    moe.allocate_experts_w2_for_loading()
     assert moe.experts_w2.shape == (2, 16, 8)
 
 
@@ -241,14 +244,16 @@ class _RecordingLoader(W8A8WeightLoader):
         self.loaded.append(name)
         if ".mlp.experts." not in name:
             return torch.zeros(32, 32)
+        expert_id = int(name.split(".experts.")[1].split(".")[0])
         if name.endswith(("gate_proj.weight", "up_proj.weight")):
-            return torch.zeros(8, 16, dtype=torch.int8)
+            value = expert_id + (11 if name.endswith("up_proj.weight") else 1)
+            return torch.full((8, 16), value, dtype=torch.int8)
         if name.endswith(("gate_proj.weight_scale", "up_proj.weight_scale")):
             return torch.zeros(8, 1)
         if name.endswith(("gate_proj.weight_offset", "up_proj.weight_offset")):
             return torch.zeros(8, 1)
         if name.endswith("down_proj.weight"):
-            return torch.zeros(16, 8, dtype=torch.int8)
+            return torch.full((16, 8), expert_id + 21, dtype=torch.int8)
         if name.endswith(("down_proj.weight_scale", "down_proj.weight_offset")):
             return torch.zeros(16, 1)
         raise AssertionError(f"unexpected expert tensor: {name}")
@@ -347,13 +352,24 @@ def test_compatible_attention_loader_allocates_only_selected_quantization(dynami
         assert projection.input_offset.numel() == 1
 
 
-def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch) -> None:
-    model = Glm52ForCausalLM(_config(ep_rank=2))
+@pytest.mark.parametrize("ep_rank", [0, 2, 3])
+def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch: pytest.MonkeyPatch, ep_rank: int) -> None:
+    model = Glm52ForCausalLM(_config(ep_rank=ep_rank))
+    moe = model.model.layers[0].mlp
     model.model.layers[0].self_attn.process_weights_after_loading = MagicMock()
-    model.model.layers[0].mlp.process_experts_w13_after_loading = MagicMock()
-    model.model.layers[0].mlp.process_experts_w2_after_loading = MagicMock()
-    model.model.layers[0].mlp.shared_experts.process_weights_after_loading = MagicMock()
+    moe.shared_experts.process_weights_after_loading = MagicMock()
+
     monkeypatch.setattr(glm5_2, "W8A8WeightLoader", _RecordingLoader)
+    formatted_shapes: list[tuple[int, ...]] = []
+
+    def _format_cast_nz(weight: torch.Tensor) -> torch.Tensor:
+        assert weight.is_contiguous()
+        if not formatted_shapes:
+            assert moe.experts_w2.numel() == 0
+        formatted_shapes.append(tuple(weight.shape))
+        return weight
+
+    monkeypatch.setattr(glm5_2.kernels, "format_cast_nz", _format_cast_nz, raising=False)
 
     model.load_weights([], tp_rank=0, tp_size=2)
 
@@ -361,7 +377,23 @@ def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch) -> None:
     assert loader is not None
     expert_names = [name for name in loader.loaded if ".mlp.experts." in name]
     assert expert_names
-    assert all(".experts.4." in name or ".experts.5." in name for name in expert_names)
+    expert_ids = {int(name.split(".experts.")[1].split(".")[0]) for name in expert_names}
+    assert expert_ids == {2 * ep_rank, 2 * ep_rank + 1}
+    assert formatted_shapes == [(2, 16, 16), (2, 8, 16)]
+    for local_idx, expert_id in enumerate(sorted(expert_ids)):
+        expected_w13 = (
+            torch.cat(
+                [
+                    torch.full((8, 16), expert_id + 1, dtype=torch.int8),
+                    torch.full((8, 16), expert_id + 11, dtype=torch.int8),
+                ]
+            )
+            .t()
+            .contiguous()
+        )
+        torch.testing.assert_close(moe.experts_w13[local_idx], expected_w13)
+        torch.testing.assert_close(moe.experts_w2[local_idx], torch.full((8, 16), expert_id + 21, dtype=torch.int8))
+    moe.shared_experts.process_weights_after_loading.assert_called_once_with()
     assert loader.tp_size == 2
     assert loader.tp_rank == 0
     attention_prefix = "model.layers.0.self_attn."

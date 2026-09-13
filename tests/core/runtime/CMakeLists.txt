@@ -12,6 +12,17 @@ cc_test(
 if(USE_NPU)
   cc_test(
     NAME
+      mtp_decode_metadata_test
+    SRCS
+      mtp_decode_metadata_test.cpp
+    DEPS
+      :runtime
+      :platform
+      GTest::gtest_main
+  )
+
+  cc_test(
+    NAME
       dspark_confidence_head_test
     SRCS
       dspark_confidence_head_test.cpp

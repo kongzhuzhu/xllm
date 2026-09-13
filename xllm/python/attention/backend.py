@@ -122,6 +122,7 @@ class AttentionMetadata(Protocol):
     linear_state_indices: torch.Tensor | None
     has_initial_state: torch.Tensor | None
     dp_execution_token_counts: Sequence[int]
+    dp_global_sequence_nums: Sequence[int]
     dp_is_decode: Sequence[int]
     q_seq_lens: torch.Tensor | None
     expanded_decode_metadata: ExpandedDecodeMetadataLike
@@ -232,6 +233,11 @@ class AttentionBackend(ABC):
     @abstractmethod
     def page_size(self) -> int:
         pass
+
+    @property
+    def logical_page_size(self) -> int:
+        """Number of global KV tokens represented by one block-table entry."""
+        return self.page_size
 
     def execute_mla(
         self,

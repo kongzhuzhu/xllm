@@ -23,6 +23,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from xllm.python.attention.backend import AttentionMetadata, LayerCache, MlaIndexContext
+from xllm.python.attention.expanded_decode_metadata import resolve_expanded_decode_metadata
 from xllm.python.attention.kv_shard_layout import KVShardLayout
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 from xllm.python.layers.sfa_dcp import (
@@ -91,6 +92,10 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self._expanded_indexer_block_table: torch.Tensor | None = None
         self._sfa_metadata: AscendSFADCPMetadata | None = None
 
+    @property
+    def logical_page_size(self) -> int:
+        return self.page_size * self._dcp_group.size()
+
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
         super().bind_kv_caches(kv_caches)
         self._kv_layout = KVShardLayout(
@@ -132,9 +137,12 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self._sfa_metadata = None
         if self._kv_layout is None or self._builder is None:
             return
-        if metadata.block_table is None:
+        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
+        block_table = self._block_table_i32
+        kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
+        if block_table is None:
             raise RuntimeError("SFA DCP requires a block table.")
-        if metadata.kv_seq_lens is None:
+        if kv_seq_lens is None:
             raise RuntimeError("SFA DCP requires kv_seq_lens.")
 
         local_slots = self._kv_layout.localize_slots(metadata.slot_mapping)
@@ -160,10 +168,14 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         else:
             self._expanded_indexer_block_table = None
 
-        num_reqs = int(metadata.block_table.shape[0])
+        # Speculative verification expands each request into one row per
+        # proposed token.  Use the same expanded row layout as the parent
+        # paged-attention backend; reading the outer metadata here would build
+        # a DCP context with fewer requests than local slots and query rows.
+        num_reqs = int(block_table.shape[0])
         num_input_tokens = int(local_slots.numel())
         self._ensure_builder_capacity(num_reqs)
-        seq_lens = metadata.kv_seq_lens.to(dtype=torch.int32)[:num_reqs]
+        seq_lens = kv_seq_lens.to(dtype=torch.int32)[:num_reqs]
         local_seq_lens = self._kv_layout.local_seq_lens(seq_lens)
         if graph_mode:
             local_seq_lens = copy_into_execution_buffer(
@@ -177,9 +189,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
 
         attn_metadata = self._builder.build(
             slot_mapping=local_slots,
-            block_table=self._block_table_i32
-            if self._block_table_i32 is not None
-            else metadata.block_table.to(torch.int32),
+            block_table=block_table,
             seq_lens=seq_lens,
             num_reqs=num_reqs,
             num_input_tokens=num_input_tokens,
@@ -188,8 +198,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         )
         attn_metadata.dcp_context.slot_mapping = local_slots[:num_input_tokens]
         attn_metadata.dcp_context.seq_lens = local_seq_lens[:num_reqs]
-        if self._block_table_i32 is not None:
-            attn_metadata.dcp_context.block_table = self._block_table_i32[:num_reqs]
+        attn_metadata.dcp_context.block_table = block_table[:num_reqs]
         self._sfa_metadata = attn_metadata
 
     def mla_index_context(self, layer: Attention) -> MlaIndexContext:

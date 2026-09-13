@@ -81,6 +81,7 @@ class PyAttentionMetadataView final {
   pybind11::object linear_state_indices() const;
   pybind11::object has_initial_state() const;
   const std::vector<int32_t>& dp_execution_token_counts() const;
+  const std::vector<int32_t>& dp_global_sequence_nums() const;
   const std::vector<int32_t>& dp_is_decode() const;
   pybind11::object q_seq_lens() const;
   PyExpandedDecodeMetadataView expanded_decode_metadata() const;
@@ -116,6 +117,7 @@ class PyAttentionMetadataView final {
   std::vector<torch::Tensor> multi_block_tables_;
   torch::Tensor linear_state_indices_;
   std::vector<int32_t> dp_execution_token_counts_;
+  std::vector<int32_t> dp_global_sequence_nums_;
   std::vector<int32_t> dp_is_decode_;
   std::shared_ptr<void> dsa_metadata_holder_;
   torch::Tensor dsa_positions_;
