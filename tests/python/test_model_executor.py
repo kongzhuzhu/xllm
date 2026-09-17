@@ -1012,10 +1012,12 @@ class TestDecodeAclGraphSpeculativeMetadata:
         replay_stream = MagicMock()
         update_stream = MagicMock()
         replay_done_event = MagicMock()
+        update_done_event = MagicMock()
         current_stream = MagicMock()
         runner._stream = replay_stream
         runner._update_stream = update_stream
         runner._replay_done_event = replay_done_event
+        runner._update_done_event = update_done_event
         fake_npu = SimpleNamespace(
             current_stream=MagicMock(return_value=current_stream),
             stream=MagicMock(return_value=nullcontext()),

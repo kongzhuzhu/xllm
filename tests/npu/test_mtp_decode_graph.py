@@ -106,7 +106,7 @@ def test_mtp_capture_replay_with_changing_topk_and_batch(is_mla: bool, max_batch
         max_model_len=16,
         decode_batch_size_limit=3,
     )
-    saved_topk = []
+    saved_outputs = []
     # Revisit existing buckets and capture both first/reused-topk paths after
     # shrinking to one row, matching MTP graph warmup's 2-to-1 transition.
     for step, rows in enumerate((3, 3, 4, 5, 6, 2, 1, 1, 3)):
@@ -131,9 +131,17 @@ def test_mtp_capture_replay_with_changing_topk_and_batch(is_mla: bool, max_batch
         torch.testing.assert_close(actual[0], expected[0])
         assert actual[1] is None
         torch.testing.assert_close(actual[2], expected[2])
-        saved_topk.append((actual[2], expected[2].cpu()))
-        for retained, reference in saved_topk:
-            torch.testing.assert_close(retained.cpu(), reference)
+        saved_outputs.append(
+            (
+                actual[0],
+                expected[0].cpu(),
+                actual[2],
+                expected[2].cpu(),
+            )
+        )
+        for retained_hidden, expected_hidden, retained_topk, expected_topk in saved_outputs:
+            torch.testing.assert_close(retained_hidden.cpu(), expected_hidden)
+            torch.testing.assert_close(retained_topk.cpu(), expected_topk)
     assert len(runner._graphs) == 6
     rejected_ids = torch.arange(4, dtype=torch.int32, device=device)
     rejected_metadata = _metadata(4, device)

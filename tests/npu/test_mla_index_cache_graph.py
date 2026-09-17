@@ -66,6 +66,45 @@ def test_native_index_scatter_skips_negative_slots(npu_device: torch.device, dty
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
+@torch.inference_mode()
+def test_quant_indexer_metadata_replays_after_warmup_cache_release(npu_device: torch.device) -> None:
+    from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
+    from xllm.python.model_executor.forward_context import (
+        AclGraphCaptureContext,
+        ForwardContext,
+        forward_context,
+    )
+
+    backend = NpuPagedAttentionBackend(64, 1, 128, 1.0, -1, True, npu_device, torch.bfloat16)
+    backend._mla_actual_seq_q = torch.tensor([1, 2], dtype=torch.int32, device=npu_device)
+    backend._mla_actual_seq_kv = torch.tensor([7, 31], dtype=torch.int32, device=npu_device)
+    backend._mla_max_seqlen_q = 1
+    backend._mla_max_seqlen_k = 128
+    context_args = (backend, npu_device, SimpleNamespace(), [])
+    with forward_context(ForwardContext(*context_args)):
+        backend._get_quant_indexer_metadata(64, 1, 128, 2048, 1)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    stream = torch.npu.Stream(device=npu_device)
+    capture = AclGraphCaptureContext(stream, [])
+    with forward_context(ForwardContext(*context_args, acl_graph=capture)), torch.npu.graph(graph, stream=stream):
+        actual = backend._get_quant_indexer_metadata(64, 1, 128, 2048, 1).clone()
+    torch.npu.synchronize()
+
+    for lengths in ([65, 127], [1, 2], [31, 7]):
+        # The next prepare() releases per-forward cached metadata. The graph
+        # must retain its own producer and observe changed sequence lengths.
+        backend._mla_quant_indexer_metadata.clear()
+        backend._mla_actual_seq_kv.copy_(torch.tensor(lengths, dtype=torch.int32))
+        with forward_context(ForwardContext(*context_args)):
+            expected = backend._get_quant_indexer_metadata(64, 1, 128, 2048, 1).cpu()
+        torch.npu.synchronize()
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.int8, torch.bfloat16, torch.float16])
 def test_index_context_capture_replays_changing_slots_and_scales(npu_device: torch.device, dtype: torch.dtype) -> None:
     from xllm.python.attention.backend import LayerCache

@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from scripts.logger import logger
@@ -147,6 +148,8 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream: torch.npu.Stream | None = None
         self._update_stream: torch.npu.Stream | None = None
         self._replay_done_event: torch.npu.Event | None = None
+        self._update_done_event: torch.npu.Event | None = None
+        self._update_done_recorded = False
 
     def can_execute(
         self,
@@ -535,13 +538,44 @@ class DecodeAclGraphRunner(BaseRunner):
             input_embedding,
             mtp_topk_indices,
         )
-        if graph_key in self._graphs:
+        if not self._synchronize_dp_graph_presence(graph_key, input_ids):
             return
+
+        self._graphs.pop(graph_key, None)
 
         if mtp_topk_indices is None:
             self._prepare_graph_entry(input_ids, positions, metadata, input_embedding)
         else:
             self._prepare_graph_entry(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+
+    def _synchronize_dp_graph_presence(
+        self,
+        graph_key: _GraphKey,
+        input_ids: torch.Tensor,
+    ) -> bool:
+        """Make DP ranks capture their local graph variants together.
+
+        A rank can enter a request with a warmup graph left over from startup,
+        while another rank saw an empty shard and has to capture lazily. Letting
+        the former replay while the latter captures makes HCCL graph collectives
+        diverge. Synchronize the cache-presence bit before deciding whether to
+        reuse the entry; if any rank is missing, all ranks recapture it. Local
+        signatures can differ for empty ranks (embedding/top-k are absent),
+        so a cached local key must still participate on every call.
+        """
+        if graph_key in self._graphs and self.dp_size <= 1:
+            return False
+        if self.dp_size <= 1 or not dist.is_initialized():
+            return graph_key not in self._graphs
+        presence = torch.tensor(
+            [int(graph_key in self._graphs)],
+            dtype=torch.int32,
+            device=input_ids.device,
+        )
+        from xllm.python import distributed
+
+        distributed.all_reduce_(presence, group_name="dp")
+        return int(presence.item()) != self.dp_size
 
     def execute(
         self,
@@ -567,10 +601,6 @@ class DecodeAclGraphRunner(BaseRunner):
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
             entry.graph.replay()
-            # A view into the persistent capture buffer, valid only until the
-            # next execute() overwrites it. The caller must consume it (e.g.
-            # run lm_head) before the next decode step; paths that hold hidden
-            # states across steps must copy.
             output = self._slice_output(entry.static_output, batch_size)
 
         if not getattr(entry, "replay_logged", False):
@@ -586,10 +616,21 @@ class DecodeAclGraphRunner(BaseRunner):
         with torch.npu.stream(self._update_stream):
             self._update_stream.wait_event(self._replay_done_event)
             self._update_graph_tasks(self._update_stream, entry.graph_tasks)
+            assert self._update_done_event is not None
+            self._update_done_event.record(self._update_stream)
 
         self._replay_done_event.record(self._stream)
+        self._update_done_recorded = True
 
         torch.npu.current_stream().wait_stream(self._stream)
+        # The graph replay waits on each task's external event, but the task
+        # update itself runs on a separate stream.  Schedule-overlap returns
+        # to C++ without a device-wide synchronize, so the next MTP draft or
+        # target graph can otherwise start while this runner is still updating
+        # FIA/MLA task parameters.  Order the caller's compute stream after
+        # those updates before exposing the output to the next model stage.
+        assert self._update_done_event is not None
+        torch.npu.current_stream().wait_event(self._update_done_event)
         return output
 
     @staticmethod
@@ -597,24 +638,26 @@ class DecodeAclGraphRunner(BaseRunner):
         output: ModelExecutionOutput,
         batch_size: int,
     ) -> ModelExecutionOutput:
-        """Slice graph outputs by token rows and retain MTP top-k safely.
+        """Slice graph outputs and detach them from the replay buffers.
 
-        The top-k tensor is consumed asynchronously by the C++ MTP worker and
-        must outlive the next replay's persistent capture buffer. Clone that
-        output before returning it; hidden states remain a view because the
-        existing executor consumes them before the next replay.
+        Graph replay writes the same persistent output allocation on every
+        step.  The MTP schedule-overlap path can retain both hidden states and
+        top-k indices until a later step, so returning views allows a replay to
+        overwrite data that an in-flight worker still consumes.  Clone every
+        tensor output while it is still ordered on the graph stream.
         """
         if not isinstance(output, tuple):
-            return output[:batch_size]
+            return output[:batch_size].clone()
         hidden, aux_hidden = output[:2]
+        hidden = hidden[:batch_size].clone()
         if aux_hidden is not None:
-            aux_hidden = aux_hidden[:batch_size]
+            aux_hidden = aux_hidden[:batch_size].clone()
         if len(output) == 2:
-            return hidden[:batch_size], aux_hidden
+            return hidden, aux_hidden
         topk = output[2]
         if topk is not None:
             topk = topk[:batch_size].clone()
-        return hidden[:batch_size], aux_hidden, topk
+        return hidden, aux_hidden, topk
 
     def _prepare_graph_entry(
         self,
@@ -653,6 +696,7 @@ class DecodeAclGraphRunner(BaseRunner):
                 priority=-1,
             )
             self._replay_done_event = torch.npu.Event()
+            self._update_done_event = torch.npu.Event()
 
         # The previous replay may still be reading the capture buffers on the
         # graph stream while the scheduler prepares the next step on the
@@ -663,6 +707,13 @@ class DecodeAclGraphRunner(BaseRunner):
             # All buckets share the paged-KV index buffer, including a newly
             # allocated bucket whose graph has not been captured yet.
             torch.npu.current_stream().wait_event(self._replay_done_event)
+        if self._update_done_recorded:
+            # Task updates run on a separate stream and read the same static
+            # metadata tensors that _fill_entry mutates.  Waiting only for the
+            # graph replay leaves that read/write pair unordered when the
+            # scheduler advances quickly under overlap.
+            assert self._update_done_event is not None
+            torch.npu.current_stream().wait_event(self._update_done_event)
 
         self._fill_entry(
             entry,

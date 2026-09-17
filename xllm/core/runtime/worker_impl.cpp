@@ -1585,19 +1585,20 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
 #if defined(USE_NPU)
           // Driver outputs are copied by GetLastStepResult, which waits for the
           // ready event before the retained no-sync inputs can be released.
-          // Non-driver ranks are not queried by LLMEngine. In eager DP MTP,
-          // overwriting their previous output can therefore release temporary
-          // DP/EP padding tensors while ATB still holds their device addresses.
-          // Keep one-step scheduler overlap, but retire the previous eager
-          // output only after its compute event has completed.
-          const bool wait_for_eager_dp_spec_input_lifetime =
+          // Non-driver ranks are not queried by LLMEngine. Overwriting their
+          // previous output can release temporary DP/EP inputs still consumed
+          // by asynchronous device work. Enabling graphs does not eliminate
+          // those inputs: prefill, mixed batches and batches above the graph
+          // limit still execute eagerly. Retire the retained inputs only after
+          // their compute event completes, preserving one-step overlap.
+          const bool wait_for_dp_spec_input_lifetime =
               last_step_output_valid_ && options_.enable_speculative_decode() &&
               parallel_args_.dp_size() > 1 &&
-              !::xllm::ExecutionConfig::get_instance().enable_graph() &&
+              !last_step_output_.retained_inputs.empty() &&
               last_step_output_.ready_event != nullptr;
-          if (wait_for_eager_dp_spec_input_lifetime) {
+          if (wait_for_dp_spec_input_lifetime) {
             CHECK(last_step_output_.ready_event->synchronize())
-                << "failed to retire previous eager DP speculative input";
+                << "failed to retire previous DP speculative input";
           }
 #endif
           update_last_step_output(output,

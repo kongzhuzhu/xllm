@@ -361,6 +361,7 @@ def test_glm_dense_mlp_unfused_path_reduces_in_fp32() -> None:
 def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> None:
     attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
     nn.Module.__init__(attention)
+    attention._use_fused_mla_decode = False
     attention.q_a_proj = nn.Identity()
     attention.q_a_layernorm = nn.Identity()
     attention.q_b_proj = nn.Identity()

@@ -57,7 +57,11 @@ from xllm.python.model_executor.cp_utils import (
     cp_shard_positions,
     cp_shard_rows,
 )
-from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
+from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
+    get_forward_context,
+    record_layer_event,
+)
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
@@ -576,7 +580,7 @@ class Glm52MLAAttention(Attention):
         )
         self.indexer = None
         if not self.is_shared:
-            self.indexer = Glm52Indexer(cfg, dtype, device)
+            self.indexer = Glm52Indexer(cfg, dtype, device, layer_id)
 
     def _forward_fused_mla_decode(
         self,
@@ -924,8 +928,15 @@ class Glm52MLAAttention(Attention):
 class Glm52Indexer(nn.Module):
     """GLM-5.2 DSA lightning indexer (wq_b W8A8, configurable RoPE)."""
 
-    def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
+    def __init__(
+        self,
+        cfg: Glm52Config,
+        dtype: torch.dtype,
+        device: torch.device,
+        layer_id: int = 0,
+    ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.n_head = cfg.index_n_heads
         self.head_dim = cfg.index_head_dim
         self.rope_dim = cfg.qk_rope_head_dim
@@ -1094,7 +1105,19 @@ class Glm52Indexer(nn.Module):
         if ctx.cp_context is not None:
             local_topk = topk.new_full((ctx.cp_context.total_local, *topk.shape[1:]), -1)
             local_topk.index_copy_(0, ctx.cp_context.query_index, topk)
-            return local_topk
+            topk = local_topk
+        graph_state = get_forward_context().execution_state
+        if graph_state is not None:
+            # The QLI result feeds every later MLA layer but is not part of the
+            # model return value for the target graph. Keep one stable result
+            # per graph entry so a concurrent capture/replay cannot recycle a
+            # temporary custom-op allocation used by another entry.
+            topk_buffer = get_execution_buffer(
+                ("GLM52_QLI_TOPK", self.layer_id) + tuple(topk.shape),
+                lambda: torch.empty_like(topk),
+            )
+            topk_buffer.copy_(topk)
+            topk = topk_buffer
         return topk
 
 

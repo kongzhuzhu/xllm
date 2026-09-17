@@ -3384,6 +3384,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   } else {
     std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
     if (!expanded_linear_state_ids.empty()) {
+      extra_int_inputs.reserve(1);
       extra_int_inputs.push_back(
           {&expanded_linear_state_ids,
            nullptr,
@@ -3590,8 +3591,6 @@ void MTPWorkerImpl::prepare_validate_inputs(
   }
 
 #if defined(USE_NPU)
-  const bool use_explicit_spec_verify_replay_update =
-      should_use_explicit_spec_verify_replay_update(input);
   const bool expand_python_mtp_linear_state_ids =
       ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
       !input_params.embedding.linear_state_ids.empty();
@@ -3642,26 +3641,17 @@ void MTPWorkerImpl::prepare_validate_inputs(
   }
 
 #if defined(USE_NPU)
-  if (use_explicit_spec_verify_replay_update) {
-    std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
-    if (!expanded_linear_state_ids.empty()) {
-      extra_int_inputs.push_back(
-          {&expanded_linear_state_ids,
-           nullptr,
-           &input_params.embedding.linear_state_indices});
-    }
-    input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
+  std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
+  if (!expanded_linear_state_ids.empty()) {
+    extra_int_inputs.reserve(1);
+    extra_int_inputs.push_back({&expanded_linear_state_ids,
+                                nullptr,
+                                &input_params.embedding.linear_state_indices});
+  }
+  input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
+  if (supports_explicit_spec_verify_replay_update()) {
     build_expanded_spec_verify_graph_input(
         input_params, device_, logical_block_size);
-  } else {
-    std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
-    if (!expanded_linear_state_ids.empty()) {
-      extra_int_inputs.push_back(
-          {&expanded_linear_state_ids,
-           nullptr,
-           &input_params.embedding.linear_state_indices});
-    }
-    input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
   }
 #else
   input_params.attention.rebuild_device_buffer(device_);

@@ -54,6 +54,14 @@ class DecodeMetadataTestWorker final : public MTPWorkerImpl {
     CHECK_EQ(prepare_stream_->synchronize(), 0);
     return verify_input;
   }
+
+  ForwardInput build_verify(const ForwardInput& input,
+                            const std::vector<int32_t>& verify_widths) {
+    ForwardInput verify_input;
+    prepare_validate_inputs(input, verify_input, verify_widths);
+    CHECK_EQ(prepare_stream_->synchronize(), 0);
+    return verify_input;
+  }
 };
 
 class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
@@ -123,6 +131,42 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
     EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_last_page_len.cpu(),
                              torch::tensor({page_size, 1}, torch::kInt)));
   }
+
+  void check_linear_state_rows(bool adaptive) {
+    DecodeMetadataTestWorker worker(
+        parallel_args(), torch::Device("npu:0"), options());
+    ForwardInput input;
+    input.token_ids_host = torch::tensor({42, 43}, torch::kInt);
+    input.positions_host = torch::tensor({5, 9}, torch::kInt);
+    input.token_ids = input.token_ids_host.to(torch::Device("npu:0"));
+    input.positions = input.positions_host.to(torch::Device("npu:0"));
+    input.input_params.meta.num_sequences = 2;
+    input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+    input.input_params.attention.host.q_seq_lens = {1, 1};
+    input.input_params.attention.host.kv_seq_lens = {6, 10};
+    input.input_params.attention.host.block_tables =
+        torch::tensor({{10, 11}, {20, 21}}, torch::kInt);
+    // Include the sentinel used by models without linear-attention layers.
+    input.input_params.embedding.linear_state_ids = {7, -1};
+    input.input_params.embedding.linear_state_indices =
+        torch::tensor({7, -1}, torch::kInt).to(torch::Device("npu:0"));
+
+    const ForwardInput verify_input =
+        adaptive ? worker.build_verify(input, std::vector<int32_t>{1, 2})
+                 : worker.build_verify(input, /*adaptive=*/false);
+    const torch::Tensor expected =
+        adaptive ? torch::tensor({7, -1, -1}, torch::kInt)
+                 : torch::tensor({7, 7, -1, -1}, torch::kInt);
+    const auto& embedding = verify_input.input_params.embedding;
+    ASSERT_TRUE(embedding.linear_state_indices.defined());
+    EXPECT_TRUE(torch::equal(embedding.linear_state_indices.cpu(), expected));
+    EXPECT_EQ(embedding.linear_state_indices.numel(),
+              verify_input.token_ids.numel());
+    EXPECT_EQ(embedding.linear_state_ids, (std::vector<int32_t>{7, -1}));
+    EXPECT_TRUE(
+        torch::equal(input.input_params.embedding.linear_state_indices.cpu(),
+                     torch::tensor({7, -1}, torch::kInt)));
+  }
 };
 
 TEST_P(MtpDecodeMetadataTest, Keeps305TokenContextWithinAllocatedPages) {
@@ -146,6 +190,14 @@ TEST_P(MtpDecodeMetadataTest, BuildsFixedVerifyAcrossLogicalPage) {
 
 TEST_P(MtpDecodeMetadataTest, BuildsAdaptiveVerifyAcrossLogicalPage) {
   check_verify_across_logical_page(/*adaptive=*/true);
+}
+
+TEST_P(MtpDecodeMetadataTest, ExpandsFixedVerifyLinearStateRows) {
+  check_linear_state_rows(/*adaptive=*/false);
+}
+
+TEST_P(MtpDecodeMetadataTest, ExpandsVariableVerifyLinearStateRows) {
+  check_linear_state_rows(/*adaptive=*/true);
 }
 
 INSTANTIATE_TEST_SUITE_P(KvSplit,

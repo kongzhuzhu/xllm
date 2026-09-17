@@ -179,7 +179,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
         # reuses the same contiguous tensor instead of launching another
         # index_select and allocation.
         self._mla_cp_block_tables: dict[tuple[int, int], torch.Tensor] = {}
-        self._mla_quant_indexer_metadata: dict[tuple[int, int, int, int], torch.Tensor] = {}
+        self._mla_quant_indexer_metadata: dict[tuple[object, ...], torch.Tensor] = {}
         self._mla_max_seqlen_q = 0
         self._mla_max_seqlen_k = 0
         self._kv_owner_representatives: torch.Tensor | None = None
@@ -305,65 +305,49 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         if graph_mode and self._block_table_i32 is not None and not self._is_mla:
             graph_batch_size = self._block_table_i32.shape[0]
-            if self._graph_workspace is None:
-                block_size = self.page_size
-                dummy_q = torch.empty(
-                    graph_batch_size,
-                    self.num_heads,
-                    self.head_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                dummy_kv = torch.empty(
-                    self.num_kv_blocks,
-                    block_size,
-                    self.num_kv_heads * self.head_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                if self._use_fia_v2:
-                    self._graph_workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
-                        query=dummy_q,
-                        key=dummy_kv,
-                        value=dummy_kv,
-                        block_table=self._block_table_i32,
-                        input_layout="TND",
-                        block_size=block_size,
-                        actual_seq_qlen=self._actual_seq_q,
-                        actual_seq_kvlen=self._actual_seq_kv,
-                        num_key_value_heads=self.num_kv_heads,
-                        num_query_heads=self.num_heads,
-                        sparse_mode=_SPARSE_MODE_NONE,
-                        softmax_scale=self.scale,
-                        return_softmax_lse=False,
+            graph_state = get_forward_context().execution_state
+            if graph_state is None:
+                if self._graph_workspace is None:
+                    self._graph_workspace = self._allocate_graph_workspace(
+                        graph_batch_size,
+                        self._block_table_i32,
                     )
-                else:
-                    self._graph_workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                        query=dummy_q,
-                        key=dummy_kv,
-                        value=dummy_kv,
-                        block_table=self._block_table_i32,
-                        input_layout="TND",
-                        block_size=block_size,
-                        actual_seq_lengths=self._actual_seq_q,
-                        actual_seq_lengths_kv=self._actual_seq_kv,
-                        num_key_value_heads=self.num_kv_heads,
-                        num_heads=self.num_heads,
-                        sparse_mode=_SPARSE_MODE_NONE,
-                        scale=self.scale,
-                        softmax_lse_flag=False,
-                    )
-            if graph_batch_size not in self._graph_outputs:
-                self._graph_outputs[graph_batch_size] = torch.empty(
+                self._current_graph_output = self._graph_outputs.setdefault(
                     graph_batch_size,
-                    self.num_heads,
-                    self.head_dim,
-                    dtype=self.dtype,
-                    device=self.device,
+                    torch.empty(
+                        graph_batch_size,
+                        self.num_heads,
+                        self.head_dim,
+                        dtype=self.dtype,
+                        device=self.device,
+                    ),
                 )
-                self._graph_lses[graph_batch_size] = torch.empty(0, dtype=self.dtype, device=self.device)
-            self._current_graph_output = self._graph_outputs[graph_batch_size]
-            self._current_graph_lse = self._graph_lses[graph_batch_size]
+                self._current_graph_lse = self._graph_lses.setdefault(
+                    graph_batch_size,
+                    torch.empty(0, dtype=self.dtype, device=self.device),
+                )
+            else:
+                self._graph_workspace = get_execution_buffer(
+                    ("FIA_WORKSPACE", graph_batch_size),
+                    lambda: self._allocate_graph_workspace(
+                        graph_batch_size,
+                        self._block_table_i32,
+                    ),
+                )
+                self._current_graph_output = get_execution_buffer(
+                    ("FIA_OUTPUT", graph_batch_size),
+                    lambda: torch.empty(
+                        graph_batch_size,
+                        self.num_heads,
+                        self.head_dim,
+                        dtype=self.dtype,
+                        device=self.device,
+                    ),
+                )
+                self._current_graph_lse = get_execution_buffer(
+                    ("FIA_LSE", graph_batch_size),
+                    lambda: torch.empty(0, dtype=self.dtype, device=self.device),
+                )
 
         # Pre-cache MLA (sparse SFA) seq-lens once per step; shared by
         # execute_mla / mla_index_context instead of re-derived per layer.
@@ -442,6 +426,58 @@ class NpuPagedAttentionBackend(AttentionBackend):
             self._mla_max_seqlen_k = 0
 
         self._prepare_kv_shard_materialization(metadata)
+
+    def _allocate_graph_workspace(
+        self,
+        graph_batch_size: int,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        block_size = self.page_size
+        dummy_q = torch.empty(
+            graph_batch_size,
+            self.num_heads,
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        dummy_kv = torch.empty(
+            self.num_kv_blocks,
+            block_size,
+            self.num_kv_heads * self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if self._use_fia_v2:
+            return torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                query=dummy_q,
+                key=dummy_kv,
+                value=dummy_kv,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_qlen=self._actual_seq_q,
+                actual_seq_kvlen=self._actual_seq_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_query_heads=self.num_heads,
+                sparse_mode=_SPARSE_MODE_NONE,
+                softmax_scale=self.scale,
+                return_softmax_lse=False,
+            )
+        return torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            query=dummy_q,
+            key=dummy_kv,
+            value=dummy_kv,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=self._actual_seq_q,
+            actual_seq_lengths_kv=self._actual_seq_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            sparse_mode=_SPARSE_MODE_NONE,
+            scale=self.scale,
+            softmax_lse_flag=False,
+        )
 
     def _prepare_kv_shard_materialization(self, metadata: AttentionMetadata) -> None:
         self._kv_owner_representatives = None
@@ -742,7 +778,31 @@ class NpuPagedAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         assert self._mla_actual_seq_q is not None
         assert self._mla_actual_seq_kv is not None
-        cache_key = (num_heads_q, head_dim, sparse_count, cmp_ratio)
+        # Warmup runs before graph capture without another prepare(). Its
+        # metadata lives outside the graph pool and is released by the next
+        # prepare(), so capturing a consumer of that cached tensor leaves a
+        # stale address in replay. Capture the metadata producer as well, once
+        # per graph, to retain its storage and refresh sequence-dependent data.
+        context = get_forward_context()
+        is_graph_capture = context.acl_graph is not None
+        # Graph entries use distinct static sequence-length buffers. Include
+        # their addresses so a graph capture cannot reuse QLI tiling metadata
+        # produced for another entry with the same tensor shape. Eager
+        # execution keeps the original compact cache key.
+        entry_scope = ()
+        if context.execution_state is not None:
+            entry_scope = (
+                self._mla_actual_seq_q.data_ptr(),
+                self._mla_actual_seq_kv.data_ptr(),
+            )
+        cache_key = (
+            num_heads_q,
+            head_dim,
+            sparse_count,
+            cmp_ratio,
+            is_graph_capture,
+            *entry_scope,
+        )
         metadata = self._mla_quant_indexer_metadata.get(cache_key)
         if metadata is None:
             actual_seq_q = self._mla_actual_seq_q
@@ -997,21 +1057,42 @@ class NpuPagedAttentionBackend(AttentionBackend):
             return output
 
         output_key = ("MLA_DENSE_OUTPUT", layer_id) + tuple(q_latent.shape)
-        output = self._mla_graph_outputs.get(output_key)
-        if output is None:
-            output = torch.empty_like(q_latent)
-            self._mla_graph_outputs[output_key] = output
-            self._mla_graph_lses[output_key] = torch.empty(0, dtype=q_latent.dtype, device=q_latent.device)
-        softmax_lse = self._mla_graph_lses[output_key]
-        workspace = self._mla_graph_workspaces.get(output_key)
-        if workspace is None:
-            workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
-                q_latent,
-                nope_flat,
-                nope_flat,
-                **common_kwargs,
+        graph_state = get_forward_context().execution_state
+        if graph_state is None:
+            output = self._mla_graph_outputs.get(output_key)
+            if output is None:
+                output = torch.empty_like(q_latent)
+                self._mla_graph_outputs[output_key] = output
+                self._mla_graph_lses[output_key] = torch.empty(
+                    0,
+                    dtype=q_latent.dtype,
+                    device=q_latent.device,
+                )
+            softmax_lse = self._mla_graph_lses[output_key]
+            workspace = self._mla_graph_workspaces.get(output_key)
+            if workspace is None:
+                workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                    q_latent,
+                    nope_flat,
+                    nope_flat,
+                    **common_kwargs,
+                )
+                self._mla_graph_workspaces[output_key] = workspace
+        else:
+            output = get_execution_buffer(output_key, lambda: torch.empty_like(q_latent))
+            softmax_lse = get_execution_buffer(
+                ("MLA_DENSE_LSE", layer_id) + tuple(q_latent.shape),
+                lambda: torch.empty(0, dtype=q_latent.dtype, device=q_latent.device),
             )
-            self._mla_graph_workspaces[output_key] = workspace
+            workspace = get_execution_buffer(
+                ("MLA_DENSE_WORKSPACE", layer_id) + tuple(q_latent.shape),
+                lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                    q_latent,
+                    nope_flat,
+                    nope_flat,
+                    **common_kwargs,
+                ),
+            )
 
         stream = graph_context.stream
         event = torch.npu.ExternalEvent()
@@ -1214,7 +1295,24 @@ class NpuPagedAttentionBackend(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         block_size: int,
+        *,
+        actual_seq_q: list[int] | torch.Tensor | None = None,
+        actual_seq_kv: list[int] | torch.Tensor | None = None,
+        block_table: torch.Tensor | None = None,
+        workspace: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
     ) -> None:
+        # Graph-task updates can run after another graph entry has prepared the
+        # same backend.  Resolve all mutable per-entry state before launching
+        # the operator so the deferred update cannot write into that entry's
+        # buffers with the next entry's metadata.
+        actual_seq_q = self._actual_seq_q if actual_seq_q is None else actual_seq_q
+        actual_seq_kv = self._actual_seq_kv if actual_seq_kv is None else actual_seq_kv
+        block_table = self._block_table_i32 if block_table is None else block_table
+        workspace = self._graph_workspace if workspace is None else workspace
+        output = self._current_graph_output if output is None else output
+        lse = self._current_graph_lse if lse is None else lse
         if self._use_fia_v2:
             torch.ops.npu.npu_fused_infer_attention_score_v2.out(
                 q,
@@ -1224,9 +1322,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 key_rope=None,
                 pse_shift=None,
                 atten_mask=None,
-                actual_seq_qlen=self._actual_seq_q,
-                actual_seq_kvlen=self._actual_seq_kv,
-                block_table=self._block_table_i32,
+                actual_seq_qlen=actual_seq_q,
+                actual_seq_kvlen=actual_seq_kv,
+                block_table=block_table,
                 num_query_heads=self.num_heads,
                 softmax_scale=self.scale,
                 input_layout="TND",
@@ -1234,8 +1332,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 sparse_mode=_SPARSE_MODE_NONE,
                 block_size=block_size,
                 return_softmax_lse=False,
-                workspace=self._graph_workspace,
-                out=[self._current_graph_output, self._current_graph_lse],
+                workspace=workspace,
+                out=[output, lse],
             )
             return
 
@@ -1245,9 +1343,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
             v,
             pse_shift=None,
             atten_mask=None,
-            actual_seq_lengths=self._actual_seq_q,
-            actual_seq_lengths_kv=self._actual_seq_kv,
-            block_table=self._block_table_i32,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=actual_seq_kv,
+            block_table=block_table,
             num_heads=self.num_heads,
             scale=self.scale,
             input_layout="TND",
@@ -1255,8 +1353,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             sparse_mode=_SPARSE_MODE_NONE,
             block_size=block_size,
             softmax_lse_flag=False,
-            workspace=self._graph_workspace,
-            out=[self._current_graph_output, self._current_graph_lse],
+            workspace=workspace,
+            out=[output, lse],
         )
 
     def _decode(
@@ -1275,23 +1373,51 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if graph_context is not None:
             if self._current_graph_output is None:
                 raise RuntimeError("ACL graph output buffer is not prepared")
+            actual_seq_q = self._actual_seq_q
+            actual_seq_kv = self._actual_seq_kv
+            block_table = self._block_table_i32
+            workspace = self._graph_workspace
+            output = self._current_graph_output
+            lse = self._current_graph_lse
             stream = graph_context.stream
             event = torch.npu.ExternalEvent()
             event.wait(stream)
             event.reset(stream)
             torch.npu.graph_task_group_begin(stream)
             try:
-                self._fia_out(q_3d, k_flat, v_flat, block_size)
+                self._fia_out(
+                    q_3d,
+                    k_flat,
+                    v_flat,
+                    block_size,
+                    actual_seq_q=actual_seq_q,
+                    actual_seq_kv=actual_seq_kv,
+                    block_table=block_table,
+                    workspace=workspace,
+                    output=output,
+                    lse=lse,
+                )
             except Exception:
                 torch.npu.graph_task_group_end(stream)
                 raise
             handle = torch.npu.graph_task_group_end(stream)
 
             def _update_fia_args() -> None:
-                self._fia_out(q_3d, k_flat, v_flat, block_size)
+                self._fia_out(
+                    q_3d,
+                    k_flat,
+                    v_flat,
+                    block_size,
+                    actual_seq_q=actual_seq_q,
+                    actual_seq_kv=actual_seq_kv,
+                    block_table=block_table,
+                    workspace=workspace,
+                    output=output,
+                    lse=lse,
+                )
 
             graph_context.tasks.append(AclGraphTask(event, handle, _update_fia_args))
-            return self._current_graph_output.reshape(num_tokens, self.num_heads * self.head_dim)
+            return output.reshape(num_tokens, self.num_heads * self.head_dim)
 
         if self._use_fia_v2:
             output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(

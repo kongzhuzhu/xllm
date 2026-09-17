@@ -16,7 +16,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -113,6 +113,73 @@ def test_dp_warmup_checks_global_bucket_already_captured() -> None:
     with patch.object(runner, "_prepare_graph_entry") as prepare:
         runner.warmup(ids, ids, metadata)
     prepare.assert_not_called()
+
+
+def test_dp_warmup_recaptures_when_peer_is_missing_graph_key() -> None:
+    runner = _runner()
+    runner.dp_size = 2
+    ids = torch.arange(2, dtype=torch.int32)
+    metadata = SimpleNamespace(dp_execution_token_counts=(2, 2))
+    key = runner._graph_key(2, False, None)
+    runner._graphs[key] = SimpleNamespace()
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_reduce_", create=True) as all_reduce,
+        patch.object(runner, "_prepare_graph_entry") as prepare,
+    ):
+        all_reduce.side_effect = lambda tensor, group_name: tensor.fill_(1)
+        runner.warmup(ids, ids, metadata)
+    assert key not in runner._graphs
+    prepare.assert_called_once()
+    all_reduce.assert_called_once()
+
+
+@pytest.mark.parametrize("local_present,global_present", [(False, 0), (False, 1), (True, 1), (True, 2)])
+def test_dp_capture_decision_uses_all_ranks(local_present: bool, global_present: int) -> None:
+    runner = _runner()
+    runner.dp_size = 2
+    ids = torch.ones(1, dtype=torch.int32)
+    key = runner._graph_key(2, False, None)
+    if local_present:
+        runner._graphs[key] = SimpleNamespace()
+
+    def reduce_presence(presence: torch.Tensor, group_name: str) -> None:
+        assert group_name == "dp"
+        assert presence.item() == int(local_present)
+        presence.fill_(global_present)
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_reduce_", side_effect=reduce_presence, create=True) as collective,
+    ):
+        assert runner._synchronize_dp_graph_presence(key, ids) is (global_present != 2)
+    collective.assert_called_once()
+
+
+def test_dp_presence_rechecks_cached_key_when_peer_changes_input_signature() -> None:
+    # A rank can stay empty while its peer changes from a two-row first draft
+    # to a one-row draft with top-k. The local key alone cannot tell whether
+    # the remote signature is still warm, so every step must participate.
+    runner = _runner()
+    runner.dp_size = 2
+    ids = torch.ones(1, dtype=torch.int32)
+    key = runner._graph_key(2, False, None)
+    runner._graphs[key] = SimpleNamespace()
+    global_presence = iter((2, 1, 2))
+
+    def reduce_presence(presence: torch.Tensor, group_name: str) -> None:
+        assert group_name == "dp"
+        assert presence.item() == 1
+        presence.fill_(next(global_presence))
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_reduce_", side_effect=reduce_presence, create=True) as collective,
+    ):
+        assert not runner._synchronize_dp_graph_presence(key, ids)
+        assert runner._synchronize_dp_graph_presence(key, ids)
+        assert not runner._synchronize_dp_graph_presence(key, ids)
+    assert collective.call_count == 3
 
 
 @pytest.mark.parametrize(
@@ -244,7 +311,45 @@ def test_new_capture_waits_for_input_and_metadata_writes() -> None:
     torch.testing.assert_close(entry.static_output, torch.ones(1))
 
 
-def test_mtp_graph_output_slices_and_detaches_topk_buffer() -> None:
+def test_entry_refill_waits_for_prior_task_updates() -> None:
+    runner = _runner()
+    runner._stream = MagicMock()
+    runner._replay_done_event = MagicMock()
+    runner._update_done_event = MagicMock()
+    runner._update_done_recorded = True
+    current_stream = MagicMock()
+    entry = SimpleNamespace(
+        batch_size=1,
+        static_metadata=SimpleNamespace(),
+        execution_state=SimpleNamespace(persistent_buffers={}),
+        static_mtp_topk_indices=None,
+    )
+    graph_key = runner._graph_key(1, False, None)
+    runner._graphs[graph_key] = entry
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=False,
+        expanded_decode_metadata=None,
+    )
+    input_ids = torch.zeros(1, dtype=torch.int32)
+    fake_npu = SimpleNamespace(current_stream=MagicMock(return_value=current_stream))
+
+    with (
+        patch.object(torch, "npu", fake_npu, create=True),
+        patch.object(runner, "_padded_batch_size", return_value=1),
+        patch.object(runner, "_fill_entry"),
+        patch.object(runner.attention_backend, "prepare", create=True),
+    ):
+        result = runner._prepare_graph_entry(input_ids, input_ids, metadata, None)
+
+    assert result is entry
+    assert current_stream.wait_event.call_args_list == [
+        call(runner._replay_done_event),
+        call(runner._update_done_event),
+    ]
+
+
+def test_mtp_graph_output_slices_and_detaches_replay_buffers() -> None:
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     topk = torch.arange(24, dtype=torch.int64).reshape(4, 2, 3)
 
@@ -255,8 +360,11 @@ def test_mtp_graph_output_slices_and_detaches_topk_buffer() -> None:
     assert sliced_aux is None
     assert torch.equal(sliced_hidden, hidden[:2])
     assert torch.equal(sliced_topk, topk[:2])
+    assert sliced_hidden.data_ptr() != hidden.data_ptr()
     assert sliced_topk.data_ptr() != topk.data_ptr()
+    hidden.zero_()
     topk.zero_()
+    assert torch.count_nonzero(sliced_hidden) > 0
     assert torch.count_nonzero(sliced_topk) > 0
 
 
@@ -275,6 +383,10 @@ def test_graph_aux_hidden_output_preserves_two_tensor_contract() -> None:
     assert len(result) == 2
     torch.testing.assert_close(result[0], hidden[:2])
     torch.testing.assert_close(result[1], aux_hidden[:2])
+    hidden.zero_()
+    aux_hidden.zero_()
+    torch.testing.assert_close(result[0], torch.arange(4).reshape(2, 2))
+    torch.testing.assert_close(result[1], torch.arange(4).reshape(2, 2) + 8)
 
 
 def test_mtp_topk_input_changes_without_reallocating_capture_buffer() -> None:
