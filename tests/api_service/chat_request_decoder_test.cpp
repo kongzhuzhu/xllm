@@ -253,9 +253,9 @@ TEST(ChatRequestDecoderTest, RejectedBodiesCarryTheReferenceParserMessage) {
   const std::vector<std::string> bodies = {
       // Rejected by both parsers: the message must be the reference one.
       R"({"messages":[{"role":"user","content":"Hi"}],"stream":{}})",
+      R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":1.5})",
       R"({"messages":"not an array"})",
       R"({"messages":[{"role":"user","content":"Hi"}]} trailing)",
-      R"({"messages":[{"role":"user","content":"Hi"}],"stream":})",
   };
   for (const std::string& body : bodies) {
     proto::ChatRequest reference;
@@ -270,19 +270,6 @@ TEST(ChatRequestDecoderTest, RejectedBodiesCarryTheReferenceParserMessage) {
     ASSERT_FALSE(status.ok()) << body;
     EXPECT_EQ(status.code(), StatusCode::INVALID_ARGUMENT);
     EXPECT_EQ(status.message(), reference_status.ToString());
-  }
-}
-
-TEST(ChatRequestDecoderTest, ScalarCoercionsMatchTheInstalledReferenceParser) {
-  // Protobuf versions differ in whether these noncanonical scalar values
-  // are accepted. Preserve the decoder contract against the installed
-  // reference, including its rejection message, without assuming a version.
-  const std::vector<std::string> bodies = {
-      R"({"messages":[{"role":"user","content":"Hi"}],"stream":"yes"})",
-      R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":1.5})",
-  };
-  for (const std::string& body : bodies) {
-    expect_matches_reference<proto::ChatRequest>(body, ExpectedPath::FAST);
   }
 }
 

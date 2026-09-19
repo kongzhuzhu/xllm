@@ -116,6 +116,7 @@ _GraphKey = tuple[
     torch.dtype | None,
     torch.device | None,
     tuple[int, ...] | None,
+    tuple[int, ...],
 ]
 
 
@@ -143,6 +144,7 @@ class DecodeAclGraphRunner(BaseRunner):
         self.num_decoding_tokens = max(1, int(num_decoding_tokens))
         self._batch_limit_warning_logged = False
         self._graphs: dict[_GraphKey, _DecodeGraphEntry] = {}
+        self._dp_graph_variants: dict[_GraphKey, int] = {}
         self._paged_kv_indices_buffer: torch.Tensor | None = None
         self._max_blocks_per_sequence: int = 0
         self._stream: torch.npu.Stream | None = None
@@ -527,7 +529,7 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         mtp_topk_indices: torch.Tensor | None = None,
-    ) -> None:
+    ) -> _GraphKey:
         batch_size = input_ids.shape[0]
         padded_batch_size = self._padded_batch_size(batch_size, metadata)
 
@@ -538,15 +540,41 @@ class DecodeAclGraphRunner(BaseRunner):
             input_embedding,
             mtp_topk_indices,
         )
+        graph_key = self._synchronize_dp_graph_key(graph_key, input_ids)
         if not self._synchronize_dp_graph_presence(graph_key, input_ids):
-            return
+            return graph_key
 
         self._graphs.pop(graph_key, None)
 
         if mtp_topk_indices is None:
-            self._prepare_graph_entry(input_ids, positions, metadata, input_embedding)
+            self._prepare_graph_entry(input_ids, positions, metadata, input_embedding, graph_key=graph_key)
         else:
-            self._prepare_graph_entry(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+            self._prepare_graph_entry(
+                input_ids, positions, metadata, input_embedding, mtp_topk_indices, graph_key=graph_key
+            )
+        return graph_key
+
+    def _synchronize_dp_graph_key(
+        self,
+        local_key: _GraphKey,
+        input_ids: torch.Tensor,
+    ) -> _GraphKey:
+        """Keep graphs captured with different peer variants in separate entries.
+
+        Empty DP ranks omit MTP embeddings and top-k inputs. A local variant
+        can therefore participate in several distinct collective captures.
+        Local cache presence alone cannot establish that the peers are about
+        to replay graphs captured together: both entries can exist but belong
+        to different captures. Include every DP rank's variant in the key.
+        """
+        if self.dp_size <= 1 or not dist.is_initialized():
+            return local_key
+        variant = self._dp_graph_variants.setdefault(local_key, len(self._dp_graph_variants) + 1)
+        local_variant = torch.tensor([variant], dtype=torch.int32, device=input_ids.device)
+        from xllm.python import distributed
+
+        variants = distributed.all_gather(local_variant, dim=0, world_size=self.dp_size, group_name="dp")
+        return (*local_key[:-1], tuple(variants.cpu().tolist()))
 
     def _synchronize_dp_graph_presence(
         self,
@@ -577,6 +605,21 @@ class DecodeAclGraphRunner(BaseRunner):
         distributed.all_reduce_(presence, group_name="dp")
         return int(presence.item()) != self.dp_size
 
+    def _synchronize_dp_graph_execute(self, input_ids: torch.Tensor) -> None:
+        """Keep graph replay starts ordered after the warmup collective.
+
+        ``warmup`` has already resolved the paired graph key. Repeating the
+        variant all-gather in ``execute`` would copy the same NPU tensor back
+        to the host on every decode step. A one-value reduction keeps the
+        cross-rank launch barrier without rebuilding the Python cache key.
+        """
+        if self.dp_size <= 1 or not dist.is_initialized():
+            return
+        ready = torch.ones(1, dtype=torch.int32, device=input_ids.device)
+        from xllm.python import distributed
+
+        distributed.all_reduce_(ready, group_name="dp")
+
     def execute(
         self,
         input_ids: torch.Tensor,
@@ -584,14 +627,19 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        graph_key: _GraphKey | None = None,
     ) -> ModelExecutionOutput:
         batch_size = input_ids.shape[0]
+        if graph_key is not None:
+            self._synchronize_dp_graph_execute(input_ids)
         entry = self._prepare_graph_entry(
             input_ids,
             positions,
             metadata,
             input_embedding,
             mtp_topk_indices,
+            graph_key=graph_key,
         )
 
         assert self._stream is not None
@@ -666,17 +714,21 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None,
         mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        graph_key: _GraphKey | None = None,
     ) -> _DecodeGraphEntry:
         batch_size = input_ids.shape[0]
         padded_batch_size = self._padded_batch_size(batch_size, metadata)
 
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
-        graph_key = self._graph_key(
-            padded_batch_size,
-            is_expanded,
-            input_embedding,
-            mtp_topk_indices,
-        )
+        if graph_key is None:
+            graph_key = self._graph_key(
+                padded_batch_size,
+                is_expanded,
+                input_embedding,
+                mtp_topk_indices,
+            )
+            graph_key = self._synchronize_dp_graph_key(graph_key, input_ids)
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
         if first_capture:
@@ -769,6 +821,7 @@ class DecodeAclGraphRunner(BaseRunner):
             is_expanded,
             *input_signature,
             *topk_signature,
+            (),
         )
 
     def _allocate_entry(

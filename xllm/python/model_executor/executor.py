@@ -363,10 +363,13 @@ class ModelExecutor:
         if graph_runner is not None and graph_runner.can_execute(input_ids, metadata, input_embedding, **graph_kwargs):
             from xllm.python.model_executor.runners.decode_cuda_graph import DecodeCudaGraphRunner
 
+            graph_key = None
             # CUDA can_execute only admits previously captured buckets. ACL
             # captures lazily with scheduler metadata and MTP inputs.
             if not isinstance(graph_runner, DecodeCudaGraphRunner):
-                graph_runner.warmup(input_ids, positions, metadata, input_embedding, **graph_kwargs)
+                graph_key = graph_runner.warmup(input_ids, positions, metadata, input_embedding, **graph_kwargs)
+                if graph_key is not None:
+                    graph_kwargs["graph_key"] = graph_key
             return graph_runner.execute(
                 input_ids,
                 positions,

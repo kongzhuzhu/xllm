@@ -295,6 +295,7 @@ def test_glm_quant_indexer_without_cp_uses_materialized_scale() -> None:
             return_value=topk,
             create=True,
         ) as quant_lightning_indexer,
+        forward_context(_cpu_context(None)),
     ):
         output = indexer.select_qli(
             torch.ones(2, 3),

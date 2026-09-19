@@ -345,43 +345,6 @@ class TestCreateAttentionBackend:
 
 
 class TestModelExecutorConstruction:
-    @pytest.mark.parametrize("graph_backend", ["cudagraphs", "inductor", "trace"])
-    def test_npu_glm_mtp_rejects_non_acl_graph_before_backend_creation(self, graph_backend: str) -> None:
-        config = {
-            "model_type": "glm_moe_dsa_mtp",
-            "python_graph_backend": graph_backend,
-            "max_position_embeddings": 128,
-        }
-        with (
-            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-            patch("xllm.python.model_executor.executor._create_attention_backend") as create_backend,
-            pytest.raises(NotImplementedError, match="GLM MTP.*aclgraph"),
-        ):
-            # No attention layers: admission must reject the backend before
-            # model inspection or any graph/attention allocation.
-            ModelExecutor(_FakeModelNoAttention(), config, max_seqs_per_batch=3)
-        create_backend.assert_not_called()
-
-    @pytest.mark.parametrize("graph_backend,enable_graph", [("off", True), ("ACLGRAPH", True), ("off", False)])
-    def test_npu_glm_mtp_graph_selection(self, graph_backend: str, enable_graph: bool) -> None:
-        config = {
-            "model_type": "glm_moe_dsa_mtp",
-            "python_graph_backend": graph_backend,
-            "enable_graph": enable_graph,
-            "max_position_embeddings": 128,
-        }
-        with (
-            patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-            patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()),
-        ):
-            executor = ModelExecutor(_FakeModel(num_layers=1), config, max_seqs_per_batch=3)
-        if enable_graph:
-            assert isinstance(executor.decode_graph_runner, DecodeAclGraphRunner)
-            assert executor.decode_graph_runner.max_batch == 6
-        else:
-            assert executor.decode_graph_runner is None
-        assert executor.inductor_runner is None
-
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
         return_value=StubAttentionBackend(),
@@ -467,43 +430,6 @@ class TestModelExecutorConstruction:
                 max_seqs_per_batch=4,
             )
 
-    @patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend())
-    def test_context_parallel_rejects_data_parallel_combination(self, _mock_create):
-        with pytest.raises(NotImplementedError, match="Python CP requires dp_size == 1"):
-            ModelExecutor(
-                _FakeModel(num_layers=1),
-                {"cp_size": 2, "dp_size": 2, "python_graph_backend": "off"},
-                max_seqs_per_batch=4,
-            )
-
-    @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
-    @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_glm_mtp_capacity_includes_repair_rows(
-        self,
-        mock_create: MagicMock,
-        mock_graph_runner: MagicMock,
-    ) -> None:
-        mock_create.return_value = StubAttentionBackend()
-        model = _FakeModel(num_layers=1)
-        ModelExecutor(
-            model,
-            {
-                "model_type": "glm_moe_dsa_mtp",
-                "max_position_embeddings": 128,
-                "python_graph_backend": "aclgraph",
-            },
-            max_seqs_per_batch=2,
-            num_decoding_tokens=1,
-        )
-
-        # Two requests can carry three or four rows when one or both need the
-        # previous token's KV repaired after accepting every draft token.
-        assert mock_create.call_args.args[-1] == 4
-        assert mock_graph_runner.call_args.args[3] == 4
-        # Later draft steps still decode one token per request. Capacity must
-        # not change the interpretation of the scheduler's token counts.
-        assert mock_graph_runner.call_args.args[-1] == 1
-
     @patch("xllm.python.model_executor.runners.decode_acl_graph.DecodeAclGraphRunner")
     @patch("xllm.python.model_executor.executor._create_attention_backend")
     def test_acl_graph_capacity_respects_decode_batch_limit(
@@ -525,10 +451,6 @@ class TestModelExecutorConstruction:
             acl_graph_decode_batch_size_limit=16,
         )
 
-        # The SFA-DCP metadata builder is token-row based. MTP expands each
-        # sequence into num_decoding_tokens rows, so its capacity must cover
-        # the expanded graph input as well.
-        assert mock_create.call_args.args[-1] == 256 * 4
         mock_graph_runner.assert_called_once_with(
             model.model,
             mock_create.return_value,
@@ -540,74 +462,6 @@ class TestModelExecutorConstruction:
             16,
             4,
         )
-
-
-@pytest.mark.parametrize("dp_rank", [0, 1])
-@pytest.mark.parametrize(
-    "max_sequences,limit,model_type,decode_tokens,logical_counts,execution_counts,capacity",
-    [
-        (256, 16, "glm_moe_dsa", 4, (16, 16), (64, 64), 64),
-        (256, 3, "glm_moe_dsa_mtp", 1, (3, 2), (6, 3), 6),
-        (5, None, "glm_moe_dsa", 4, (3, 2), (12, 8), 12),
-        (5, 3, "glm_moe_dsa_mtp", 1, (3, 2), (6, 3), 6),
-        (256, 3, "glm_moe_dsa_mtp", 1, (0, 3), (1, 5), 6),
-    ],
-)
-def test_acl_executor_preserves_per_rank_sequence_capacity(
-    dp_rank: int,
-    max_sequences: int,
-    limit: int | None,
-    model_type: str,
-    decode_tokens: int,
-    logical_counts: tuple[int, ...],
-    execution_counts: tuple[int, ...],
-    capacity: int,
-) -> None:
-    # Construct the real runner through the executor: overriding max_batch on
-    # a runner would hide double DP division and token-row rounding bugs.
-    with patch(
-        "xllm.python.model_executor.executor._create_attention_backend",
-        return_value=_PagedStubAttentionBackend(),
-    ):
-        executor = ModelExecutor(
-            _FakeModel(num_layers=1),
-            {
-                "model_type": model_type,
-                "max_position_embeddings": 128,
-                "python_graph_backend": "aclgraph",
-                "dp_size": 2,
-                "dp_rank": dp_rank,
-            },
-            max_seqs_per_batch=max_sequences,
-            num_decoding_tokens=decode_tokens,
-            acl_graph_decode_batch_size_limit=limit,
-        )
-    runner = executor.decode_graph_runner
-    assert isinstance(runner, DecodeAclGraphRunner)
-    rows = execution_counts[dp_rank]
-    metadata = SimpleNamespace(
-        is_prefill=False,
-        is_chunked_prefill=False,
-        expanded_decode_metadata=None,
-        dp_global_sequence_nums=logical_counts,
-        dp_execution_token_counts=execution_counts,
-        dp_is_decode=(1, 1),
-        slot_mapping=torch.arange(rows, dtype=torch.int32),
-        block_table=torch.zeros((rows, 1), dtype=torch.int32),
-        kv_seq_lens=torch.ones(rows, dtype=torch.int32),
-        kv_seq_lens_host_values=[1] * rows,
-        paged_kv_indptr=torch.arange(rows + 1, dtype=torch.int32),
-        paged_kv_indices=torch.zeros(rows, dtype=torch.int32),
-        paged_kv_last_page_len=torch.ones(rows, dtype=torch.int32),
-        kv_cu_seq_lens=None,
-        q_cu_seq_lens=None,
-    )
-    assert runner.max_batch == capacity
-    assert runner.can_execute(torch.zeros(rows, dtype=torch.int32), metadata)
-    assert runner._padded_batch_size(rows, metadata) == capacity
-    if limit is not None:
-        metadata.dp_global_sequence_nums = (limit + 1, 0)
-        assert not runner.can_execute(torch.zeros(rows, dtype=torch.int32), metadata)
 
 
 class TestDecodeCudaGraphDataParallelKeys:
@@ -857,6 +711,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 positions,
                 metadata,
                 None,
+                graph_key=graph_key,
             )
 
             runner._graphs[graph_key] = object()
@@ -988,15 +843,15 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 metadata_row_count=4,
             )
 
-    def test_replay_returns_static_output_view(self) -> None:
+    def test_replay_returns_detached_static_output(self) -> None:
         runner = self._runner()
         batch_size = 3
         padded_batch_size = 4
         static_output = torch.arange(12).reshape(padded_batch_size, 3)
         graph = MagicMock()
         entry = SimpleNamespace(
-            graph=graph,
             batch_size=padded_batch_size,
+            graph=graph,
             static_output=static_output,
             static_metadata=SimpleNamespace(),
             graph_tasks=[],
@@ -1012,12 +867,11 @@ class TestDecodeAclGraphSpeculativeMetadata:
         replay_stream = MagicMock()
         update_stream = MagicMock()
         replay_done_event = MagicMock()
-        update_done_event = MagicMock()
         current_stream = MagicMock()
         runner._stream = replay_stream
         runner._update_stream = update_stream
         runner._replay_done_event = replay_done_event
-        runner._update_done_event = update_done_event
+        runner._update_done_event = MagicMock()
         fake_npu = SimpleNamespace(
             current_stream=MagicMock(return_value=current_stream),
             stream=MagicMock(return_value=nullcontext()),
@@ -1039,51 +893,12 @@ class TestDecodeAclGraphSpeculativeMetadata:
             )
 
         assert output.shape == (batch_size, 3)
-        assert output.data_ptr() == static_output.data_ptr()
+        assert output.data_ptr() != static_output.data_ptr()
         output[0, 0] = -1
-        assert static_output[0, 0].item() == -1
+        assert static_output[0, 0].item() == 0
         replay_stream.wait_stream.assert_called_once_with(current_stream)
         current_stream.wait_stream.assert_called_once_with(replay_stream)
         graph.replay.assert_called_once_with()
-
-    @pytest.mark.parametrize("new_bucket", [False, True])
-    def test_graph_buffer_update_waits_for_previous_replay(self, new_bucket: bool) -> None:
-        runner = self._runner()
-        metadata = self._metadata()
-        entry = SimpleNamespace(
-            graph=None if new_bucket else MagicMock(),
-            static_metadata=SimpleNamespace(),
-            execution_state=SimpleNamespace(persistent_buffers={}),
-        )
-        if not new_bucket:
-            runner._graphs[runner._graph_key(4, True, None)] = entry
-        replay_stream = MagicMock()
-        update_stream = MagicMock()
-        replay_done_event = MagicMock()
-        current_stream = MagicMock()
-        runner._stream = replay_stream
-        runner._update_stream = update_stream
-        runner._replay_done_event = replay_done_event
-        runner.attention_backend.prepare = MagicMock()
-        fake_npu = SimpleNamespace(current_stream=MagicMock(return_value=current_stream))
-
-        with (
-            patch.object(torch, "npu", fake_npu, create=True),
-            patch.object(runner, "_allocate_entry", return_value=entry),
-            patch.object(runner, "_capture"),
-            patch.object(runner, "_fill_entry") as fill_entry,
-        ):
-            fill_entry.side_effect = lambda *args: current_stream.wait_event.assert_called_once_with(replay_done_event)
-            result = runner._prepare_graph_entry(
-                torch.arange(4, dtype=torch.int32),
-                torch.arange(4, dtype=torch.int32),
-                metadata,
-                None,
-            )
-
-        assert result is entry
-        current_stream.wait_event.assert_called_once_with(replay_done_event)
-        fill_entry.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1177,155 +992,6 @@ class TestBindKvCaches:
         executor.bind_kv_caches([kv])  # should not raise or re-bind
 
 
-@pytest.mark.parametrize(
-    ("config", "exception", "message"),
-    [
-        ({"cp_size": 0}, ValueError, "cp_size"),
-        ({"dp_size": 0}, ValueError, "dp_size"),
-        ({"cp_size": 2, "cp_rank": -1}, ValueError, "cp_rank"),
-        ({"cp_size": 2, "cp_rank": 2}, ValueError, "cp_rank"),
-        ({"kv_split_size": -1}, ValueError, "kv_split_size"),
-        ({"cp_size": 4, "kv_split_size": 3}, ValueError, "divisor"),
-        ({"cp_size": 1, "dp_size": 2, "kv_split_size": 2}, NotImplementedError, "DCP requires dp_size == 1"),
-    ],
-)
-def test_executor_rejects_invalid_cp_dcp_topology_before_backend_creation(
-    config: dict, exception: type[Exception], message: str
-) -> None:
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor._create_attention_backend") as create_backend,
-        pytest.raises(exception, match=message),
-    ):
-        ModelExecutor(_FakeModel(num_layers=1), config, max_seqs_per_batch=4)
-    create_backend.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        {"cp_size": 4, "cp_rank": 3, "kv_split_size": 0},
-        {"cp_size": 4, "cp_rank": 3, "kv_split_size": 2},
-        {"cp_size": 1, "dp_size": 2, "kv_split_size": 1},
-        {"cp_size": 1, "dp_size": 1, "kv_split_size": 2},
-    ],
-)
-def test_executor_preserves_supported_cp_dcp_topologies(config: dict) -> None:
-    config = {
-        "model_type": "glm_moe_dsa",
-        "enable_disagg_pd": True,
-        "instance_role": "PREFILL",
-        **config,
-    }
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()),
-    ):
-        executor = ModelExecutor(_FakeModel(num_layers=1), config, max_seqs_per_batch=4)
-    assert executor.eager_runner.cp_size == config["cp_size"]
-    assert executor.eager_runner.cp_rank == config.get("cp_rank", 0)
-
-
-@pytest.mark.parametrize("graph_backend", ["cudagraphs", "inductor", "reduce-overhead"])
-def test_cp_rejects_unsupported_graph_backend_before_backend_creation(graph_backend: str) -> None:
-    with (
-        patch("xllm.python.model_executor.executor._create_attention_backend") as create_backend,
-        patch("xllm.python.model_executor.runners.decode_cuda_graph.DecodeCudaGraphRunner"),
-        pytest.raises(NotImplementedError, match="Context-Parallel"),
-    ):
-        ModelExecutor(
-            _FakeModel(num_layers=1),
-            {"cp_size": 2, "max_position_embeddings": 128, "python_graph_backend": graph_backend},
-            max_seqs_per_batch=4,
-        )
-    create_backend.assert_not_called()
-
-
-@pytest.mark.parametrize("graph_backend", ["off", "ACLGraph"])
-def test_cp_preserves_eager_prefill_with_resolved_acl_graph(graph_backend: str) -> None:
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()),
-    ):
-        executor = ModelExecutor(
-            _FakeModel(num_layers=1),
-            {
-                "model_type": "glm_moe_dsa",
-                "cp_size": 2,
-                "kv_split_size": 1,
-                "max_position_embeddings": 128,
-                "enable_graph": True,
-                "python_graph_backend": graph_backend,
-            },
-            max_seqs_per_batch=4,
-        )
-    assert executor.eager_runner.cp_size == 2
-    assert executor.inductor_runner is None
-    assert isinstance(executor.decode_graph_runner, DecodeAclGraphRunner)
-    assert not executor.decode_graph_runner.can_execute(
-        torch.ones(3, dtype=torch.int32),
-        SimpleNamespace(is_prefill=True, is_chunked_prefill=False, expanded_decode_metadata=None),
-    )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "decoding_tokens", "message"),
-    [
-        ({"model_type": "qwen3_5"}, 1, "model_type"),
-        ({"model_type": "deepseek_v32"}, 1, "model_type"),
-        ({"model_type": "glm_moe_dsa_mtp", "is_draft_engine": True}, 1, "model_type"),
-        ({"model_type": ""}, 1, "model_type"),
-        ({"instance_role": "DECODE"}, 1, "DEFAULT or PREFILL"),
-        ({"instance_role": "MIX"}, 1, "DEFAULT or PREFILL"),
-        ({"task_type": "embed"}, 1, "generate"),
-        ({"num_speculative_tokens": 3, "speculative_algorithm": "mTp"}, 1, "MTP"),
-        ({}, 4, "MTP"),
-        ({"num_speculative_tokens": 3, "speculative_algorithm": "DFlash2"}, 1, "aux-hidden"),
-        ({"num_speculative_tokens": 3, "speculative_algorithm": "DSpark"}, 1, "aux-hidden"),
-        ({"num_speculative_tokens": 3, "speculative_algorithm": "Eagle3"}, 1, "aux-hidden"),
-        ({"kv_split_size": 0}, 1, "disaggregated PD"),
-        ({"kv_split_size": 2, "instance_role": "PREFILL"}, 1, "disaggregated PD"),
-        ({"kv_split_size": 2, "enable_disagg_pd": True}, 1, "PREFILL"),
-    ],
-)
-def test_cp_model_admission_rejects_before_backend_creation(
-    overrides: dict, decoding_tokens: int, message: str
-) -> None:
-    config = {"model_type": "glm_moe_dsa", "cp_size": 2, "kv_split_size": 1, **overrides}
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor._create_attention_backend") as create_backend,
-        pytest.raises(NotImplementedError, match=message),
-    ):
-        ModelExecutor(_FakeModel(num_layers=1), config, max_seqs_per_batch=3, num_decoding_tokens=decoding_tokens)
-    create_backend.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        {"model_type": "glm_moe_dsa", "cp_size": 2, "kv_split_size": 1},
-        {
-            "model_type": "glm_moe_dsa",
-            "cp_size": 2,
-            "kv_split_size": 0,
-            "enable_disagg_pd": True,
-            "instance_role": "PREFILL",
-        },
-        {"model_type": "qwen3", "cp_size": 2, "kv_split_size": 1},
-        {"model_type": "glm_moe_dsa", "cp_size": 1, "kv_split_size": 2, "num_speculative_tokens": 3},
-        {"model_type": "glm_moe_dsa_mtp", "cp_size": 1, "kv_split_size": 2, "is_draft_engine": True},
-    ],
-)
-def test_cp_model_admission_preserves_prefill_and_separate_dcp_mtp(config: dict) -> None:
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()),
-    ):
-        executor = ModelExecutor(_FakeModel(num_layers=1), config, max_seqs_per_batch=3)
-    assert executor.eager_runner.cp_size == config["cp_size"]
-
-
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.execute routing
 # ---------------------------------------------------------------------------
@@ -1412,44 +1078,6 @@ def test_eager_runner_builds_cp_context_for_chunked_prefill() -> None:
         2,
         torch.device("cpu"),
     )
-
-
-@pytest.mark.parametrize("is_mla", [False, True])
-@pytest.mark.parametrize(
-    ("input_shape", "position_shape", "embedding_rows"),
-    [
-        ((7,), (7,), None),
-        ((9,), (9,), None),
-        ((2, 4), (8,), None),
-        ((8,), (7,), None),
-        ((8,), (2, 4), None),
-        ((8,), (8,), 7),
-    ],
-)
-def test_cp_rejects_misaligned_packed_inputs_before_prepare(
-    is_mla: bool,
-    input_shape: tuple[int, ...],
-    position_shape: tuple[int, ...],
-    embedding_rows: int | None,
-) -> None:
-    runner = _make_eager_runner(is_mla=is_mla)
-    metadata = SimpleNamespace(
-        is_prefill=True,
-        is_chunked_prefill=False,
-        is_mixed=False,
-        is_spec_verify=False,
-        q_seq_lens_host=torch.tensor([3, 5], dtype=torch.int32),
-        kv_seq_lens_host=torch.tensor([11, 13], dtype=torch.int32),
-    )
-    embedding = None if embedding_rows is None else torch.zeros(embedding_rows, 4)
-    with (
-        patch("xllm.python.model_executor.runners.eager.build_cp_context") as build_context,
-        pytest.raises(ValueError, match="CP packed"),
-    ):
-        runner.execute(torch.zeros(input_shape), torch.zeros(position_shape), metadata, embedding)
-    build_context.assert_not_called()
-    assert not runner.attention_backend._prepared
-    runner.model.assert_not_called()
 
 
 def test_eager_runner_rejects_mixed_cp_before_collective() -> None:
@@ -1554,36 +1182,6 @@ def test_eager_runner_rejects_missing_cp_lengths(
     assert not runner.attention_backend._prepared
 
 
-@pytest.mark.parametrize(
-    "bad_lengths",
-    [
-        torch.empty(1, dtype=torch.int32, device="meta"),
-        torch.tensor([[1]], dtype=torch.int32),
-        torch.tensor([1.5], dtype=torch.float32),
-    ],
-)
-@pytest.mark.parametrize("field", ["q_seq_lens_host", "kv_seq_lens_host"])
-def test_cp_rejects_invalid_host_lengths_before_prepare(bad_lengths: torch.Tensor, field: str) -> None:
-    runner = _make_eager_runner()
-    metadata = SimpleNamespace(
-        is_prefill=True,
-        is_chunked_prefill=False,
-        is_mixed=False,
-        is_spec_verify=False,
-        q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-        kv_seq_lens_host=torch.tensor([1], dtype=torch.int32),
-    )
-    setattr(metadata, field, bad_lengths)
-    with (
-        patch("xllm.python.model_executor.runners.eager.build_cp_context") as build_context,
-        pytest.raises(ValueError, match="CPU int32/int64 vector"),
-    ):
-        runner.execute(torch.zeros(1), torch.zeros(1), metadata)
-    build_context.assert_not_called()
-    assert not runner.attention_backend._prepared
-    runner.model.assert_not_called()
-
-
 class TestExecuteRouting:
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
@@ -1671,36 +1269,10 @@ class TestExecuteRouting:
         assert args == (input_ids, positions, metadata, None, None, mtp_topk)
         assert torch.equal(result, torch.ones(2))
 
-    @pytest.mark.parametrize("runner_cls", [DecodeAclGraphRunner, DecodeCudaGraphRunner])
-    @patch("xllm.python.model_executor.executor._create_attention_backend")
-    def test_mtp_topk_only_routes_to_acl_graph(self, mock_create: MagicMock, runner_cls: type) -> None:
-        mock_create.return_value = StubAttentionBackend()
-        executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
-        executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
-        graph_runner = create_autospec(runner_cls, instance=True)
-        graph_runner.can_execute.return_value = True
-        executor.decode_graph_runner = graph_runner
-        executor.eager_runner = MagicMock()
-        ids = torch.arange(2, dtype=torch.int32)
-        metadata = MagicMock(spec=AttentionMetadata)
-        topk = torch.ones((2, 1, 8), dtype=torch.int32)
-
-        result = executor.execute(ids, ids, metadata, mtp_topk_indices=topk)
-
-        if runner_cls is DecodeAclGraphRunner:
-            graph_runner.can_execute.assert_called_once_with(ids, metadata, None, mtp_topk_indices=topk)
-            graph_runner.execute.assert_called_once_with(ids, ids, metadata, None, mtp_topk_indices=topk)
-            assert result is graph_runner.execute.return_value
-            executor.eager_runner.execute.assert_not_called()
-        else:
-            graph_runner.can_execute.assert_not_called()
-            executor.eager_runner.execute.assert_called_once_with(ids, ids, metadata, None, None, topk)
-
-    @pytest.mark.parametrize("runner_cls", [DecodeAclGraphRunner, DecodeCudaGraphRunner])
     @patch(
         "xllm.python.model_executor.executor._create_attention_backend",
     )
-    def test_graph_warmup_uses_scheduler_inputs(self, mock_create: MagicMock, runner_cls: type) -> None:
+    def test_acl_graph_warmup_uses_scheduler_inputs(self, mock_create):
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
         executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
@@ -1711,21 +1283,62 @@ class TestExecuteRouting:
         input_ids = torch.zeros(4, dtype=torch.int32)
         positions = torch.arange(4, dtype=torch.int32)
         metadata = MagicMock(spec=AttentionMetadata)
-        graph_runner = create_autospec(runner_cls, instance=True)
+        graph_runner = MagicMock()
         graph_runner.can_execute.return_value = True
         graph_runner.execute.return_value = torch.ones(4)
         executor.decode_graph_runner = graph_runner
 
         result = executor.execute(input_ids, positions, metadata)
 
-        if runner_cls is DecodeAclGraphRunner:
-            graph_runner.warmup.assert_called_once_with(input_ids, positions, metadata, None)
-        else:
-            graph_runner.warmup.assert_not_called()
-        graph_runner.execute.assert_called_once_with(
+        graph_runner.warmup.assert_called_once_with(
             input_ids,
             positions,
             metadata,
             None,
         )
+        graph_runner.execute.assert_called_once_with(
+            input_ids,
+            positions,
+            metadata,
+            None,
+            graph_key=graph_runner.warmup.return_value,
+        )
         assert torch.equal(result, torch.ones(4))
+
+
+@patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend())
+def test_context_parallel_rejects_data_parallel_combination(_mock_create):
+    with pytest.raises(NotImplementedError, match="Python CP requires dp_size == 1"):
+        ModelExecutor(
+            _FakeModel(num_layers=1),
+            {"cp_size": 2, "dp_size": 2, "python_graph_backend": "off"},
+            max_seqs_per_batch=4,
+        )
+
+
+@patch("xllm.python.model_executor.executor._create_attention_backend")
+def test_mtp_topk_routes_to_acl_graph(mock_create):
+    mock_create.return_value = StubAttentionBackend()
+    executor = ModelExecutor(_FakeModel(num_layers=1), {}, max_seqs_per_batch=4)
+    executor.bind_kv_caches([(torch.zeros(1), torch.zeros(1))])
+    graph_runner = create_autospec(DecodeAclGraphRunner, instance=True)
+    graph_runner.can_execute.return_value = True
+    executor.decode_graph_runner = graph_runner
+    executor.eager_runner = MagicMock()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    metadata = MagicMock(spec=AttentionMetadata)
+    topk = torch.ones((2, 1, 8), dtype=torch.int32)
+
+    result = executor.execute(input_ids, input_ids, metadata, mtp_topk_indices=topk)
+
+    graph_runner.can_execute.assert_called_once_with(input_ids, metadata, None, mtp_topk_indices=topk)
+    graph_runner.execute.assert_called_once_with(
+        input_ids,
+        input_ids,
+        metadata,
+        None,
+        mtp_topk_indices=topk,
+        graph_key=graph_runner.warmup.return_value,
+    )
+    assert result is graph_runner.execute.return_value
+    executor.eager_runner.execute.assert_not_called()

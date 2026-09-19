@@ -29,7 +29,7 @@ case "$subject" in
     ;;
 esac
 
-regex='^(feat|bugfix|docs|test|refactor|chore|style|revert|perf|model|build|skills): (\S+ ){3,}\S+\.$'
+regex='^(feat|bugfix|docs|test|refactor|chore|style|revert|perf|model|build|skills): ([^[:space:]]+ ){3,}[^[:space:]]+\.$'
 
 if [[ "$subject" =~ $regex ]]; then
   exit 0
@@ -64,4 +64,3 @@ EOF
 
 echo "Rejected subject: $subject" >&2
 exit 1
-
