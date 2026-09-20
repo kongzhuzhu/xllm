@@ -1442,10 +1442,16 @@ bool MTPWorkerImpl::supports_unified_python_mtp_graph() const {
   if (SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
     return false;
   }
-  return impl_->model_executor() != nullptr &&
-         draft_impl_->model_executor() != nullptr &&
-         impl_->model_executor()->python_impl() != nullptr &&
-         draft_impl_->model_executor()->python_impl() != nullptr;
+  const bool supported =
+      impl_->model_executor() != nullptr &&
+      draft_impl_->model_executor() != nullptr &&
+      impl_->model_executor()->python_impl() != nullptr &&
+      draft_impl_->model_executor()->python_impl() != nullptr;
+  if (supported) {
+    LOG(INFO) << "MTP unified Python graph admitted: speculative_tokens="
+              << options_.num_speculative_tokens();
+  }
+  return supported;
 #else
   return false;
 #endif
@@ -1457,6 +1463,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
     const ForwardInput& current_draft_input,
     int32_t num_speculative_tokens) {
 #if defined(USE_NPU)
+  LOG(INFO) << "MTP unified Python graph execute: speculative_tokens="
+            << num_speculative_tokens;
   const int32_t batch_size = input.input_params.meta.num_sequences;
   CHECK_GT(batch_size, 0);
   CHECK_EQ(current_draft_input.positions.numel(), batch_size * 2)
