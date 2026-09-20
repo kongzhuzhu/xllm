@@ -1430,16 +1430,37 @@ void MTPWorkerImpl::prepare_draft_sampling(
 
 bool MTPWorkerImpl::supports_unified_python_mtp_graph() const {
 #if defined(USE_NPU)
-  if (options_.num_speculative_tokens() <= 0 || impl_ == nullptr ||
+  const bool pure_ep_topology =
+      parallel_args_.ep_size() > 1 &&
+      parallel_args_.ep_size() == parallel_args_.world_size() &&
+      parallel_args_.tp_size() == parallel_args_.world_size();
+  const bool unsupported_shape =
+      options_.num_speculative_tokens() <= 0 || impl_ == nullptr ||
       draft_impl_ == nullptr || parallel_args_.cp_size() != 1 ||
-      parallel_args_.dp_size() != 1 || parallel_args_.tp_size() != 1 ||
+      parallel_args_.dp_size() != 1 ||
+      (parallel_args_.tp_size() != 1 && !pure_ep_topology) ||
       enable_schedule_overlap() ||
       !ModelConfig::is_python_model_impl(context_.get_model_impl()) ||
       !ModelConfig::is_python_model_impl(
-          draft_impl_->context_.get_model_impl())) {
+          draft_impl_->context_.get_model_impl());
+  if (unsupported_shape) {
+    LOG(INFO) << "MTP unified Python graph rejected: k="
+              << options_.num_speculative_tokens()
+              << ", tp=" << parallel_args_.tp_size()
+              << ", dp=" << parallel_args_.dp_size()
+              << ", cp=" << parallel_args_.cp_size()
+              << ", ep=" << parallel_args_.ep_size()
+              << ", world=" << parallel_args_.world_size()
+              << ", overlap=" << enable_schedule_overlap()
+              << ", model_impl=" << context_.get_model_impl()
+              << ", draft_model_impl="
+              << (draft_impl_ == nullptr
+                      ? std::string("<null>")
+                      : draft_impl_->context_.get_model_impl());
     return false;
   }
   if (SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+    LOG(INFO) << "MTP unified Python graph rejected: ATB speculative kernel";
     return false;
   }
   const bool supported =
