@@ -26,6 +26,36 @@ limitations under the License.
 namespace py = pybind11;
 
 namespace xllm::detail {
+namespace {
+
+MtpPyGraphOutput parse_graph_output(const py::object& output) {
+  py::object next_state = output.attr("next_state");
+  MtpPyGraphOutput result;
+  result.accepted_ids = output.attr("accepted_ids").cast<torch::Tensor>();
+  result.accepted_mask = output.attr("accepted_mask").cast<torch::Tensor>();
+  result.accepted_count = output.attr("accepted_count").cast<torch::Tensor>();
+  result.committed_tokens =
+      output.attr("committed_tokens").cast<torch::Tensor>();
+  result.next_token_ids = next_state.attr("token_ids").cast<torch::Tensor>();
+  result.next_positions = next_state.attr("positions").cast<torch::Tensor>();
+  result.next_kv_seq_lens = tensor_from_python(next_state.attr("kv_seq_lens"));
+  result.next_embeddings = tensor_from_python(next_state.attr("embeddings"));
+  result.next_topk_indices =
+      tensor_from_python(next_state.attr("topk_indices"));
+  result.target_embeddings =
+      tensor_from_python(output.attr("target_embeddings"));
+  return result;
+}
+
+py::list metadata_list(const std::vector<py::object>& metadata) {
+  py::list result;
+  for (const py::object& item : metadata) {
+    result.append(item);
+  }
+  return result;
+}
+
+}  // namespace
 
 std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
     PyExecutorImpl& target_executor,
@@ -66,32 +96,73 @@ MtpPyGraphOutput MtpPyExecutorPair::capture_and_execute(
   py::gil_scoped_acquire gil;
   py::object optional_topk =
       draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
-  runner_.attr("capture")(seed_token_ids,
-                          base_positions,
-                          kv_seq_lens,
-                          draft_input_embedding,
-                          optional_topk);
-  py::object output = runner_.attr("execute")(seed_token_ids,
-                                              base_positions,
-                                              kv_seq_lens,
-                                              draft_input_embedding,
-                                              optional_topk);
-  py::object next_state = output.attr("next_state");
-  MtpPyGraphOutput result;
-  result.accepted_ids = output.attr("accepted_ids").cast<torch::Tensor>();
-  result.accepted_mask = output.attr("accepted_mask").cast<torch::Tensor>();
-  result.accepted_count = output.attr("accepted_count").cast<torch::Tensor>();
-  result.committed_tokens =
-      output.attr("committed_tokens").cast<torch::Tensor>();
-  result.next_token_ids = next_state.attr("token_ids").cast<torch::Tensor>();
-  result.next_positions = next_state.attr("positions").cast<torch::Tensor>();
-  result.next_kv_seq_lens = tensor_from_python(next_state.attr("kv_seq_lens"));
-  result.next_embeddings = tensor_from_python(next_state.attr("embeddings"));
-  result.next_topk_indices =
-      tensor_from_python(next_state.attr("topk_indices"));
-  result.target_embeddings =
-      tensor_from_python(output.attr("target_embeddings"));
-  return result;
+  LOG(INFO) << "MTP unified pair capture begin";
+  try {
+    runner_.attr("capture")(seed_token_ids,
+                            base_positions,
+                            kv_seq_lens,
+                            draft_input_embedding,
+                            optional_topk);
+  } catch (const py::error_already_set& error) {
+    LOG(ERROR) << "MTP unified pair capture failed: " << error.what();
+    throw;
+  }
+  LOG(INFO) << "MTP unified pair capture done; replay begin";
+  py::object output;
+  try {
+    output = runner_.attr("execute")(seed_token_ids,
+                                     base_positions,
+                                     kv_seq_lens,
+                                     draft_input_embedding,
+                                     optional_topk);
+  } catch (const py::error_already_set& error) {
+    LOG(ERROR) << "MTP unified pair replay failed: " << error.what();
+    throw;
+  }
+  LOG(INFO) << "MTP unified pair replay done";
+  return parse_graph_output(output);
+}
+
+bool MtpPyExecutorPair::can_update_metadata(
+    const std::vector<py::object>& draft_metadata,
+    const py::object& target_metadata) const {
+  CHECK(runner_);
+  py::gil_scoped_acquire gil;
+  return runner_
+      .attr("can_update_metadata")(metadata_list(draft_metadata),
+                                   target_metadata)
+      .cast<bool>();
+}
+
+MtpPyGraphOutput MtpPyExecutorPair::update_and_execute(
+    const std::vector<py::object>& draft_metadata,
+    const py::object& target_metadata,
+    const torch::Tensor& repair_token_ids,
+    const torch::Tensor& seed_token_ids,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& kv_seq_lens,
+    const torch::Tensor& draft_input_embedding,
+    const torch::Tensor& draft_topk_indices) {
+  CHECK(runner_);
+  py::gil_scoped_acquire gil;
+  py::object optional_topk =
+      draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
+  runner_.attr("update_metadata")(
+      metadata_list(draft_metadata), target_metadata, repair_token_ids);
+  LOG(INFO) << "MTP unified pair replay begin (reused graph)";
+  py::object output;
+  try {
+    output = runner_.attr("execute")(seed_token_ids,
+                                     base_positions,
+                                     kv_seq_lens,
+                                     draft_input_embedding,
+                                     optional_topk);
+  } catch (const py::error_already_set& error) {
+    LOG(ERROR) << "MTP unified pair replay failed: " << error.what();
+    throw;
+  }
+  LOG(INFO) << "MTP unified pair replay done (reused graph)";
+  return parse_graph_output(output);
 }
 
 }  // namespace xllm::detail

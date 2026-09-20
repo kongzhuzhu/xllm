@@ -594,6 +594,74 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._actual_seq_q = state.query
         self._actual_seq_kv = state.kv
 
+    def update_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        """Update replay inputs without rebuilding graph-owned backend state.
+
+        ``prepare`` is intentionally excluded from ACL graph replay: it may
+        allocate workspaces or synchronize a stream.  The graph still needs
+        the current request's slot/page/sequence values, so copy them into the
+        stable tensors that the prepared backend and captured kernels already
+        reference.  A shape or mode change is a new graph variant, never an
+        implicit eager fallback.
+        """
+        if self._metadata is None:
+            raise RuntimeError("attention backend must be prepared before metadata update")
+        if metadata.is_prefill != self._metadata.is_prefill:
+            raise RuntimeError("MTP graph metadata changed prefill/decode mode")
+        if metadata.is_chunked_prefill != self._metadata.is_chunked_prefill:
+            raise RuntimeError("MTP graph metadata changed chunked-prefill mode")
+        expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
+        block_table = expanded.block_table if expanded is not None else metadata.block_table
+        kv_seq_lens = expanded.kv_seq_lens if expanded is not None else metadata.kv_seq_lens
+        if self._block_table_i32 is None:
+            if block_table is not None:
+                raise RuntimeError("MTP graph metadata introduced a block table")
+        else:
+            if block_table is None:
+                raise RuntimeError("MTP graph metadata removed the block table")
+            block_table_i32 = block_table.to(torch.int32)
+            if block_table_i32.shape != self._block_table_i32.shape:
+                raise RuntimeError("MTP graph block-table shape changed")
+            self._block_table_i32.copy_(block_table_i32)
+
+        if kv_seq_lens is None:
+            if self._mla_actual_seq_kv is not None:
+                raise RuntimeError("MTP graph metadata removed KV sequence lengths")
+        else:
+            actual_seq_kv = kv_seq_lens.to(torch.int32)
+            if self._mla_actual_seq_kv is not None:
+                if actual_seq_kv.shape != self._mla_actual_seq_kv.shape:
+                    raise RuntimeError("MTP graph KV sequence-length shape changed")
+                self._mla_actual_seq_kv.copy_(actual_seq_kv)
+            if self._mla_actual_seq_q is not None:
+                actual_seq_q = torch.arange(
+                    1,
+                    actual_seq_kv.numel() + 1,
+                    dtype=torch.int32,
+                    device=actual_seq_kv.device,
+                )
+                if actual_seq_q.shape != self._mla_actual_seq_q.shape:
+                    raise RuntimeError("MTP graph query sequence-length shape changed")
+                self._mla_actual_seq_q.copy_(actual_seq_q)
+
+        host_kv_values = (
+            expanded.kv_seq_lens_host_values
+            if expanded is not None
+            else getattr(metadata, "kv_seq_lens_host_values", None)
+        )
+        if self._is_mla:
+            if self.requires_host_kv_lengths:
+                if host_kv_values is None:
+                    raise RuntimeError("MTP graph replay requires host KV lengths")
+                self._mla_actual_seq_kv_host = list(host_kv_values)
+                self._mla_actual_seq_q_host = list(range(1, len(host_kv_values) + 1))
+        elif self._block_table_i32 is not None:
+            if host_kv_values is None or len(host_kv_values) != self._block_table_i32.shape[0]:
+                raise RuntimeError("MTP graph replay host KV lengths do not match block table")
+            self._actual_seq_kv = list(host_kv_values)
+            self._actual_seq_q = list(range(1, self._block_table_i32.shape[0] + 1))
+        self._metadata = metadata
+
     def _allocate_graph_workspace(
         self,
         graph_batch_size: int,

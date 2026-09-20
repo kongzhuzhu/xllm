@@ -36,6 +36,10 @@ from typing import TYPE_CHECKING, Callable, Literal
 import torch
 import torch.nn as nn
 
+from xllm.python.model_executor.forward_context import (
+    AclGraphCaptureContext,
+    AclGraphExecutionState,
+)
 from xllm.python.model_executor.runners.base import (
     SpeculativeDeviceState,
     SpeculativeExecutionOutput,
@@ -86,10 +90,171 @@ class MtpRoleAdapter:
         if target and len(metadata_by_step) != 1:
             raise ValueError("target metadata plan must contain one K+1-row entry")
         self._executor = executor
-        self._metadata_by_step = tuple(metadata_by_step)
+        clone_metadata = getattr(metadata_by_step[0], "clone_for_graph", None)
+        if clone_metadata is None:
+            self._metadata_by_step = tuple(metadata_by_step)
+        else:
+            self._metadata_by_step = tuple(item.clone_for_graph() for item in metadata_by_step)
         self._target = target
         self._layer_synchronizer = layer_synchronizer
-        self._repair_token_ids = repair_token_ids
+        self._repair_token_ids = torch.empty_like(repair_token_ids) if repair_token_ids is not None else None
+        if self._repair_token_ids is not None:
+            self._repair_token_ids.copy_(repair_token_ids)
+        self._acl_graph: AclGraphCaptureContext | None = None
+        self._execution_state: AclGraphExecutionState | None = None
+        create_backends = getattr(executor, "create_mtp_role_backends", None)
+        self._attention_backends = (
+            tuple(create_backends(len(self._metadata_by_step))) if create_backends is not None else ()
+        )
+        if self._attention_backends and len(self._attention_backends) != len(self._metadata_by_step):
+            raise RuntimeError("MTP role backend count does not match metadata plan")
+        self._graph_prepared = False
+        self._step_execution_states: tuple[AclGraphExecutionState | None, ...] = ()
+
+    def bind_graph_context(
+        self,
+        acl_graph: AclGraphCaptureContext | None,
+        execution_state: AclGraphExecutionState | None,
+    ) -> None:
+        """Bind the role-local context owned by the enclosing graph entry."""
+        if acl_graph is not None and not self._attention_backends:
+            raise RuntimeError("MTP ACL graph requires one pre-prepared attention backend per fixed role metadata plan")
+        self._acl_graph = acl_graph
+        self._execution_state = execution_state
+        if execution_state is None:
+            self._step_execution_states = tuple(None for _ in self._metadata_by_step)
+        elif not self._step_execution_states:
+            # Each fixed invocation owns its graph workspace namespace. The
+            # attention backends use generic execution-buffer keys such as
+            # FIA_OUTPUT; sharing one map across K steps would alias draft
+            # and target workspaces when their shapes happen to match.
+            self._step_execution_states = tuple(AclGraphExecutionState({}) for _ in self._metadata_by_step)
+        elif len(self._step_execution_states) != len(self._metadata_by_step):
+            raise RuntimeError("MTP role execution-state plan changed after warmup")
+
+    def finish_warmup(self) -> None:
+        """Mark fixed role backends ready for graph capture and replay."""
+        if self._attention_backends:
+            self._graph_prepared = True
+
+    def can_update_metadata(self, metadata_by_step: Sequence[AttentionMetadata]) -> bool:
+        """Return whether a new invocation fits this captured role variant."""
+        if len(metadata_by_step) != len(self._metadata_by_step):
+            return False
+        can_update = all(hasattr(old_metadata, "update_from") for old_metadata in self._metadata_by_step)
+        if not can_update or not self._attention_backends:
+            return False
+        if not all(hasattr(backend, "update_graph_metadata") for backend in self._attention_backends):
+            return False
+        for old_metadata, new_metadata in zip(self._metadata_by_step, metadata_by_step):
+            if getattr(old_metadata, "is_prefill", None) != getattr(new_metadata, "is_prefill", None):
+                return False
+            if getattr(old_metadata, "is_chunked_prefill", None) != getattr(new_metadata, "is_chunked_prefill", None):
+                return False
+            for name in (
+                "slot_mapping",
+                "paged_kv_indptr",
+                "paged_kv_indices",
+                "paged_kv_last_page_len",
+                "q_cu_seq_lens",
+                "kv_cu_seq_lens",
+                "kv_seq_lens",
+                "q_seq_lens",
+                "block_table",
+            ):
+                old_value = getattr(old_metadata, name, None)
+                new_value = getattr(new_metadata, name, None)
+                if (old_value is None) != (new_value is None):
+                    return False
+                if old_value is not None and (
+                    old_value.shape != new_value.shape
+                    or old_value.dtype != new_value.dtype
+                    or old_value.device != new_value.device
+                ):
+                    return False
+            for name in ("kv_seq_lens_host_values", "q_seq_lens_host"):
+                old_value = getattr(old_metadata, name, None)
+                new_value = getattr(new_metadata, name, None)
+                if old_value is None or new_value is None:
+                    if old_value is not new_value:
+                        return False
+                elif len(old_value) != len(new_value):
+                    return False
+            old_tables = getattr(old_metadata, "multi_block_tables", ())
+            new_tables = getattr(new_metadata, "multi_block_tables", ())
+            if len(old_tables) != len(new_tables):
+                return False
+            for old_table, new_table in zip(old_tables, new_tables):
+                if (old_table is None) != (new_table is None):
+                    return False
+                if old_table is not None and (
+                    old_table.shape != new_table.shape
+                    or old_table.dtype != new_table.dtype
+                    or old_table.device != new_table.device
+                ):
+                    return False
+            old_expanded = getattr(old_metadata, "expanded_decode_metadata", None)
+            new_expanded = getattr(new_metadata, "expanded_decode_metadata", None)
+            old_enabled = bool(getattr(old_expanded, "enabled", False)) if old_expanded is not None else False
+            new_enabled = bool(getattr(new_expanded, "enabled", False)) if new_expanded is not None else False
+            if old_enabled != new_enabled:
+                return False
+            if old_enabled:
+                for name in (
+                    "kv_seq_lens",
+                    "block_table",
+                    "paged_kv_indptr",
+                    "paged_kv_indices",
+                    "paged_kv_last_page_len",
+                    "paged_attention_tiling_data",
+                    "kv_seq_lens_host",
+                ):
+                    old_value = getattr(old_expanded, name, None)
+                    new_value = getattr(new_expanded, name, None)
+                    if (old_value is None) != (new_value is None):
+                        return False
+                    if old_value is not None and (
+                        old_value.shape != new_value.shape
+                        or old_value.dtype != new_value.dtype
+                        or old_value.device != new_value.device
+                    ):
+                        return False
+                old_host_values = getattr(old_expanded, "kv_seq_lens_host_values", None)
+                new_host_values = getattr(new_expanded, "kv_seq_lens_host_values", None)
+                if (old_host_values is None) != (new_host_values is None):
+                    return False
+                if old_host_values is not None and len(old_host_values) != len(new_host_values):
+                    return False
+        return True
+
+    @torch.inference_mode()
+    def update_metadata(
+        self,
+        metadata_by_step: Sequence[AttentionMetadata],
+        repair_token_ids: torch.Tensor | None,
+    ) -> None:
+        """Copy a new invocation into the captured role's stable metadata."""
+        if not self._graph_prepared:
+            raise RuntimeError("MTP role metadata cannot update before graph warmup")
+        if not self.can_update_metadata(metadata_by_step):
+            raise RuntimeError("MTP role metadata is not compatible with captured graph variant")
+        if (self._repair_token_ids is None) != (repair_token_ids is None):
+            raise RuntimeError("MTP repair-token presence changed after capture")
+        if self._repair_token_ids is not None:
+            assert repair_token_ids is not None
+            if repair_token_ids.shape != self._repair_token_ids.shape:
+                raise RuntimeError("MTP repair-token shape changed after capture")
+            self._repair_token_ids.copy_(repair_token_ids)
+        for old_metadata, new_metadata, backend in zip(
+            self._metadata_by_step,
+            metadata_by_step,
+            self._attention_backends,
+        ):
+            old_metadata.update_from(new_metadata)
+            update_backend = getattr(backend, "update_graph_metadata", None)
+            if update_backend is None:
+                raise RuntimeError("MTP graph attention backend does not support metadata replay updates")
+            update_backend(old_metadata)
 
     def __call__(
         self,
@@ -120,14 +285,34 @@ class MtpRoleAdapter:
                 dtype=torch.long,
                 device=token_ids.device,
             )
-        output = self._executor.eager_runner.execute(
-            call_token_ids,
-            call_positions,
-            self._metadata_by_step[metadata_index],
-            call_embedding,
-            self._layer_synchronizer,
-            topk_indices,
-        )
+        execute_role = getattr(self._executor, "execute_mtp_role", None)
+        if execute_role is None:
+            if self._acl_graph is not None or self._execution_state is not None:
+                raise TypeError("MTP graph adapter executor lacks execute_mtp_role")
+            output = self._executor.eager_runner.execute(
+                call_token_ids,
+                call_positions,
+                self._metadata_by_step[metadata_index],
+                call_embedding,
+                self._layer_synchronizer,
+                topk_indices,
+            )
+        else:
+            execution_state = (
+                self._step_execution_states[metadata_index] if self._step_execution_states else self._execution_state
+            )
+            output = execute_role(
+                call_token_ids,
+                call_positions,
+                self._metadata_by_step[metadata_index],
+                call_embedding,
+                self._layer_synchronizer,
+                topk_indices,
+                acl_graph=self._acl_graph,
+                execution_state=execution_state,
+                attention_backend=(self._attention_backends[metadata_index] if self._attention_backends else None),
+                skip_prepare=self._graph_prepared,
+            )
         if selected_rows is None:
             return output
         if isinstance(output, tuple):
@@ -322,6 +507,54 @@ class MtpGraphRecipe(nn.Module):
             persistent=False,
         )
 
+    def bind_graph_contexts(
+        self,
+        acl_graph: AclGraphCaptureContext | None,
+        draft_state: AclGraphExecutionState | None,
+        target_state: AclGraphExecutionState | None,
+    ) -> None:
+        """Bind role-local graph state without assuming adapter internals."""
+        for forward, state in (
+            (self.draft_forward, draft_state),
+            (self.target_forward, target_state),
+        ):
+            bind_context = getattr(forward, "bind_graph_context", None)
+            if bind_context is not None:
+                bind_context(acl_graph, state)
+
+    def finish_warmup(self) -> None:
+        """Freeze role backend metadata before entering ACL graph capture."""
+        for forward in (self.draft_forward, self.target_forward):
+            finish_warmup = getattr(forward, "finish_warmup", None)
+            if finish_warmup is not None:
+                finish_warmup()
+
+    def can_update_metadata(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+    ) -> bool:
+        """Check whether both role adapters can consume a new invocation."""
+        draft_check = getattr(self.draft_forward, "can_update_metadata", None)
+        target_check = getattr(self.target_forward, "can_update_metadata", None)
+        if draft_check is None or target_check is None:
+            return False
+        return bool(draft_check(draft_metadata)) and bool(target_check((target_metadata,)))
+
+    def update_metadata(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+        repair_token_ids: torch.Tensor,
+    ) -> None:
+        """Update both role metadata and the captured repair-token buffer."""
+        update_draft = getattr(self.draft_forward, "update_metadata", None)
+        update_target = getattr(self.target_forward, "update_metadata", None)
+        if update_draft is None or update_target is None:
+            raise RuntimeError("MTP graph recipe does not support metadata replay updates")
+        update_draft(draft_metadata, repair_token_ids)
+        update_target((target_metadata,), None)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -346,15 +579,18 @@ class MtpGraphRecipe(nn.Module):
             if self.draft_activate is not None:
                 self.draft_activate()
             step_positions = base_positions + step
-            draft_output = _body_output(
-                self.draft_forward(
-                    current_ids,
-                    step_positions,
-                    step,
-                    current_embedding,
-                    current_topk_indices,
+            try:
+                draft_output = _body_output(
+                    self.draft_forward(
+                        current_ids,
+                        step_positions,
+                        step,
+                        current_embedding,
+                        current_topk_indices,
+                    )
                 )
-            )
+            except Exception as exc:
+                raise RuntimeError(f"MTP draft body step {step} failed: {exc}") from exc
             draft_hidden = draft_output.hidden
             step_logits = self.draft_logits(draft_hidden)
             if step_logits.shape != (self.batch_size, self.vocab_size):
@@ -379,7 +615,10 @@ class MtpGraphRecipe(nn.Module):
         ).reshape(-1)
         if self.target_activate is not None:
             self.target_activate()
-        target_output = _body_output(self.target_forward(target_ids, target_positions, -1, None, None))
+        try:
+            target_output = _body_output(self.target_forward(target_ids, target_positions, -1, None, None))
+        except Exception as exc:
+            raise RuntimeError(f"MTP target body failed: {exc}") from exc
         target_hidden = target_output.hidden
         if target_hidden.ndim != 2 or target_hidden.shape[0] != self.batch_size * (self.speculative_tokens + 1):
             raise ValueError("target hidden must have one row per target verification token")
@@ -477,6 +716,9 @@ class MtpAclGraphRunner:
         self._captured = False
         self._graph = None
         self._capture_stream = None
+        self._execution_states = (
+            (AclGraphExecutionState({}), AclGraphExecutionState({})) if backend == "aclgraph" else (None, None)
+        )
         self._entry = MtpGraphEntry(
             MtpGraphCapability(
                 speculative_tokens=recipe.speculative_tokens,
@@ -567,6 +809,27 @@ class MtpAclGraphRunner:
             self._static_draft_topk_indices,
         )
 
+    def can_update_metadata(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+    ) -> bool:
+        """Return whether the captured graph can reuse stable metadata storage."""
+        if not self._captured:
+            return False
+        return self.recipe.can_update_metadata(draft_metadata, target_metadata)
+
+    def update_metadata(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+        repair_token_ids: torch.Tensor,
+    ) -> None:
+        """Update role-local metadata before the next graph replay."""
+        if not self._captured:
+            raise RuntimeError("MTP ACL graph must be captured before metadata update")
+        self.recipe.update_metadata(draft_metadata, target_metadata, repair_token_ids)
+
     def capture(
         self,
         seed_token_ids: torch.Tensor,
@@ -584,30 +847,46 @@ class MtpAclGraphRunner:
         self._validate_recurrent_inputs(draft_input_embedding, draft_topk_indices)
         if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
             raise RuntimeError("ACL graph backend requires torch.npu.NPUGraph")
+        stage = "input copy"
+        try:
+            self._static_seed_token_ids.copy_(seed_token_ids)
+            self._static_base_positions.copy_(base_positions)
+            if self._static_kv_seq_lens is not None:
+                assert kv_seq_lens is not None
+                self._static_kv_seq_lens.copy_(kv_seq_lens)
+            if self._static_draft_input_embedding is not None:
+                assert draft_input_embedding is not None
+                self._static_draft_input_embedding.copy_(draft_input_embedding)
+            if self._static_draft_topk_indices is not None:
+                assert draft_topk_indices is not None
+                self._static_draft_topk_indices.copy_(draft_topk_indices)
 
-        self._static_seed_token_ids.copy_(seed_token_ids)
-        self._static_base_positions.copy_(base_positions)
-        if self._static_kv_seq_lens is not None:
-            assert kv_seq_lens is not None
-            self._static_kv_seq_lens.copy_(kv_seq_lens)
-        if self._static_draft_input_embedding is not None:
-            assert draft_input_embedding is not None
-            self._static_draft_input_embedding.copy_(draft_input_embedding)
-        if self._static_draft_topk_indices is not None:
-            assert draft_topk_indices is not None
-            self._static_draft_topk_indices.copy_(draft_topk_indices)
+            stage = "warmup stream"
+            self._capture_stream = torch.npu.Stream(device=self.recipe.device)
+            self._capture_stream.wait_stream(torch.npu.current_stream())
+            self.recipe.bind_graph_contexts(None, *self._execution_states)
+            stage = "warmup recipe"
+            with torch.npu.stream(self._capture_stream):
+                for _ in range(self.warmup_steps):
+                    self._prepare_static_inputs()
+                    self._run_static()
+            self.recipe.finish_warmup()
+            stage = "warmup synchronize"
+            self._capture_stream.synchronize()
+            torch.npu.current_stream().wait_stream(self._capture_stream)
+            torch.npu.synchronize()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                stage = "warmup collective barrier"
+                torch.distributed.barrier()
 
-        self._capture_stream = torch.npu.Stream(device=self.recipe.device)
-        self._capture_stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(self._capture_stream):
-            for _ in range(self.warmup_steps):
-                self._prepare_static_inputs()
-                self._run_static()
-        torch.npu.synchronize()
-
-        self._graph = torch.npu.NPUGraph()
-        with torch.npu.stream(self._capture_stream), torch.npu.graph(self._graph, stream=self._capture_stream):
-            self._static_output = self._run_static()
+            stage = "graph capture"
+            self._graph = torch.npu.NPUGraph()
+            capture_context = AclGraphCaptureContext(self._capture_stream, [])
+            self.recipe.bind_graph_contexts(capture_context, *self._execution_states)
+            with torch.npu.stream(self._capture_stream), torch.npu.graph(self._graph, stream=self._capture_stream):
+                self._static_output = self._run_static()
+        except Exception as exc:
+            raise RuntimeError(f"MTP ACL graph capture failed during {stage}: {exc}") from exc
         self._entry.graph = self._graph
         self._entry.generation += 1
         self._entry.captured = True

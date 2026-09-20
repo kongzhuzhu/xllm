@@ -18,6 +18,9 @@ limitations under the License.
 #include <pybind11/stl.h>
 #include <torch/python.h>
 
+#include <algorithm>
+#include <optional>
+#include <string>
 #include <utility>
 
 #include "core/framework/model/model_input_params.h"
@@ -28,6 +31,46 @@ namespace py = pybind11;
 
 namespace xllm {
 namespace {
+
+void copy_stable_tensor(torch::Tensor& destination,
+                        const torch::Tensor& source,
+                        const char* name) {
+  TORCH_CHECK(destination.defined() == source.defined(),
+              "MTP graph metadata field ",
+              name,
+              " changed definedness during replay");
+  if (!source.defined()) {
+    return;
+  }
+  TORCH_CHECK(destination.sizes() == source.sizes(),
+              "MTP graph metadata field ",
+              name,
+              " changed shape from ",
+              destination.sizes(),
+              " to ",
+              source.sizes());
+  TORCH_CHECK(destination.scalar_type() == source.scalar_type(),
+              "MTP graph metadata field ",
+              name,
+              " changed dtype");
+  TORCH_CHECK(destination.device() == source.device(),
+              "MTP graph metadata field ",
+              name,
+              " changed device");
+  destination.copy_(source);
+}
+
+void copy_stable_optional_tensor(std::optional<torch::Tensor>& destination,
+                                 const std::optional<torch::Tensor>& source,
+                                 const char* name) {
+  TORCH_CHECK(destination.has_value() == source.has_value(),
+              "MTP graph metadata field ",
+              name,
+              " changed optional presence during replay");
+  if (source.has_value()) {
+    copy_stable_tensor(*destination, *source, name);
+  }
+}
 
 struct PythonObjectHolder final {
   explicit PythonObjectHolder(py::object value) : value(std::move(value)) {}
@@ -153,7 +196,9 @@ void register_attention_metadata_views(py::module_& module) {
                              &PyAttentionMetadataView::is_chunked_prefill)
       .def_property_readonly("is_mixed", &PyAttentionMetadataView::is_mixed)
       .def_property_readonly("is_spec_verify",
-                             &PyAttentionMetadataView::is_spec_verify);
+                             &PyAttentionMetadataView::is_spec_verify)
+      .def("update_from", &PyAttentionMetadataView::update_from)
+      .def("clone_for_graph", &PyAttentionMetadataView::clone_for_graph);
 }
 
 PyExpandedDecodeMetadataView::PyExpandedDecodeMetadataView(
@@ -447,6 +492,225 @@ bool PyAttentionMetadataView::is_mixed() const { return metadata_->is_mixed; }
 
 bool PyAttentionMetadataView::is_spec_verify() const {
   return metadata_->is_spec_verify;
+}
+
+void PyAttentionMetadataView::update_from(
+    const PyAttentionMetadataView& source) {
+  TORCH_CHECK(metadata_ != nullptr && source.metadata_ != nullptr,
+              "MTP graph metadata view is not initialized");
+  TORCH_CHECK(metadata_->is_prefill == source.metadata_->is_prefill,
+              "MTP graph metadata changed prefill/decode mode");
+  TORCH_CHECK(
+      metadata_->is_chunked_prefill == source.metadata_->is_chunked_prefill,
+      "MTP graph metadata changed chunked-prefill mode");
+  TORCH_CHECK(metadata_->is_mixed == source.metadata_->is_mixed,
+              "MTP graph metadata changed mixed mode");
+  TORCH_CHECK(metadata_->is_spec_verify == source.metadata_->is_spec_verify,
+              "MTP graph metadata changed spec-verify mode");
+
+  copy_stable_tensor(
+      metadata_->slot_mapping, source.metadata_->slot_mapping, "slot_mapping");
+  copy_stable_tensor(metadata_->paged_kv_indptr,
+                     source.metadata_->paged_kv_indptr,
+                     "paged_kv_indptr");
+  copy_stable_tensor(metadata_->paged_kv_indices,
+                     source.metadata_->paged_kv_indices,
+                     "paged_kv_indices");
+  copy_stable_tensor(metadata_->paged_kv_last_page_len,
+                     source.metadata_->paged_kv_last_page_len,
+                     "paged_kv_last_page_len");
+  copy_stable_tensor(metadata_->q_cu_seq_lens,
+                     source.metadata_->q_cu_seq_lens,
+                     "q_cu_seq_lens");
+  copy_stable_tensor(metadata_->kv_cu_seq_lens,
+                     source.metadata_->kv_cu_seq_lens,
+                     "kv_cu_seq_lens");
+  copy_stable_tensor(
+      metadata_->kv_seq_lens, source.metadata_->kv_seq_lens, "kv_seq_lens");
+  copy_stable_tensor(
+      metadata_->q_seq_lens, source.metadata_->q_seq_lens, "q_seq_lens");
+  copy_stable_tensor(
+      metadata_->block_table, source.metadata_->block_table, "block_table");
+  copy_stable_tensor(metadata_->has_initial_states,
+                     source.metadata_->has_initial_states,
+                     "has_initial_states");
+#if defined(USE_NPU)
+  copy_stable_tensor(metadata_->q_seq_lens_host,
+                     source.metadata_->q_seq_lens_host,
+                     "q_seq_lens_host");
+  copy_stable_tensor(metadata_->kv_seq_lens_host,
+                     source.metadata_->kv_seq_lens_host,
+                     "kv_seq_lens_host");
+  copy_stable_tensor(metadata_->paged_attention_tiling_data,
+                     source.metadata_->paged_attention_tiling_data,
+                     "paged_attention_tiling_data");
+  copy_stable_tensor(metadata_->fia_attn_mask,
+                     source.metadata_->fia_attn_mask,
+                     "fia_attn_mask");
+#endif
+
+  copy_stable_optional_tensor(
+      metadata_->qo_indptr, source.metadata_->qo_indptr, "qo_indptr");
+  copy_stable_tensor(
+      metadata_->mrope_cos, source.metadata_->mrope_cos, "mrope_cos");
+  copy_stable_tensor(
+      metadata_->mrope_sin, source.metadata_->mrope_sin, "mrope_sin");
+  copy_stable_tensor(
+      metadata_->attn_mask, source.metadata_->attn_mask, "attn_mask");
+
+  TORCH_CHECK(metadata_->expanded_decode.enabled ==
+                  source.metadata_->expanded_decode.enabled,
+              "MTP graph expanded-decode mode changed");
+  if (metadata_->expanded_decode.enabled) {
+    copy_stable_tensor(metadata_->expanded_decode.kv_seq_lens,
+                       source.metadata_->expanded_decode.kv_seq_lens,
+                       "expanded.kv_seq_lens");
+    copy_stable_tensor(metadata_->expanded_decode.block_table,
+                       source.metadata_->expanded_decode.block_table,
+                       "expanded.block_table");
+    copy_stable_tensor(metadata_->expanded_decode.paged_kv_indptr,
+                       source.metadata_->expanded_decode.paged_kv_indptr,
+                       "expanded.paged_kv_indptr");
+    copy_stable_tensor(metadata_->expanded_decode.paged_kv_indices,
+                       source.metadata_->expanded_decode.paged_kv_indices,
+                       "expanded.paged_kv_indices");
+    copy_stable_tensor(metadata_->expanded_decode.paged_kv_last_page_len,
+                       source.metadata_->expanded_decode.paged_kv_last_page_len,
+                       "expanded.paged_kv_last_page_len");
+    copy_stable_tensor(
+        metadata_->expanded_decode.paged_attention_tiling_data,
+        source.metadata_->expanded_decode.paged_attention_tiling_data,
+        "expanded.paged_attention_tiling_data");
+    copy_stable_tensor(metadata_->expanded_decode.kv_seq_lens_host,
+                       source.metadata_->expanded_decode.kv_seq_lens_host,
+                       "expanded.kv_seq_lens_host");
+    TORCH_CHECK(
+        metadata_->expanded_decode.kv_seq_lens_host_vec.size() ==
+            source.metadata_->expanded_decode.kv_seq_lens_host_vec.size(),
+        "MTP graph expanded host KV length count changed");
+    metadata_->expanded_decode.kv_seq_lens_host_vec =
+        source.metadata_->expanded_decode.kv_seq_lens_host_vec;
+  }
+
+  TORCH_CHECK(multi_block_tables_.size() == source.multi_block_tables_.size(),
+              "MTP graph metadata multi-block table count changed");
+  for (size_t i = 0; i < multi_block_tables_.size(); ++i) {
+    copy_stable_tensor(multi_block_tables_[i],
+                       source.multi_block_tables_[i],
+                       "multi_block_tables");
+  }
+  copy_stable_tensor(linear_state_indices_,
+                     source.linear_state_indices_,
+                     "linear_state_indices");
+  copy_stable_tensor(dsa_positions_, source.dsa_positions_, "dsa_positions");
+  copy_stable_tensor(dsa_cos_sin_, source.dsa_cos_sin_, "dsa_cos_sin");
+  copy_stable_tensor(dsa_c4_cos_sin_, source.dsa_c4_cos_sin_, "dsa_c4_cos_sin");
+  copy_stable_tensor(
+      dsa_c128_cos_sin_, source.dsa_c128_cos_sin_, "dsa_c128_cos_sin");
+
+  TORCH_CHECK(kv_seq_lens_host_values().size() ==
+                  source.kv_seq_lens_host_values().size(),
+              "MTP graph metadata host KV length count changed");
+  TORCH_CHECK(q_seq_lens_host_.numel() == source.q_seq_lens_host_.numel(),
+              "MTP graph metadata host Q length count changed");
+  std::copy(source.metadata_->kv_seq_lens_vec.begin(),
+            source.metadata_->kv_seq_lens_vec.end(),
+            metadata_->kv_seq_lens_vec.begin());
+  std::copy(source.metadata_->q_seq_lens_vec.begin(),
+            source.metadata_->q_seq_lens_vec.end(),
+            metadata_->q_seq_lens_vec.begin());
+  if (kv_seq_lens_host_.defined()) {
+    kv_seq_lens_host_.copy_(source.kv_seq_lens_host_);
+  }
+  if (q_seq_lens_host_.defined()) {
+    q_seq_lens_host_.copy_(source.q_seq_lens_host_);
+  }
+  dp_execution_token_counts_ = source.dp_execution_token_counts_;
+  dp_global_sequence_nums_ = source.dp_global_sequence_nums_;
+  dp_is_decode_ = source.dp_is_decode_;
+
+  // Decode max lengths are request data and grow after every accepted token.
+  // They are updated in the stable view; graph-shape changes are guarded by
+  // tensor capacities above, not by the current scalar length value.
+  metadata_->max_query_len = source.metadata_->max_query_len;
+  metadata_->max_seq_len = source.metadata_->max_seq_len;
+  dsa_metadata_holder_ = source.dsa_metadata_holder_;
+  dsa_graph_block_table_cols_ = source.dsa_graph_block_table_cols_;
+  dsa_graph_mode_ = source.dsa_graph_mode_;
+}
+
+PyAttentionMetadataView PyAttentionMetadataView::clone_for_graph() const {
+  TORCH_CHECK(metadata_ != nullptr,
+              "MTP graph metadata view is not initialized");
+  auto cloned = std::make_shared<layer::AttentionMetadata>(*metadata_);
+  const auto clone_tensor = [](const torch::Tensor& tensor) {
+    return tensor.defined() ? tensor.clone() : torch::Tensor();
+  };
+  cloned->q_cu_seq_lens = clone_tensor(metadata_->q_cu_seq_lens);
+  cloned->kv_cu_seq_lens = clone_tensor(metadata_->kv_cu_seq_lens);
+  cloned->kv_seq_lens = clone_tensor(metadata_->kv_seq_lens);
+  cloned->q_seq_lens = clone_tensor(metadata_->q_seq_lens);
+  cloned->block_table = clone_tensor(metadata_->block_table);
+  cloned->slot_mapping = clone_tensor(metadata_->slot_mapping);
+  cloned->mrope_cos = clone_tensor(metadata_->mrope_cos);
+  cloned->mrope_sin = clone_tensor(metadata_->mrope_sin);
+  cloned->paged_kv_indptr = clone_tensor(metadata_->paged_kv_indptr);
+  cloned->paged_kv_indices = clone_tensor(metadata_->paged_kv_indices);
+  cloned->paged_kv_last_page_len =
+      clone_tensor(metadata_->paged_kv_last_page_len);
+  cloned->qo_indptr =
+      metadata_->qo_indptr.has_value()
+          ? std::optional<torch::Tensor>(clone_tensor(*metadata_->qo_indptr))
+          : std::nullopt;
+  cloned->full_k_cache = clone_tensor(metadata_->full_k_cache);
+  cloned->full_v_cache = clone_tensor(metadata_->full_v_cache);
+  cloned->unshared_k_cache = clone_tensor(metadata_->unshared_k_cache);
+  cloned->unshared_v_cache = clone_tensor(metadata_->unshared_v_cache);
+  cloned->step_tensor = clone_tensor(metadata_->step_tensor);
+  cloned->chunk_indices = clone_tensor(metadata_->chunk_indices);
+  cloned->batch = clone_tensor(metadata_->batch);
+  cloned->token_block_offset = clone_tensor(metadata_->token_block_offset);
+  cloned->has_initial_states = clone_tensor(metadata_->has_initial_states);
+  cloned->attn_mask = clone_tensor(metadata_->attn_mask);
+#if defined(USE_NPU)
+  cloned->q_seq_lens_host = clone_tensor(metadata_->q_seq_lens_host);
+  cloned->kv_seq_lens_host = clone_tensor(metadata_->kv_seq_lens_host);
+  cloned->paged_attention_tiling_data =
+      clone_tensor(metadata_->paged_attention_tiling_data);
+  cloned->fia_attn_mask = clone_tensor(metadata_->fia_attn_mask);
+#endif
+  cloned->expanded_decode.kv_seq_lens =
+      clone_tensor(metadata_->expanded_decode.kv_seq_lens);
+  cloned->expanded_decode.block_table =
+      clone_tensor(metadata_->expanded_decode.block_table);
+  cloned->expanded_decode.paged_kv_indptr =
+      clone_tensor(metadata_->expanded_decode.paged_kv_indptr);
+  cloned->expanded_decode.paged_kv_indices =
+      clone_tensor(metadata_->expanded_decode.paged_kv_indices);
+  cloned->expanded_decode.paged_kv_last_page_len =
+      clone_tensor(metadata_->expanded_decode.paged_kv_last_page_len);
+  cloned->expanded_decode.paged_attention_tiling_data =
+      clone_tensor(metadata_->expanded_decode.paged_attention_tiling_data);
+  cloned->expanded_decode.kv_seq_lens_host =
+      clone_tensor(metadata_->expanded_decode.kv_seq_lens_host);
+
+  PyAttentionMetadataView result(std::move(cloned));
+  result.multi_block_tables_.reserve(multi_block_tables_.size());
+  for (const torch::Tensor& table : multi_block_tables_) {
+    result.multi_block_tables_.push_back(clone_tensor(table));
+  }
+  result.linear_state_indices_ = clone_tensor(linear_state_indices_);
+  result.dp_execution_token_counts_ = dp_execution_token_counts_;
+  result.dp_global_sequence_nums_ = dp_global_sequence_nums_;
+  result.dp_is_decode_ = dp_is_decode_;
+  result.dsa_metadata_holder_ = dsa_metadata_holder_;
+  result.dsa_positions_ = clone_tensor(dsa_positions_);
+  result.dsa_cos_sin_ = clone_tensor(dsa_cos_sin_);
+  result.dsa_c4_cos_sin_ = clone_tensor(dsa_c4_cos_sin_);
+  result.dsa_c128_cos_sin_ = clone_tensor(dsa_c128_cos_sin_);
+  result.dsa_graph_block_table_cols_ = dsa_graph_block_table_cols_;
+  result.dsa_graph_mode_ = dsa_graph_mode_;
+  return result;
 }
 
 torch::Tensor PyAttentionMetadataView::make_host_int32_view(

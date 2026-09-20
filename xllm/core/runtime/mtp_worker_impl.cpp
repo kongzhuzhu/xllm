@@ -1430,27 +1430,40 @@ void MTPWorkerImpl::prepare_draft_sampling(
 
 bool MTPWorkerImpl::supports_unified_python_mtp_graph() const {
 #if defined(USE_NPU)
-  const bool pure_ep_topology =
-      parallel_args_.ep_size() > 1 &&
-      parallel_args_.ep_size() == parallel_args_.world_size() &&
-      parallel_args_.tp_size() == parallel_args_.world_size();
+  // For LLM decode, tp_size is the effective attention TP width published by
+  // the communicator (world_size / dp_size for the v1 cp=1 path).  It is not
+  // an independent launch knob.  EP is a separate MoE topology and may be
+  // equal to or smaller than world_size.  CP is a prefill-only concern and is
+  // outside the v1 decode graph scope.
+  const int32_t world_size = std::max<int32_t>(parallel_args_.world_size(), 1);
+  const int32_t dp_size = std::max<int32_t>(parallel_args_.dp_size(), 1);
+  const int32_t tp_size = parallel_args_.tp_size();
+  const int32_t ep_size = parallel_args_.ep_size();
+  const bool attention_topology_valid =
+      tp_size > 0 && tp_size * dp_size == world_size;
+  const bool moe_topology_valid = ep_size > 0 && world_size % ep_size == 0;
+  const int32_t moe_tp_size = moe_topology_valid ? world_size / ep_size : 0;
   const bool unsupported_shape =
+      !::xllm::ExecutionConfig::get_instance().enable_graph() ||
       options_.num_speculative_tokens() <= 0 || impl_ == nullptr ||
-      draft_impl_ == nullptr || parallel_args_.cp_size() != 1 ||
-      parallel_args_.dp_size() != 1 ||
-      (parallel_args_.tp_size() != 1 && !pure_ep_topology) ||
-      enable_schedule_overlap() ||
+      draft_impl_ == nullptr || !attention_topology_valid ||
+      !moe_topology_valid || parallel_args_.dp_size() != 1 ||
+      parallel_args_.cp_size() != 1 || enable_schedule_overlap() ||
       !ModelConfig::is_python_model_impl(context_.get_model_impl()) ||
       !ModelConfig::is_python_model_impl(
           draft_impl_->context_.get_model_impl());
   if (unsupported_shape) {
     LOG(INFO) << "MTP unified Python graph rejected: k="
-              << options_.num_speculative_tokens()
+              << options_.num_speculative_tokens() << ", enable_graph="
+              << ::xllm::ExecutionConfig::get_instance().enable_graph()
               << ", tp=" << parallel_args_.tp_size()
               << ", dp=" << parallel_args_.dp_size()
               << ", cp=" << parallel_args_.cp_size()
               << ", ep=" << parallel_args_.ep_size()
               << ", world=" << parallel_args_.world_size()
+              << ", attention_topology_valid=" << attention_topology_valid
+              << ", moe_topology_valid=" << moe_topology_valid
+              << ", moe_tp=" << moe_tp_size
               << ", overlap=" << enable_schedule_overlap()
               << ", model_impl=" << context_.get_model_impl()
               << ", draft_model_impl="
@@ -1538,33 +1551,66 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
   CHECK(target_python_executor != nullptr && draft_python_executor != nullptr)
       << "unified Python MTP graph requires Python target and draft executors";
 
-  std::vector<py::object> draft_metadata;
-  draft_metadata.reserve(draft_inputs.size());
-  py::object target_metadata;
+  detail::MtpPyGraphOutput graph_output;
   {
+    // Declare Python-owned temporaries after the guard so both normal return
+    // and exception unwinding release them before releasing the GIL. Otherwise
+    // a construction error can be hidden by a second fault in PyErr_Fetch.
     py::gil_scoped_acquire gil;
+    std::vector<py::object> draft_metadata;
+    draft_metadata.reserve(draft_inputs.size());
     for (const ForwardInput& draft_input : draft_inputs) {
       draft_metadata.emplace_back(
           draft_python_executor->attention_metadata_view(
               draft_input.input_params));
     }
-    target_metadata = target_python_executor->attention_metadata_view(
-        validate_input.input_params);
-  }
+    py::object target_metadata =
+        target_python_executor->attention_metadata_view(
+            validate_input.input_params);
 
-  unified_python_mtp_graph_ =
-      detail::MtpPyExecutorPair::create(*target_python_executor,
-                                        *draft_python_executor,
-                                        draft_metadata,
-                                        target_metadata,
-                                        repair_token_ids,
-                                        kv_seq_lens,
-                                        batch_size,
-                                        num_speculative_tokens,
-                                        context_.get_model_args().vocab_size());
-  detail::MtpPyGraphOutput graph_output =
-      unified_python_mtp_graph_->capture_and_execute(
+    detail::MtpPyExecutorPair* graph_variant = nullptr;
+    size_t graph_variant_index = 0;
+    for (size_t index = 0; index < unified_python_mtp_graph_variants_.size();
+         ++index) {
+      if (unified_python_mtp_graph_variants_[index]->can_update_metadata(
+              draft_metadata, target_metadata)) {
+        graph_variant = unified_python_mtp_graph_variants_[index].get();
+        graph_variant_index = index;
+        break;
+      }
+    }
+    if (graph_variant == nullptr) {
+      LOG(INFO) << "MTP unified pair create begin; variant="
+                << unified_python_mtp_graph_variants_.size();
+      std::unique_ptr<detail::MtpPyExecutorPair> new_variant =
+          detail::MtpPyExecutorPair::create(
+              *target_python_executor,
+              *draft_python_executor,
+              draft_metadata,
+              target_metadata,
+              repair_token_ids,
+              kv_seq_lens,
+              batch_size,
+              num_speculative_tokens,
+              context_.get_model_args().vocab_size());
+      LOG(INFO) << "MTP unified pair create done; capture begin; variant="
+                << unified_python_mtp_graph_variants_.size();
+      graph_output = new_variant->capture_and_execute(
           seed_token_ids, base_positions, kv_seq_lens, draft_embedding);
+      unified_python_mtp_graph_variants_.emplace_back(std::move(new_variant));
+    } else {
+      LOG(INFO)
+          << "MTP unified pair variant metadata compatible; reusing capture; "
+          << "variant=" << graph_variant_index;
+      graph_output = graph_variant->update_and_execute(draft_metadata,
+                                                       target_metadata,
+                                                       repair_token_ids,
+                                                       seed_token_ids,
+                                                       base_positions,
+                                                       kv_seq_lens,
+                                                       draft_embedding);
+    }
+  }
 
   CHECK(graph_output.committed_tokens.defined())
       << "unified Python MTP graph did not return committed tokens";
@@ -1593,6 +1639,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
       batch_size,
       num_speculative_tokens + 1,
       use_chunked_prefill_spec_verify_path());
+
+  // The device-target-context path keeps the preceding result pending so the
+  // next scheduler turn can prepare draft metadata without a host round trip.
+  // A new unified graph result cannot be staged while that single pending slot
+  // is occupied.  Consume the previous result here, after the current graph
+  // has completed its device work, then publish the new result.  This is an
+  // explicit state transition, not a fallback to the legacy MTP executor.
+  if (pending_target_context_.accepted_tokens.defined()) {
+    LOG(INFO) << "MTP unified graph consuming previous target context before "
+                 "staging the next result";
+    flush_pending_target_context();
+  }
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
   StreamEventPtr ready_event;
@@ -1677,7 +1735,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   }
   if (!use_device_target_context) {
     // Batch transitions are uncommon in steady decode.  Materialize the most
-    // recent target state only for that fallback; the normal path below never
+    // recent target state before preparing the next graph invocation; the
+    // steady path below never
     // synchronizes the worker thread with the NPU.
     flush_pending_target_context();
     if (matching_device_target_context) {
@@ -1708,9 +1767,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   const bool has_json_object_states = !input.json_object_states.empty();
   const bool use_unified_python_graph =
       supports_unified_python_mtp_graph() && !use_prelaunched_first_draft &&
-      !use_device_target_context && !has_json_object_states &&
-      !use_adaptive_speculative_decode &&
-      input.sampling_params.all_greedy_sample;
+      !has_json_object_states && !use_adaptive_speculative_decode &&
+      input.sampling_params.all_greedy_sample &&
+      !input.sampling_params.logprobs &&
+      input.sampling_params.max_top_logprobs == 0;
+  if (!input.sampling_params.logprobs &&
+      input.sampling_params.max_top_logprobs != 0) {
+    LOG(INFO) << "MTP unified Python graph rejected: top-logprob output is "
+                 "not part of the fused greedy output contract";
+  } else if (input.sampling_params.logprobs) {
+    LOG(INFO) << "MTP unified Python graph rejected: logprob output is not "
+                 "part of the fused greedy output contract";
+  }
   std::vector<uint8_t> json_invalid_suffix;
   Timer timer;
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";

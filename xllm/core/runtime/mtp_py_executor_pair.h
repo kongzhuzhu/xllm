@@ -63,6 +63,19 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
       const torch::Tensor& draft_input_embedding,
       const torch::Tensor& draft_topk_indices = torch::Tensor());
 
+  bool can_update_metadata(const std::vector<pybind11::object>& draft_metadata,
+                           const pybind11::object& target_metadata) const;
+
+  MtpPyGraphOutput update_and_execute(
+      const std::vector<pybind11::object>& draft_metadata,
+      const pybind11::object& target_metadata,
+      const torch::Tensor& repair_token_ids,
+      const torch::Tensor& seed_token_ids,
+      const torch::Tensor& base_positions,
+      const torch::Tensor& kv_seq_lens,
+      const torch::Tensor& draft_input_embedding,
+      const torch::Tensor& draft_topk_indices = torch::Tensor());
+
  private:
   explicit MtpPyExecutorPair(pybind11::object runner);
 

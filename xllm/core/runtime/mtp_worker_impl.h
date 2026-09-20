@@ -334,6 +334,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   torch::Tensor mtp_validate_greedy_do_sample_;
   std::unique_ptr<detail::NpuJsonDraftTokenHandoff> json_draft_token_handoff_;
 #endif
-  std::unique_ptr<detail::MtpPyExecutorPair> unified_python_mtp_graph_;
+  // One captured pair per fixed metadata/layout variant.  A replay may update
+  // values in-place only when every graph-visible shape is unchanged.  Shape
+  // changes therefore select another captured variant or synchronously create
+  // a new one; they never fall through to the legacy MTP execution path after
+  // unified admission.
+  std::vector<std::unique_ptr<detail::MtpPyExecutorPair>>
+      unified_python_mtp_graph_variants_;
 };
 }  // namespace xllm

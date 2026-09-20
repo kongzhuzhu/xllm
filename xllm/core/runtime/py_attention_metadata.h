@@ -120,6 +120,13 @@ class PyAttentionMetadataView final {
   bool is_chunked_prefill() const;
   bool is_mixed() const;
   bool is_spec_verify() const;
+  // Copy dynamic values from another view into this view's stable storage.
+  // Graph replay keeps pointers to this instance, so replacing the backing
+  // metadata object would leave the captured graph reading stale addresses.
+  void update_from(const PyAttentionMetadataView& source);
+  // Make an owned tensor copy for a graph entry. The source view belongs to a
+  // Worker invocation and must not be mutated by later replay updates.
+  PyAttentionMetadataView clone_for_graph() const;
 
  private:
   static torch::Tensor make_host_int32_view(

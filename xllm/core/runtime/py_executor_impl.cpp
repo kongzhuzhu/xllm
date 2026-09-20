@@ -203,34 +203,27 @@ py::object PyExecutorImpl::create_mtp_graph_runner(
   for (const py::object& metadata : draft_metadata) {
     draft_metadata_list.append(metadata);
   }
-  py::list target_metadata_list;
-  target_metadata_list.append(target_metadata);
-
-  py::object draft_forward =
-      draft_executor.py_executor_.attr("create_mtp_role_adapter")(
-          draft_metadata_list,
-          py::arg("speculative_tokens") = speculative_tokens,
-          py::arg("repair_token_ids") = repair_token_ids);
-  py::object target_forward = py_executor_.attr("create_mtp_role_adapter")(
-      target_metadata_list,
-      py::arg("speculative_tokens") = speculative_tokens,
-      py::arg("target") = true);
 
   py::cpp_function draft_activate = py::cpp_function([&draft_executor]() {
     active_py_causal_lm = draft_executor.py_causal_lm_;
   });
   py::cpp_function target_activate =
       py::cpp_function([this]() { active_py_causal_lm = py_causal_lm_; });
-  return py_executor_.attr("create_mtp_graph_runner")(
-      draft_executor.py_executor_,
-      py::arg("draft_forward") = draft_forward,
-      py::arg("target_forward") = target_forward,
-      py::arg("batch_size") = batch_size,
-      py::arg("speculative_tokens") = speculative_tokens,
-      py::arg("vocab_size") = vocab_size,
-      py::arg("kv_seq_lens") = kv_seq_lens,
-      py::arg("draft_activate") = draft_activate,
-      py::arg("target_activate") = target_activate);
+  LOG(INFO) << "MTP Python pair graph runner begin";
+  py::object runner =
+      py_executor_.attr("create_mtp_graph_runner_from_metadata")(
+          draft_executor.py_executor_,
+          draft_metadata_list,
+          target_metadata,
+          py::arg("repair_token_ids") = repair_token_ids,
+          py::arg("batch_size") = batch_size,
+          py::arg("speculative_tokens") = speculative_tokens,
+          py::arg("vocab_size") = vocab_size,
+          py::arg("kv_seq_lens") = kv_seq_lens,
+          py::arg("draft_activate") = draft_activate,
+          py::arg("target_activate") = target_activate);
+  LOG(INFO) << "MTP Python pair graph runner done";
+  return runner;
 }
 
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
