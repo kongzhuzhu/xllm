@@ -47,6 +47,8 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #endif
+#include <pybind11/pybind11.h>
+
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/draft_extend_input.h"
 #include "core/framework/speculative/mtp_async_input_builder.h"
@@ -56,6 +58,8 @@ limitations under the License.
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
 #include "core/runtime/task_execution_pipeline.h"
+#include "core/runtime/mtp_py_executor_pair.h"
+#include "core/runtime/py_executor_impl.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
@@ -63,6 +67,7 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
+namespace py = pybind11;
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
@@ -1423,6 +1428,185 @@ void MTPWorkerImpl::prepare_draft_sampling(
   }
 }
 
+bool MTPWorkerImpl::supports_unified_python_mtp_graph() const {
+#if defined(USE_NPU)
+  if (options_.num_speculative_tokens() <= 0 || impl_ == nullptr ||
+      draft_impl_ == nullptr || parallel_args_.cp_size() != 1 ||
+      parallel_args_.dp_size() != 1 || parallel_args_.tp_size() != 1 ||
+      enable_schedule_overlap() ||
+      !ModelConfig::is_python_model_impl(context_.get_model_impl()) ||
+      !ModelConfig::is_python_model_impl(
+          draft_impl_->context_.get_model_impl())) {
+    return false;
+  }
+  if (SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+    return false;
+  }
+  return impl_->model_executor() != nullptr &&
+         draft_impl_->model_executor() != nullptr &&
+         impl_->model_executor()->python_impl() != nullptr &&
+         draft_impl_->model_executor()->python_impl() != nullptr;
+#else
+  return false;
+#endif
+}
+
+std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
+    const ForwardInput& input,
+    const ForwardInput& metadata_template,
+    const ForwardInput& current_draft_input,
+    int32_t num_speculative_tokens) {
+#if defined(USE_NPU)
+  const int32_t batch_size = input.input_params.meta.num_sequences;
+  CHECK_GT(batch_size, 0);
+  CHECK_EQ(current_draft_input.positions.numel(), batch_size * 2)
+      << "unified Python MTP graph requires [repair,current] draft rows";
+  CHECK_EQ(current_draft_input.token_ids.numel(), batch_size * 2)
+      << "unified Python MTP graph requires [repair,current] draft tokens";
+  CHECK(current_draft_input.input_params.embedding.input_embedding.defined())
+      << "unified Python MTP graph requires draft embeddings";
+
+  std::vector<ForwardInput> draft_inputs(
+      static_cast<size_t>(num_speculative_tokens));
+  draft_inputs[0] = current_draft_input;
+  for (int32_t draft_idx = 1; draft_idx < num_speculative_tokens; ++draft_idx) {
+    prepare_draft_inputs(metadata_template,
+                         draft_inputs[static_cast<size_t>(draft_idx)],
+                         draft_idx);
+  }
+  ForwardInput validate_input;
+  prepare_validate_inputs(metadata_template, validate_input);
+
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  for (ForwardInput& draft_input : draft_inputs) {
+    wait_metadata_ready_event(draft_input, *compute_stream_);
+  }
+  wait_metadata_ready_event(validate_input, *compute_stream_);
+
+  torch::Tensor draft_rows =
+      current_draft_input.token_ids.view({batch_size, 2});
+  torch::Tensor draft_positions =
+      current_draft_input.positions.view({batch_size, 2});
+  torch::Tensor draft_kv_rows =
+      current_draft_input.input_params.attention.device.kv_seq_lens.view(
+          {batch_size, 2});
+  torch::Tensor seed_token_ids =
+      draft_rows.select(/*dim=*/1, /*index=*/1).to(torch::kInt64).contiguous();
+  torch::Tensor repair_token_ids =
+      draft_rows.select(/*dim=*/1, /*index=*/0).to(torch::kInt64).contiguous();
+  torch::Tensor base_positions = draft_positions.select(/*dim=*/1, /*index=*/1)
+                                     .to(torch::kInt64)
+                                     .contiguous();
+  torch::Tensor kv_seq_lens =
+      draft_kv_rows.select(/*dim=*/1, /*index=*/1).to(torch::kInt).contiguous();
+  torch::Tensor draft_embedding =
+      current_draft_input.input_params.embedding.input_embedding;
+
+  PyExecutorImpl* target_python_executor =
+      impl_->model_executor()->python_impl();
+  PyExecutorImpl* draft_python_executor =
+      draft_impl_->model_executor()->python_impl();
+  CHECK(target_python_executor != nullptr && draft_python_executor != nullptr)
+      << "unified Python MTP graph requires Python target and draft executors";
+
+  std::vector<py::object> draft_metadata;
+  draft_metadata.reserve(draft_inputs.size());
+  py::object target_metadata;
+  {
+    py::gil_scoped_acquire gil;
+    for (const ForwardInput& draft_input : draft_inputs) {
+      draft_metadata.emplace_back(
+          draft_python_executor->attention_metadata_view(
+              draft_input.input_params));
+    }
+    target_metadata = target_python_executor->attention_metadata_view(
+        validate_input.input_params);
+  }
+
+  unified_python_mtp_graph_ =
+      detail::MtpPyExecutorPair::create(*target_python_executor,
+                                        *draft_python_executor,
+                                        draft_metadata,
+                                        target_metadata,
+                                        repair_token_ids,
+                                        kv_seq_lens,
+                                        batch_size,
+                                        num_speculative_tokens,
+                                        context_.get_model_args().vocab_size());
+  detail::MtpPyGraphOutput graph_output =
+      unified_python_mtp_graph_->capture_and_execute(
+          seed_token_ids, base_positions, kv_seq_lens, draft_embedding);
+
+  CHECK(graph_output.committed_tokens.defined())
+      << "unified Python MTP graph did not return committed tokens";
+  CHECK(graph_output.target_embeddings.defined())
+      << "unified Python MTP graph did not return target embeddings";
+  CHECK_EQ(graph_output.committed_tokens.size(0), batch_size);
+  CHECK_EQ(graph_output.committed_tokens.size(1), num_speculative_tokens + 1);
+  CHECK_EQ(graph_output.target_embeddings.size(0), batch_size);
+  CHECK_EQ(graph_output.target_embeddings.size(1), num_speculative_tokens + 1);
+
+  ForwardOutput target_output;
+  target_output.sample_output.next_tokens = graph_output.committed_tokens;
+  target_output.sample_output.embeddings = graph_output.target_embeddings;
+
+  torch::Tensor validate_positions = validate_input.positions;
+  CHECK_EQ(validate_positions.numel(),
+           static_cast<int64_t>(batch_size) * (num_speculative_tokens + 1));
+  torch::Tensor base_positions_for_cache =
+      validate_positions.view({batch_size, num_speculative_tokens + 1})
+          .select(/*dim=*/1, /*index=*/0)
+          .contiguous();
+  const torch::Tensor& validate_kv_seq_lens =
+      validate_input.input_params.attention.device.kv_seq_lens;
+  torch::Tensor base_kv_seq_lens = mtp_async::extract_target_base_kv_seq_lens(
+      validate_kv_seq_lens,
+      batch_size,
+      num_speculative_tokens + 1,
+      use_chunked_prefill_spec_verify_path());
+  torch::Tensor accepted_tokens_host =
+      acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
+  StreamEventPtr ready_event;
+  {
+    accepted_tokens_host.copy_(graph_output.committed_tokens,
+                               /*non_blocking=*/true);
+    ready_event = compute_stream_->record_event();
+  }
+  if (ready_event == nullptr) {
+    const int32_t ret = compute_stream_->synchronize();
+    CHECK_EQ(ret, 0) << "failed to synchronize unified MTP graph output";
+  }
+  stage_target_context_write(input,
+                             target_output.sample_output,
+                             base_positions_for_cache,
+                             base_kv_seq_lens,
+                             ready_event,
+                             std::move(accepted_tokens_host),
+                             {});
+  target_output.ready_event = ready_event;
+
+  if (!enable_schedule_overlap()) {
+    torch::Tensor accepted_tokens_cpu_result =
+        pending_target_context_.accepted_tokens_host;
+    flush_pending_target_context();
+    target_output.ready_event.reset();
+    target_output.sample_output.next_tokens =
+        std::move(accepted_tokens_cpu_result);
+  }
+  target_output.sample_output.embeddings = torch::Tensor();
+  if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
+    return std::nullopt;
+  }
+  return target_output;
+#else
+  (void)input;
+  (void)metadata_template;
+  (void)current_draft_input;
+  (void)num_speculative_tokens;
+  return std::nullopt;
+#endif
+}
+
 std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     const ForwardInput& raw_input) {
   ForwardInput input = raw_input;
@@ -1493,6 +1677,11 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   std::vector<ForwardInput> draft_prepared(num_speculative_tokens);
   detail::JsonDraftValidationScratch json_scratch;
   const bool has_json_object_states = !input.json_object_states.empty();
+  const bool use_unified_python_graph =
+      supports_unified_python_mtp_graph() && !use_prelaunched_first_draft &&
+      !use_device_target_context && !has_json_object_states &&
+      !use_adaptive_speculative_decode &&
+      input.sampling_params.all_greedy_sample;
   std::vector<uint8_t> json_invalid_suffix;
   Timer timer;
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";
@@ -1620,7 +1809,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     }
     update_decode_step_input(input, last_states);
     metadata_template = input;
-    prepare_draft_extend_inputs(input, last_states, current_draft_input);
+    prepare_draft_extend_inputs(input,
+                                last_states,
+                                current_draft_input,
+                                /*force_two_rows=*/use_unified_python_graph);
+  }
+  if (use_unified_python_graph) {
+    return run_unified_python_mtp_graph(
+        input, metadata_template, current_draft_input, num_speculative_tokens);
   }
   const bool use_continuous_dsa_drafts =
       (use_device_target_context || use_prelaunched_first_draft) &&

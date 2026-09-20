@@ -161,6 +161,78 @@ PyExecutorImpl::~PyExecutorImpl() {
   clear_python_object(py_executor_);
 }
 
+py::object PyExecutorImpl::attention_metadata_view(
+    const ModelInputParams& params) const {
+  std::shared_ptr<layer::AttentionMetadata> attn_metadata =
+      params.attn_metadata;
+  if (!attn_metadata) {
+    attn_metadata = std::make_shared<layer::AttentionMetadata>(
+        layer::AttentionMetadataBuilder::build(
+            params, enable_mla_, std::nullopt, device_));
+  }
+  if (enable_mla_ && py_causal_lm_->cp_size() > 1 &&
+      py_causal_lm_->kv_split_size() > 1 &&
+      (attn_metadata->is_prefill || attn_metadata->is_chunked_prefill)) {
+    const KVShardLayout layout(options_.block_size(),
+                               py_causal_lm_->kv_split_size(),
+                               py_causal_lm_->kv_split_rank());
+    attn_metadata->kv_shard_batch_metadata =
+        layer::build_kv_shard_batch_metadata(*attn_metadata, layout);
+  }
+  return py::cast(PyAttentionMetadataView(attn_metadata, params));
+}
+
+py::object PyExecutorImpl::create_mtp_graph_runner(
+    PyExecutorImpl& draft_executor,
+    const std::vector<py::object>& draft_metadata,
+    const py::object& target_metadata,
+    const torch::Tensor& repair_token_ids,
+    const torch::Tensor& kv_seq_lens,
+    int32_t batch_size,
+    int32_t speculative_tokens,
+    int64_t vocab_size) {
+  CHECK(!draft_metadata.empty())
+      << "MTP graph requires draft metadata for every fixed K step";
+  CHECK_GT(batch_size, 0) << "MTP graph batch size must be positive";
+  CHECK_GT(speculative_tokens, 0)
+      << "MTP graph speculative token count must be positive";
+  CHECK_GT(vocab_size, 0) << "MTP graph vocabulary size must be positive";
+
+  py::gil_scoped_acquire gil;
+  py::list draft_metadata_list;
+  for (const py::object& metadata : draft_metadata) {
+    draft_metadata_list.append(metadata);
+  }
+  py::list target_metadata_list;
+  target_metadata_list.append(target_metadata);
+
+  py::object draft_forward =
+      draft_executor.py_executor_.attr("create_mtp_role_adapter")(
+          draft_metadata_list,
+          py::arg("speculative_tokens") = speculative_tokens,
+          py::arg("repair_token_ids") = repair_token_ids);
+  py::object target_forward = py_executor_.attr("create_mtp_role_adapter")(
+      target_metadata_list,
+      py::arg("speculative_tokens") = speculative_tokens,
+      py::arg("target") = true);
+
+  py::cpp_function draft_activate = py::cpp_function([&draft_executor]() {
+    active_py_causal_lm = draft_executor.py_causal_lm_;
+  });
+  py::cpp_function target_activate =
+      py::cpp_function([this]() { active_py_causal_lm = py_causal_lm_; });
+  return py_executor_.attr("create_mtp_graph_runner")(
+      draft_executor.py_executor_,
+      py::arg("draft_forward") = draft_forward,
+      py::arg("target_forward") = target_forward,
+      py::arg("batch_size") = batch_size,
+      py::arg("speculative_tokens") = speculative_tokens,
+      py::arg("vocab_size") = vocab_size,
+      py::arg("kv_seq_lens") = kv_seq_lens,
+      py::arg("draft_activate") = draft_activate,
+      py::arg("target_activate") = target_activate);
+}
+
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
   return batch.prepare_forward_input(options_.num_decoding_tokens(),
                                      /*min_decoding_batch_size=*/0,

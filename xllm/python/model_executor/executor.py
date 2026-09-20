@@ -28,6 +28,15 @@ from xllm.python.layers.attention import Attention
 from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.eager import EagerRunner
+from xllm.python.model_executor.runners.mtp_acl_graph import (
+    ActivateFn,
+    ForwardFn,
+    GraphBackend,
+    MtpAclGraphRunner,
+    MtpGraphRecipe,
+    MtpRoleAdapter,
+    PrepareFn,
+)
 from xllm.python.platform import current_platform
 
 
@@ -152,6 +161,15 @@ class ModelExecutor:
         acl_graph_decode_batch_size_limit: int | None = None,
     ) -> None:
         self.model = model
+        # MTP width is a process-level graph contract.  The runner may accept
+        # fewer tokens after verification, but it must never change the
+        # capture width for a live executor.
+        self.num_speculative_tokens = int(config.get("num_speculative_tokens", 0))
+        # Keep the full CausalLM object next to the body handle.  Ordinary
+        # runners intentionally receive ``model.model`` only, while the
+        # speculative graph needs the role-owned lm_head/compute_logits entry
+        # after every unrolled body step.
+        self.execution_model = model.model
         self._kv_bound = False
         cp_size = int(config.get("cp_size", 1))
         cp_rank = int(config.get("cp_rank", 0))
@@ -325,6 +343,89 @@ class ModelExecutor:
             from xllm.python.model_executor.runners.inductor import InductorRunner
 
             self.inductor_runner = InductorRunner(execution_model, self.attention_backend, device, graph_backend)
+
+    def create_mtp_graph_runner(
+        self,
+        draft_executor: ModelExecutor,
+        *,
+        draft_forward: ForwardFn,
+        target_forward: ForwardFn,
+        batch_size: int,
+        speculative_tokens: int,
+        vocab_size: int,
+        backend: GraphBackend = "aclgraph",
+        kv_seq_lens: torch.Tensor | None = None,
+        prepare: PrepareFn | None = None,
+        draft_activate: ActivateFn | None = None,
+        target_activate: ActivateFn | None = None,
+    ) -> MtpAclGraphRunner:
+        """Create a paired MTP runner with explicit role adapters.
+
+        ``draft_forward`` and ``target_forward`` install their own fixed
+        attention metadata/``ForwardContext`` and return the body hidden
+        states.  Requiring the adapters here prevents the composite runner
+        from accidentally reusing one model's mutable attention backend for
+        both roles.  The C++ MTP bridge will own these adapters when it wires
+        the two ``PyExecutorImpl`` instances together.
+        """
+        if not isinstance(draft_executor, ModelExecutor):
+            raise TypeError("draft_executor must be a ModelExecutor")
+        for role, configured_tokens in (
+            ("target", self.num_speculative_tokens),
+            ("draft", draft_executor.num_speculative_tokens),
+        ):
+            if configured_tokens > 0 and configured_tokens != speculative_tokens:
+                raise ValueError(
+                    f"{role} executor was initialized with num_speculative_tokens="
+                    f"{configured_tokens}, got graph K={speculative_tokens}"
+                )
+
+        def draft_logits(hidden: torch.Tensor) -> torch.Tensor:
+            return draft_executor.model.compute_logits(hidden, None)
+
+        def target_logits(hidden: torch.Tensor) -> torch.Tensor:
+            return self.model.compute_logits(hidden, None)
+
+        recipe = MtpGraphRecipe(
+            draft_forward,
+            draft_logits,
+            target_forward,
+            target_logits,
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            vocab_size=vocab_size,
+            device=next(self.model.parameters()).device,
+            kv_seq_lens=kv_seq_lens,
+            draft_activate=draft_activate,
+            target_activate=target_activate,
+        )
+        return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare)
+
+    def create_mtp_role_adapter(
+        self,
+        metadata_by_step: tuple[object, ...],
+        *,
+        speculative_tokens: int,
+        target: bool = False,
+        layer_synchronizer: LayerSynchronizer | None = None,
+        repair_token_ids: torch.Tensor | None = None,
+    ) -> MtpRoleAdapter:
+        """Bind fixed attention metadata to this executor's MTP role.
+
+        The returned adapter always invokes this executor's eager body runner;
+        the caller captures the enclosing ``MtpAclGraphRunner``.  This keeps
+        target and draft attention ownership separate while avoiding nested
+        decode graph capture.  C++ creates one adapter per ``PyExecutorImpl``
+        and supplies K draft metadata entries plus one target K+1 entry.
+        """
+        return MtpRoleAdapter(
+            self,
+            metadata_by_step,
+            speculative_tokens=speculative_tokens,
+            target=target,
+            layer_synchronizer=layer_synchronizer,
+            repair_token_ids=repair_token_ids,
+        )
 
     @staticmethod
     def _attention_config(

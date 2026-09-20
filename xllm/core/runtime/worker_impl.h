@@ -306,6 +306,8 @@ class WorkerImpl {
 
   Status get_status() const { return status_; }
 
+  Executor* model_executor() const { return model_executor_.get(); }
+
   // model context, includes model args, parallel args and date type etc.
   mutable ModelContext context_;
 

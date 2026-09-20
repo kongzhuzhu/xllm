@@ -61,6 +61,19 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  pybind11::object attention_metadata_view(
+      const ModelInputParams& params) const;
+
+  pybind11::object create_mtp_graph_runner(
+      PyExecutorImpl& draft_executor,
+      const std::vector<pybind11::object>& draft_metadata,
+      const pybind11::object& target_metadata,
+      const torch::Tensor& repair_token_ids,
+      const torch::Tensor& kv_seq_lens,
+      int32_t batch_size,
+      int32_t speculative_tokens,
+      int64_t vocab_size);
+
  private:
   // Caller holds the GIL. First binding occurs on Prepare for pipeline input.
   void bind_kv_caches(std::vector<KVCache>& kv_caches);

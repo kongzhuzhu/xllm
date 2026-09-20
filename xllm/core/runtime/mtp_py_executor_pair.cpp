@@ -1,0 +1,97 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "core/runtime/mtp_py_executor_pair.h"
+
+#include <glog/logging.h>
+#include <torch/python.h>
+
+#include <utility>
+
+#include "core/runtime/py_executor_impl.h"
+#include "core/util/pybind_helper.h"
+
+namespace py = pybind11;
+
+namespace xllm::detail {
+
+std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
+    PyExecutorImpl& target_executor,
+    PyExecutorImpl& draft_executor,
+    const std::vector<py::object>& draft_metadata,
+    const py::object& target_metadata,
+    const torch::Tensor& repair_token_ids,
+    const torch::Tensor& kv_seq_lens,
+    int32_t batch_size,
+    int32_t speculative_tokens,
+    int64_t vocab_size) {
+  py::gil_scoped_acquire gil;
+  py::object runner =
+      target_executor.create_mtp_graph_runner(draft_executor,
+                                              draft_metadata,
+                                              target_metadata,
+                                              repair_token_ids,
+                                              kv_seq_lens,
+                                              batch_size,
+                                              speculative_tokens,
+                                              vocab_size);
+  return std::unique_ptr<MtpPyExecutorPair>(
+      new MtpPyExecutorPair(std::move(runner)));
+}
+
+MtpPyExecutorPair::MtpPyExecutorPair(py::object runner)
+    : runner_(std::move(runner)) {}
+
+MtpPyExecutorPair::~MtpPyExecutorPair() { clear_python_object(runner_); }
+
+MtpPyGraphOutput MtpPyExecutorPair::capture_and_execute(
+    const torch::Tensor& seed_token_ids,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& kv_seq_lens,
+    const torch::Tensor& draft_input_embedding,
+    const torch::Tensor& draft_topk_indices) {
+  CHECK(runner_);
+  py::gil_scoped_acquire gil;
+  py::object optional_topk =
+      draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
+  runner_.attr("capture")(seed_token_ids,
+                          base_positions,
+                          kv_seq_lens,
+                          draft_input_embedding,
+                          optional_topk);
+  py::object output = runner_.attr("execute")(seed_token_ids,
+                                              base_positions,
+                                              kv_seq_lens,
+                                              draft_input_embedding,
+                                              optional_topk);
+  py::object next_state = output.attr("next_state");
+  MtpPyGraphOutput result;
+  result.accepted_ids = output.attr("accepted_ids").cast<torch::Tensor>();
+  result.accepted_mask = output.attr("accepted_mask").cast<torch::Tensor>();
+  result.accepted_count = output.attr("accepted_count").cast<torch::Tensor>();
+  result.committed_tokens =
+      output.attr("committed_tokens").cast<torch::Tensor>();
+  result.next_token_ids = next_state.attr("token_ids").cast<torch::Tensor>();
+  result.next_positions = next_state.attr("positions").cast<torch::Tensor>();
+  result.next_kv_seq_lens = tensor_from_python(next_state.attr("kv_seq_lens"));
+  result.next_embeddings = tensor_from_python(next_state.attr("embeddings"));
+  result.next_topk_indices =
+      tensor_from_python(next_state.attr("topk_indices"));
+  result.target_embeddings =
+      tensor_from_python(output.attr("target_embeddings"));
+  return result;
+}
+
+}  // namespace xllm::detail

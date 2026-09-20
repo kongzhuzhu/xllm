@@ -31,12 +31,10 @@ limitations under the License.
 
 namespace xllm {
 
-#if defined(USE_NPU)
 namespace detail {
 class NpuJsonDraftTokenHandoff;
+class MtpPyExecutorPair;
 }  // namespace detail
-#endif
-
 // MTP (Multi-Token Prediction) speculative worker.
 // Uses a draft model to generate proposals, then validates with target model.
 // Eagle3WorkerImpl inherits from this class.
@@ -265,6 +263,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool device_target_context_ready_for_batch(const ForwardInput& input) const;
   void flush_pending_target_context();
   bool supports_combined_first_draft_execution() const;
+  bool supports_unified_python_mtp_graph() const;
+  std::optional<ForwardOutput> run_unified_python_mtp_graph(
+      const ForwardInput& input,
+      const ForwardInput& metadata_template,
+      const ForwardInput& current_draft_input,
+      int32_t num_speculative_tokens);
   bool can_use_combined_first_draft() const;
   bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
   void prepare_next_first_draft_template(const ForwardInput& input,
@@ -330,5 +334,6 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   torch::Tensor mtp_validate_greedy_do_sample_;
   std::unique_ptr<detail::NpuJsonDraftTokenHandoff> json_draft_token_handoff_;
 #endif
+  std::unique_ptr<detail::MtpPyExecutorPair> unified_python_mtp_graph_;
 };
 }  // namespace xllm
