@@ -20,6 +20,7 @@ limitations under the License.
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/framework/speculative/adaptive_speculative_controller.h"
@@ -341,5 +342,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // unified admission.
   std::vector<std::unique_ptr<detail::MtpPyExecutorPair>>
       unified_python_mtp_graph_variants_;
+  std::unordered_map<std::string, size_t>
+      unified_python_mtp_graph_variant_index_;
 };
 }  // namespace xllm

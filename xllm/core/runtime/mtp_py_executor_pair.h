@@ -66,6 +66,9 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
   bool can_update_metadata(const std::vector<pybind11::object>& draft_metadata,
                            const pybind11::object& target_metadata) const;
 
+  std::string metadata_key(const std::vector<pybind11::object>& draft_metadata,
+                           const pybind11::object& target_metadata) const;
+
   MtpPyGraphOutput update_and_execute(
       const std::vector<pybind11::object>& draft_metadata,
       const pybind11::object& target_metadata,

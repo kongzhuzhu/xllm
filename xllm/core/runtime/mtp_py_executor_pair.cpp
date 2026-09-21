@@ -134,6 +134,16 @@ bool MtpPyExecutorPair::can_update_metadata(
       .cast<bool>();
 }
 
+std::string MtpPyExecutorPair::metadata_key(
+    const std::vector<py::object>& draft_metadata,
+    const py::object& target_metadata) const {
+  CHECK(runner_);
+  py::gil_scoped_acquire gil;
+  py::object key = runner_.attr("metadata_key")(metadata_list(draft_metadata),
+                                                target_metadata);
+  return py::repr(key).cast<std::string>();
+}
+
 MtpPyGraphOutput MtpPyExecutorPair::update_and_execute(
     const std::vector<py::object>& draft_metadata,
     const py::object& target_metadata,

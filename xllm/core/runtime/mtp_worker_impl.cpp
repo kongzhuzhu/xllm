@@ -1570,13 +1570,22 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
 
     detail::MtpPyExecutorPair* graph_variant = nullptr;
     size_t graph_variant_index = 0;
-    for (size_t index = 0; index < unified_python_mtp_graph_variants_.size();
-         ++index) {
-      if (unified_python_mtp_graph_variants_[index]->can_update_metadata(
-              draft_metadata, target_metadata)) {
-        graph_variant = unified_python_mtp_graph_variants_[index].get();
-        graph_variant_index = index;
-        break;
+    std::string metadata_key;
+    if (!unified_python_mtp_graph_variants_.empty()) {
+      metadata_key = unified_python_mtp_graph_variants_.front()->metadata_key(
+          draft_metadata, target_metadata);
+      auto variant_it =
+          unified_python_mtp_graph_variant_index_.find(metadata_key);
+      if (variant_it != unified_python_mtp_graph_variant_index_.end()) {
+        graph_variant_index = variant_it->second;
+        CHECK_LT(graph_variant_index,
+                 unified_python_mtp_graph_variants_.size());
+        graph_variant =
+            unified_python_mtp_graph_variants_[graph_variant_index].get();
+        if (!graph_variant->can_update_metadata(draft_metadata,
+                                                target_metadata)) {
+          graph_variant = nullptr;
+        }
       }
     }
     if (graph_variant == nullptr) {
@@ -1597,7 +1606,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                 << unified_python_mtp_graph_variants_.size();
       graph_output = new_variant->capture_and_execute(
           seed_token_ids, base_positions, kv_seq_lens, draft_embedding);
+      if (metadata_key.empty()) {
+        metadata_key =
+            new_variant->metadata_key(draft_metadata, target_metadata);
+      }
+      const size_t new_variant_index =
+          unified_python_mtp_graph_variants_.size();
       unified_python_mtp_graph_variants_.emplace_back(std::move(new_variant));
+      unified_python_mtp_graph_variant_index_.insert_or_assign(
+          metadata_key, new_variant_index);
     } else {
       LOG(INFO)
           << "MTP unified pair variant metadata compatible; reusing capture; "
@@ -1640,17 +1657,6 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
       num_speculative_tokens + 1,
       use_chunked_prefill_spec_verify_path());
 
-  // The device-target-context path keeps the preceding result pending so the
-  // next scheduler turn can prepare draft metadata without a host round trip.
-  // A new unified graph result cannot be staged while that single pending slot
-  // is occupied.  Consume the previous result here, after the current graph
-  // has completed its device work, then publish the new result.  This is an
-  // explicit state transition, not a fallback to the legacy MTP executor.
-  if (pending_target_context_.accepted_tokens.defined()) {
-    LOG(INFO) << "MTP unified graph consuming previous target context before "
-                 "staging the next result";
-    flush_pending_target_context();
-  }
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
   StreamEventPtr ready_event;
@@ -1767,7 +1773,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   const bool has_json_object_states = !input.json_object_states.empty();
   const bool use_unified_python_graph =
       supports_unified_python_mtp_graph() && !use_prelaunched_first_draft &&
-      !has_json_object_states && !use_adaptive_speculative_decode &&
+      !use_device_target_context && !has_json_object_states &&
+      !use_adaptive_speculative_decode &&
       input.sampling_params.all_greedy_sample &&
       !input.sampling_params.logprobs &&
       input.sampling_params.max_top_logprobs == 0;

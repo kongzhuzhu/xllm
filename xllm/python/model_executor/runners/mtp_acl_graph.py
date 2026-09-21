@@ -59,6 +59,73 @@ PrepareFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None]
 ActivateFn = Callable[[], None]
 
 
+def _tensor_signature(value: object) -> tuple[object, ...] | None:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    device = getattr(value, "device", None)
+    if shape is None or dtype is None or device is None:
+        return (type(value).__qualname__, repr(value))
+    return (tuple(shape), str(dtype), str(device))
+
+
+def _metadata_signature(metadata: AttentionMetadata) -> tuple[object, ...]:
+    fields = (
+        "slot_mapping",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+        "q_cu_seq_lens",
+        "kv_cu_seq_lens",
+        "kv_seq_lens",
+        "q_seq_lens",
+        "block_table",
+    )
+    tensor_fields = tuple((name, _tensor_signature(getattr(metadata, name, None))) for name in fields)
+    host_fields = tuple(
+        (
+            name,
+            len(getattr(metadata, name, ())) if getattr(metadata, name, None) is not None else None,
+        )
+        for name in ("kv_seq_lens_host_values", "q_seq_lens_host")
+    )
+    tables = tuple(_tensor_signature(table) for table in getattr(metadata, "multi_block_tables", ()))
+    expanded = getattr(metadata, "expanded_decode_metadata", None)
+    expanded_fields = (
+        "kv_seq_lens",
+        "block_table",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+        "paged_attention_tiling_data",
+        "kv_seq_lens_host",
+    )
+    expanded_signature = (
+        False,
+        (),
+        None,
+    )
+    if expanded is not None and bool(getattr(expanded, "enabled", False)):
+        expanded_signature = (
+            True,
+            tuple((name, _tensor_signature(getattr(expanded, name, None))) for name in expanded_fields),
+            len(getattr(expanded, "kv_seq_lens_host_values", ()))
+            if getattr(expanded, "kv_seq_lens_host_values", None) is not None
+            else None,
+        )
+    return (
+        bool(getattr(metadata, "is_prefill", False)),
+        bool(getattr(metadata, "is_chunked_prefill", False)),
+        bool(getattr(metadata, "is_mixed", False)),
+        bool(getattr(metadata, "is_spec_verify", False)),
+        tensor_fields,
+        host_fields,
+        tables,
+        expanded_signature,
+    )
+
+
 class MtpRoleAdapter:
     """Role-scoped body adapter for one composite MTP graph.
 
@@ -541,6 +608,17 @@ class MtpGraphRecipe(nn.Module):
             return False
         return bool(draft_check(draft_metadata)) and bool(target_check((target_metadata,)))
 
+    def metadata_key(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+    ) -> tuple[object, ...]:
+        """Return the fixed graph-layout key before compatibility validation."""
+        return (
+            tuple(_metadata_signature(metadata) for metadata in draft_metadata),
+            _metadata_signature(target_metadata),
+        )
+
     def update_metadata(
         self,
         draft_metadata: Sequence[AttentionMetadata],
@@ -818,6 +896,14 @@ class MtpAclGraphRunner:
         if not self._captured:
             return False
         return self.recipe.can_update_metadata(draft_metadata, target_metadata)
+
+    def metadata_key(
+        self,
+        draft_metadata: Sequence[AttentionMetadata],
+        target_metadata: AttentionMetadata,
+    ) -> tuple[object, ...]:
+        """Return the fixed metadata/layout key used by the C++ registry."""
+        return self.recipe.metadata_key(draft_metadata, target_metadata)
 
     def update_metadata(
         self,
