@@ -120,7 +120,8 @@ torch::Tensor extract_target_base_kv_seq_lens(
     const torch::Tensor& validate_kv_seq_lens,
     int64_t batch_size,
     int64_t num_validate_tokens,
-    bool use_chunked_prefill) {
+    bool use_chunked_prefill,
+    bool step_major_layout) {
   CHECK(validate_kv_seq_lens.defined());
   CHECK_GT(batch_size, 0);
   CHECK_GT(num_validate_tokens, 0);
@@ -133,10 +134,14 @@ torch::Tensor extract_target_base_kv_seq_lens(
 
   const int64_t expanded_rows = batch_size * num_validate_tokens;
   CHECK_GE(flattened.numel(), expanded_rows);
-  return flattened.slice(/*dim=*/0, /*start=*/0, /*end=*/expanded_rows)
-      .view({batch_size, num_validate_tokens})
-      .select(/*dim=*/1, /*index=*/0)
-      .contiguous();
+  torch::Tensor rows =
+      flattened.slice(/*dim=*/0, /*start=*/0, /*end=*/expanded_rows);
+  if (step_major_layout) {
+    rows = rows.view({num_validate_tokens, batch_size}).transpose(0, 1);
+  } else {
+    rows = rows.view({batch_size, num_validate_tokens});
+  }
+  return rows.select(/*dim=*/1, /*index=*/0).contiguous();
 }
 
 AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,

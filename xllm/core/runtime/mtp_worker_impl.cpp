@@ -1495,7 +1495,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
     const ForwardInput& input,
     const ForwardInput& metadata_template,
     const ForwardInput& current_draft_input,
-    int32_t num_speculative_tokens) {
+    int32_t num_speculative_tokens,
+    const torch::Tensor& previous_accepted_tokens,
+    const torch::Tensor& previous_base_positions,
+    const torch::Tensor& previous_base_kv_seq_lens) {
 #if defined(USE_NPU)
   LOG(INFO) << "MTP unified Python graph execute: speculative_tokens="
             << num_speculative_tokens;
@@ -1524,6 +1527,36 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
     wait_metadata_ready_event(draft_input, *compute_stream_);
   }
   wait_metadata_ready_event(validate_input, *compute_stream_);
+  const bool has_previous_device_state = previous_accepted_tokens.defined() ||
+                                         previous_base_positions.defined() ||
+                                         previous_base_kv_seq_lens.defined();
+  if (has_previous_device_state) {
+    CHECK(previous_accepted_tokens.defined() &&
+          previous_base_positions.defined() &&
+          previous_base_kv_seq_lens.defined())
+        << "unified MTP previous accepted state must be complete";
+    mtp_async::prepare_target_verify_from_accepted_state(
+        validate_input,
+        previous_accepted_tokens,
+        previous_base_positions,
+        previous_base_kv_seq_lens,
+        logical_block_size(),
+        use_chunked_prefill_spec_verify_path(),
+        uses_step_major_validate_layout());
+    validate_input.retained_device_tensors = {previous_accepted_tokens,
+                                              previous_base_positions,
+                                              previous_base_kv_seq_lens};
+    for (int32_t draft_idx = 1; draft_idx < num_speculative_tokens;
+         ++draft_idx) {
+      mtp_async::prepare_later_draft_from_device_base(
+          draft_inputs[static_cast<size_t>(draft_idx)],
+          input,
+          previous_base_positions,
+          previous_base_kv_seq_lens,
+          draft_idx,
+          logical_block_size());
+    }
+  }
 
   torch::Tensor draft_rows =
       current_draft_input.token_ids.view({batch_size, 2});
@@ -1657,7 +1690,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
   CHECK_EQ(validate_positions.numel(),
            static_cast<int64_t>(batch_size) * (num_speculative_tokens + 1));
   torch::Tensor validate_base_positions =
-      validate_positions.view({batch_size, num_speculative_tokens + 1})
+      (uses_step_major_validate_layout()
+           ? validate_positions.view({num_speculative_tokens + 1, batch_size})
+                 .transpose(0, 1)
+           : validate_positions.view({batch_size, num_speculative_tokens + 1}))
           .select(/*dim=*/1, /*index=*/0)
           .contiguous();
   const torch::Tensor& validate_kv_seq_lens =
@@ -1667,7 +1703,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
           validate_kv_seq_lens,
           batch_size,
           num_speculative_tokens + 1,
-          use_chunked_prefill_spec_verify_path());
+          use_chunked_prefill_spec_verify_path(),
+          uses_step_major_validate_layout());
   const mtp_async::AcceptedTokenMetadata expected_state =
       mtp_async::build_accepted_token_metadata(graph_output.committed_tokens,
                                                validate_base_positions,
@@ -1709,13 +1746,16 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
   target_output.sample_output.next_tokens = graph_output.committed_tokens;
   target_output.sample_output.embeddings = graph_output.target_embeddings;
 
-  // The composite graph has already derived the accepted-prefix base state
-  // from its Device acceptance result. Keep that state as the source for the
-  // next draft/cache transition instead of reconstructing it from the Host
-  // verify metadata. The overlap path is still outside unified admission, so
-  // these persistent output views are consumed before a subsequent replay.
-  torch::Tensor base_positions_for_cache = graph_output.next_positions;
-  torch::Tensor base_kv_seq_lens = graph_output.next_kv_seq_lens;
+  // Persist the pre-acceptance graph base together with the committed-token
+  // matrix. The fused next-draft preparation adds the accepted prefix to this
+  // base; persisting graph_output.next_* here would advance the same prefix a
+  // second time on the next invocation. This matches the eager MTP context
+  // contract, where base_* are the target verify input base values.
+  // Own the pre-acceptance base tensors. The scheduler reuses the original
+  // ForwardInput storage after this call; retaining an alias lets a later
+  // batch overwrite the state used by the next unified invocation.
+  torch::Tensor base_positions_for_cache = base_positions.clone();
+  torch::Tensor base_kv_seq_lens = kv_seq_lens.clone();
 
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
@@ -1743,8 +1783,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                              {});
   unified_device_accepted_tokens_ = graph_output.committed_tokens;
   unified_device_accepted_embeddings_ = graph_output.target_embeddings;
-  unified_device_base_positions_ = graph_output.next_positions;
-  unified_device_base_kv_seq_lens_ = graph_output.next_kv_seq_lens;
+  unified_device_base_positions_ = base_positions_for_cache;
+  unified_device_base_kv_seq_lens_ = base_kv_seq_lens;
   unified_device_context_embedding_ids_ =
       input.input_params.embedding.embedding_ids;
   unified_device_context_request_ids_ =
@@ -1769,6 +1809,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
   (void)metadata_template;
   (void)current_draft_input;
   (void)num_speculative_tokens;
+  (void)previous_accepted_tokens;
+  (void)previous_base_positions;
+  (void)previous_base_kv_seq_lens;
   return std::nullopt;
 #endif
 }
@@ -2059,8 +2102,13 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
     }
   }
   if (use_unified_python_graph) {
-    return run_unified_python_mtp_graph(
-        input, metadata_template, current_draft_input, num_speculative_tokens);
+    return run_unified_python_mtp_graph(input,
+                                        metadata_template,
+                                        current_draft_input,
+                                        num_speculative_tokens,
+                                        accepted_tokens,
+                                        target_base_positions,
+                                        target_base_kv_seq_lens);
   }
   const bool use_continuous_dsa_drafts =
       (use_device_target_context || use_prelaunched_first_draft) &&
@@ -2182,7 +2230,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
             accepted_tokens,
             target_base_positions,
             target_base_kv_seq_lens,
-            logical_block_size());
+            logical_block_size(),
+            use_chunked_prefill_spec_verify_path(),
+            uses_step_major_validate_layout());
         validate_input.retained_device_tensors = {
             accepted_tokens, target_base_positions, target_base_kv_seq_lens};
         finish_metadata_prepare(*prepare_stream_, validate_input);
@@ -2818,7 +2868,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
         validate_kv_seq_lens,
         batch_size,
         num_val_tokens,
-        use_chunked_prefill_spec_verify_path());
+        use_chunked_prefill_spec_verify_path(),
+        uses_step_major_validate_layout());
 
     accepted_tokens_host.copy_(val_output.next_tokens,
                                /*non_blocking=*/true);

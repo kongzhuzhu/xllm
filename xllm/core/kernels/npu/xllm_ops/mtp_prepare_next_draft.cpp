@@ -46,9 +46,12 @@ bool is_supported_mtp_prepare_input(const torch::Tensor& accepted_tokens,
          (embedding_type == torch::kFloat16 ||
           embedding_type == torch::kBFloat16) &&
          embedding_placeholder.scalar_type() == embedding_type &&
-         base_positions.scalar_type() == torch::kInt &&
-         base_kv_seq_lens.scalar_type() == torch::kInt &&
-         block_tables.scalar_type() == torch::kInt &&
+         (base_positions.scalar_type() == torch::kInt ||
+          base_positions.scalar_type() == torch::kLong) &&
+         (base_kv_seq_lens.scalar_type() == torch::kInt ||
+          base_kv_seq_lens.scalar_type() == torch::kLong) &&
+         (block_tables.scalar_type() == torch::kInt ||
+          block_tables.scalar_type() == torch::kLong) &&
          accepted_embeddings.size(0) == batch_size &&
          accepted_embeddings.size(1) == speculative_width &&
          embedding_placeholder.numel() == hidden_size &&
@@ -90,10 +93,20 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
 
   const int64_t batch_size = accepted_tokens.size(0);
   const int64_t hidden_size = accepted_embeddings.size(2);
-  const torch::Tensor position_rows =
+  torch::Tensor position_rows =
       base_positions.flatten().slice(0, 0, batch_size);
-  const torch::Tensor kv_seq_len_rows =
+  if (position_rows.scalar_type() != torch::kInt) {
+    position_rows = position_rows.to(torch::kInt);
+  }
+  torch::Tensor kv_seq_len_rows =
       base_kv_seq_lens.flatten().slice(0, 0, batch_size);
+  if (kv_seq_len_rows.scalar_type() != torch::kInt) {
+    kv_seq_len_rows = kv_seq_len_rows.to(torch::kInt);
+  }
+  torch::Tensor block_table_input = block_tables;
+  if (block_table_input.scalar_type() != torch::kInt) {
+    block_table_input = block_table_input.to(torch::kInt);
+  }
 
   MtpPrepareNextDraftOutput local_output;
   MtpPrepareNextDraftOutput& output =
@@ -113,9 +126,11 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
   ensure_tensor(output.embeddings,
                 {batch_size * 2, hidden_size},
                 accepted_embeddings.options());
-  ensure_tensor(output.positions, {batch_size * 2}, base_positions.options());
-  ensure_tensor(output.kv_seq_lens, {batch_size}, base_kv_seq_lens.options());
-  ensure_tensor(output.cache_slots, {batch_size * 2}, base_positions.options());
+  const torch::TensorOptions int_options =
+      accepted_tokens.options().dtype(torch::kInt);
+  ensure_tensor(output.positions, {batch_size * 2}, int_options);
+  ensure_tensor(output.kv_seq_lens, {batch_size}, int_options);
+  ensure_tensor(output.cache_slots, {batch_size * 2}, int_options);
 
   aclTensor* accepted_tokens_acl = nullptr;
   aclTensor* accepted_embeddings_acl = nullptr;
@@ -133,7 +148,7 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
   create_acltensor(&embedding_placeholder_acl, embedding_placeholder);
   create_acltensor(&base_positions_acl, position_rows);
   create_acltensor(&base_kv_seq_lens_acl, kv_seq_len_rows);
-  create_acltensor(&block_tables_acl, block_tables);
+  create_acltensor(&block_tables_acl, block_table_input);
   create_acltensor(&token_ids_acl, output.token_ids);
   create_acltensor(&embeddings_acl, output.embeddings);
   create_acltensor(&positions_acl, output.positions);

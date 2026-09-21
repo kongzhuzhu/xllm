@@ -276,7 +276,10 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const ForwardInput& input,
       const ForwardInput& metadata_template,
       const ForwardInput& current_draft_input,
-      int32_t num_speculative_tokens);
+      int32_t num_speculative_tokens,
+      const torch::Tensor& previous_accepted_tokens = torch::Tensor(),
+      const torch::Tensor& previous_base_positions = torch::Tensor(),
+      const torch::Tensor& previous_base_kv_seq_lens = torch::Tensor());
   bool can_use_combined_first_draft() const;
   bool can_prelaunch_next_first_draft(const ForwardInput& input) const;
   void prepare_next_first_draft_template(const ForwardInput& input,

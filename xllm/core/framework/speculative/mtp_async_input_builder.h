@@ -65,7 +65,9 @@ void prepare_target_verify_from_accepted_state(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
-    int32_t block_size);
+    int32_t block_size,
+    bool use_chunked_prefill = false,
+    bool step_major_layout = false);
 
 }  // namespace mtp_async
 }  // namespace xllm
