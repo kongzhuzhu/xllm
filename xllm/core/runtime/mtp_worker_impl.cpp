@@ -1644,6 +1644,43 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
   CHECK_EQ(graph_output.next_positions.numel(), batch_size);
   CHECK_EQ(graph_output.next_kv_seq_lens.numel(), batch_size);
 
+  // Validate the graph-produced state against the independent Device
+  // reference used by the existing MTP input builder. This catches an
+  // acceptance/count or rejected-prefix state bug at the unified boundary;
+  // it is intentionally a hard check after graph execution, never a reason
+  // to enter the legacy MTP path.
+  CHECK(graph_output.accepted_count.defined())
+      << "unified Python MTP graph did not return accepted count";
+  CHECK_EQ(graph_output.accepted_count.numel(), batch_size);
+  torch::Tensor validate_positions = validate_input.positions;
+  CHECK_EQ(validate_positions.numel(),
+           static_cast<int64_t>(batch_size) * (num_speculative_tokens + 1));
+  torch::Tensor validate_base_positions =
+      validate_positions.view({batch_size, num_speculative_tokens + 1})
+          .select(/*dim=*/1, /*index=*/0)
+          .contiguous();
+  const torch::Tensor& validate_kv_seq_lens =
+      validate_input.input_params.attention.device.kv_seq_lens;
+  torch::Tensor validate_base_kv_seq_lens =
+      mtp_async::extract_target_base_kv_seq_lens(
+          validate_kv_seq_lens,
+          batch_size,
+          num_speculative_tokens + 1,
+          use_chunked_prefill_spec_verify_path());
+  const mtp_async::AcceptedTokenMetadata expected_state =
+      mtp_async::build_accepted_token_metadata(graph_output.committed_tokens,
+                                               validate_base_positions,
+                                               validate_base_kv_seq_lens);
+  CHECK(torch::equal(graph_output.accepted_count.to(torch::kLong),
+                     expected_state.accepted_lengths - 1))
+      << "unified MTP accepted count disagrees with committed tokens";
+  CHECK(
+      torch::equal(graph_output.next_positions, expected_state.base_positions))
+      << "unified MTP next positions disagree with accepted prefix";
+  CHECK(torch::equal(graph_output.next_kv_seq_lens.to(torch::kLong),
+                     expected_state.base_kv_seq_lens))
+      << "unified MTP next KV lengths disagree with accepted prefix";
+
   ForwardOutput target_output;
   target_output.sample_output.next_tokens = graph_output.committed_tokens;
   target_output.sample_output.embeddings = graph_output.target_embeddings;
