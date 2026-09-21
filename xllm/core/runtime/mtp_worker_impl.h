@@ -232,6 +232,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
     // changes and the host cache fallback is required.
     torch::Tensor accepted_tokens;
     torch::Tensor accepted_tokens_host;
+    torch::Tensor accepted_count_host;
     torch::Tensor accepted_embeddings;
     torch::Tensor base_positions;
     torch::Tensor base_kv_seq_lens;
@@ -257,9 +258,12 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                   torch::Tensor base_kv_seq_lens,
                                   StreamEventPtr ready_event,
                                   torch::Tensor accepted_tokens_host,
+                                  torch::Tensor accepted_count_host,
                                   std::vector<size_t> failed_rows);
   torch::Tensor acquire_accepted_tokens_host_buffer(
       const torch::Tensor& accepted_tokens);
+  torch::Tensor acquire_accepted_count_host_buffer(
+      const torch::Tensor& accepted_count);
   bool pending_target_context_matches(const ForwardInput& input) const;
   bool device_target_context_ready_for_batch(const ForwardInput& input) const;
   void flush_pending_target_context();
@@ -305,6 +309,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // into this storage until the copy event is synchronized and CPU consumers
   // have finished reading it.
   torch::Tensor accepted_tokens_host_buffer_;
+  torch::Tensor accepted_count_host_buffer_;
   // Draft step 0 is submitted at the tail of the preceding target validation,
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.

@@ -86,6 +86,12 @@ class EmbeddingCache final {
                             const torch::Tensor& accepted_tokens,
                             const torch::Tensor& accepted_embeddings,
                             int32_t num_speculative_tokens);
+  void write_target_context(const std::vector<int32_t>& embedding_ids,
+                            const std::vector<std::string>& request_ids,
+                            const torch::Tensor& accepted_tokens,
+                            const torch::Tensor& accepted_embeddings,
+                            const torch::Tensor& accepted_count,
+                            int32_t num_speculative_tokens);
 
   // Algorithm-specific placeholder embedding for missing target context, e.g.
   // PD first decode. MTP uses hidden_size; Eagle3 uses 3 * hidden_size.

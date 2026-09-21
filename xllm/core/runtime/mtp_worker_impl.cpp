@@ -1658,10 +1658,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
 
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
+  torch::Tensor accepted_count_host =
+      acquire_accepted_count_host_buffer(graph_output.accepted_count);
   StreamEventPtr ready_event;
   {
     accepted_tokens_host.copy_(graph_output.committed_tokens,
                                /*non_blocking=*/true);
+    accepted_count_host.copy_(graph_output.accepted_count,
+                              /*non_blocking=*/true);
     ready_event = compute_stream_->record_event();
   }
   if (ready_event == nullptr) {
@@ -1674,6 +1678,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                              base_kv_seq_lens,
                              ready_event,
                              std::move(accepted_tokens_host),
+                             std::move(accepted_count_host),
                              {});
   target_output.ready_event = ready_event;
 
@@ -2761,6 +2766,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
                              base_kv_seq_lens,
                              target_context_ready_event,
                              std::move(accepted_tokens_host),
+                             torch::Tensor(),
                              std::move(failed_sequence_rows));
   if (prelaunch_next_first_draft && !has_failed_sequence_rows) {
     // Submit the next iteration's first draft before returning to the
@@ -2805,6 +2811,7 @@ void MTPWorkerImpl::stage_target_context_write(
     torch::Tensor base_kv_seq_lens,
     StreamEventPtr ready_event,
     torch::Tensor accepted_tokens_host,
+    torch::Tensor accepted_count_host,
     std::vector<size_t> failed_rows) {
   CHECK(!pending_target_context_.accepted_tokens.defined())
       << "previous MTP target context must be flushed before staging another";
@@ -2815,6 +2822,7 @@ void MTPWorkerImpl::stage_target_context_write(
   pending_target_context_.accepted_tokens = validate_output.next_tokens;
   pending_target_context_.accepted_tokens_host =
       std::move(accepted_tokens_host);
+  pending_target_context_.accepted_count_host = std::move(accepted_count_host);
   pending_target_context_.accepted_embeddings = validate_output.embeddings;
   pending_target_context_.base_positions = std::move(base_positions);
   pending_target_context_.base_kv_seq_lens = std::move(base_kv_seq_lens);
@@ -2855,6 +2863,33 @@ torch::Tensor MTPWorkerImpl::acquire_accepted_tokens_host_buffer(
   return accepted_tokens_host_buffer_
       .narrow(/*dim=*/0, /*start=*/0, required_capacity)
       .view(accepted_tokens.sizes());
+}
+
+torch::Tensor MTPWorkerImpl::acquire_accepted_count_host_buffer(
+    const torch::Tensor& accepted_count) {
+  CHECK(accepted_count.defined()) << "accepted count must be defined";
+  CHECK_EQ(accepted_count.dim(), 1) << "accepted count must be a vector";
+  CHECK_GT(accepted_count.numel(), 0) << "accepted count must not be empty";
+  CHECK(!pending_target_context_.accepted_tokens.defined())
+      << "accepted-count host buffer is still in use";
+
+  const int64_t required_capacity = accepted_count.numel();
+  const int64_t configured_capacity =
+      static_cast<int64_t>(options_.max_seqs_per_batch());
+  const bool needs_allocation =
+      !accepted_count_host_buffer_.defined() ||
+      accepted_count_host_buffer_.scalar_type() !=
+          accepted_count.scalar_type() ||
+      accepted_count_host_buffer_.numel() < required_capacity;
+  if (needs_allocation) {
+    const int64_t capacity = std::max(required_capacity, configured_capacity);
+    accepted_count_host_buffer_ = torch::empty(
+        {capacity},
+        accepted_count.options().device(torch::kCPU).pinned_memory(true));
+  }
+
+  return accepted_count_host_buffer_.narrow(
+      /*dim=*/0, /*start=*/0, required_capacity);
 }
 
 bool MTPWorkerImpl::pending_target_context_matches(
@@ -2901,22 +2936,42 @@ void MTPWorkerImpl::flush_pending_target_context() {
   int64_t plain_accepted = 0;
   int64_t constrained_draft = 0;
   int64_t plain_draft = 0;
+  const torch::Tensor& accepted_count_host =
+      pending_target_context_.accepted_count_host;
+  if (accepted_count_host.defined()) {
+    CHECK(accepted_count_host.device().is_cpu())
+        << "accepted count host state must be on CPU";
+    CHECK_EQ(accepted_count_host.dim(), 1)
+        << "accepted count host state must be a vector";
+    CHECK_EQ(accepted_count_host.size(0), output_tokens.size(0))
+        << "accepted count host state batch mismatch";
+    CHECK(accepted_count_host.scalar_type() == torch::kInt ||
+          accepted_count_host.scalar_type() == torch::kLong)
+        << "accepted count host state must be int32 or int64";
+  }
   for (int64_t sequence_idx = 0; sequence_idx < output_tokens.size(0);
        ++sequence_idx) {
     const bool constrained =
         !pending_target_context_.json_constrained_rows.empty() &&
         pending_target_context_
                 .json_constrained_rows[static_cast<size_t>(sequence_idx)] != 0U;
-    int64_t rejected = 0;
-    for (int32_t token_idx = 0; token_idx < num_validation_tokens;
-         ++token_idx) {
-      if (output_tokens.index({sequence_idx, token_idx}).item<int64_t>() < 0) {
-        ++rejected;
+    int64_t accepted = 0;
+    if (accepted_count_host.defined()) {
+      accepted = accepted_count_host.index({sequence_idx}).item<int64_t>();
+      CHECK_GE(accepted, 0);
+      CHECK_LE(accepted, num_speculative_tokens);
+    } else {
+      int64_t rejected = 0;
+      for (int32_t token_idx = 0; token_idx < num_validation_tokens;
+           ++token_idx) {
+        if (output_tokens.index({sequence_idx, token_idx}).item<int64_t>() <
+            0) {
+          ++rejected;
+        }
       }
+      accepted = num_speculative_tokens -
+                 std::min<int64_t>(rejected, num_speculative_tokens);
     }
-    const int64_t accepted =
-        num_speculative_tokens -
-        std::min<int64_t>(rejected, num_speculative_tokens);
     if (constrained) {
       constrained_accepted += accepted;
       constrained_draft += num_speculative_tokens;
@@ -2937,6 +2992,7 @@ void MTPWorkerImpl::flush_pending_target_context() {
         pending_target_context_.request_ids,
         pending_target_context_.accepted_tokens_host,
         pending_target_context_.accepted_embeddings,
+        pending_target_context_.accepted_count_host,
         options_.num_speculative_tokens());
   } else {
     CHECK(pending_target_context_.request_ids.empty() ||
@@ -2979,6 +3035,10 @@ void MTPWorkerImpl::flush_pending_target_context() {
               /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
           pending_target_context_.accepted_embeddings.narrow(
               /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
+          pending_target_context_.accepted_count_host.defined()
+              ? pending_target_context_.accepted_count_host.narrow(
+                    /*dim=*/0, /*start=*/sequence_index, /*length=*/1)
+              : torch::Tensor(),
           options_.num_speculative_tokens());
     }
   }

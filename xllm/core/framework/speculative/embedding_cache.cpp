@@ -111,6 +111,21 @@ void EmbeddingCache::write_target_context(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& accepted_embeddings,
     int32_t num_speculative_tokens) {
+  write_target_context(ids,
+                       request_ids,
+                       accepted_tokens,
+                       accepted_embeddings,
+                       torch::Tensor(),
+                       num_speculative_tokens);
+}
+
+void EmbeddingCache::write_target_context(
+    const std::vector<int32_t>& ids,
+    const std::vector<std::string>& request_ids,
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& accepted_embeddings,
+    const torch::Tensor& accepted_count,
+    int32_t num_speculative_tokens) {
   CHECK(accepted_tokens.defined()) << "accepted target tokens are undefined";
   CHECK(accepted_embeddings.defined())
       << "accepted target embeddings are undefined";
@@ -122,6 +137,15 @@ void EmbeddingCache::write_target_context(
       << "accepted token batch mismatch";
   CHECK(request_ids.empty() || request_ids.size() == ids.size())
       << "accepted request id count mismatch";
+  if (accepted_count.defined()) {
+    CHECK(accepted_count.device().is_cpu()) << "accepted count must be on CPU";
+    CHECK_EQ(accepted_count.dim(), 1) << "accepted count should be a vector";
+    CHECK_EQ(accepted_count.size(0), static_cast<int64_t>(ids.size()))
+        << "accepted count batch mismatch";
+    CHECK(accepted_count.scalar_type() == torch::kInt ||
+          accepted_count.scalar_type() == torch::kLong)
+        << "accepted count must be int32 or int64";
+  }
   CHECK_EQ(accepted_embeddings.size(0), static_cast<int64_t>(ids.size()))
       << "accepted embedding batch mismatch";
   CHECK_EQ(accepted_tokens.size(1), accepted_embeddings.size(1))
@@ -135,21 +159,39 @@ void EmbeddingCache::write_target_context(
   const int32_t token_width = static_cast<int32_t>(accepted_tokens_cpu.size(1));
   for (int32_t i = 0; i < num_ids; ++i) {
     int32_t accepted_len = 0;
+    if (accepted_count.defined()) {
+      accepted_len =
+          static_cast<int32_t>(accepted_count.index({i}).item<int64_t>()) + 1;
+      CHECK_GE(accepted_len, 1);
+      CHECK_LE(accepted_len, num_speculative_tokens + 1);
+    }
     int32_t last_token_id = -1;
     int32_t correction_token = -1;
     int32_t correction_offset = -1;
     const int64_t row_offset = static_cast<int64_t>(i) * token_width;
-    for (int32_t j = 0; j < token_width; ++j) {
-      const int64_t token = accepted_tokens_data[row_offset + j];
-      if (token < 0) {
-        break;
-      }
+    if (accepted_count.defined()) {
+      correction_offset = accepted_len - 1;
+      const int64_t token =
+          accepted_tokens_data[row_offset + correction_offset];
+      CHECK_GE(token, 0) << "accepted target token is missing at graph count";
       CHECK_LE(token, static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
           << "accepted token overflow";
       last_token_id = static_cast<int32_t>(token);
-      correction_token = static_cast<int32_t>(token);
-      correction_offset = j;
-      ++accepted_len;
+      correction_token = last_token_id;
+    } else {
+      for (int32_t j = 0; j < token_width; ++j) {
+        const int64_t token = accepted_tokens_data[row_offset + j];
+        if (token < 0) {
+          break;
+        }
+        CHECK_LE(token,
+                 static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
+            << "accepted token overflow";
+        last_token_id = static_cast<int32_t>(token);
+        correction_token = static_cast<int32_t>(token);
+        correction_offset = j;
+        ++accepted_len;
+      }
     }
     CHECK_GT(accepted_len, 0)
         << "each sequence must have at least one accepted target token";
