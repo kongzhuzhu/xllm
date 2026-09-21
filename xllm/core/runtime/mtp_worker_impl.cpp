@@ -1633,29 +1633,28 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
       << "unified Python MTP graph did not return committed tokens";
   CHECK(graph_output.target_embeddings.defined())
       << "unified Python MTP graph did not return target embeddings";
+  CHECK(graph_output.next_positions.defined())
+      << "unified Python MTP graph did not return next positions";
+  CHECK(graph_output.next_kv_seq_lens.defined())
+      << "unified Python MTP graph did not return next KV lengths";
   CHECK_EQ(graph_output.committed_tokens.size(0), batch_size);
   CHECK_EQ(graph_output.committed_tokens.size(1), num_speculative_tokens + 1);
   CHECK_EQ(graph_output.target_embeddings.size(0), batch_size);
   CHECK_EQ(graph_output.target_embeddings.size(1), num_speculative_tokens + 1);
+  CHECK_EQ(graph_output.next_positions.numel(), batch_size);
+  CHECK_EQ(graph_output.next_kv_seq_lens.numel(), batch_size);
 
   ForwardOutput target_output;
   target_output.sample_output.next_tokens = graph_output.committed_tokens;
   target_output.sample_output.embeddings = graph_output.target_embeddings;
 
-  torch::Tensor validate_positions = validate_input.positions;
-  CHECK_EQ(validate_positions.numel(),
-           static_cast<int64_t>(batch_size) * (num_speculative_tokens + 1));
-  torch::Tensor base_positions_for_cache =
-      validate_positions.view({batch_size, num_speculative_tokens + 1})
-          .select(/*dim=*/1, /*index=*/0)
-          .contiguous();
-  const torch::Tensor& validate_kv_seq_lens =
-      validate_input.input_params.attention.device.kv_seq_lens;
-  torch::Tensor base_kv_seq_lens = mtp_async::extract_target_base_kv_seq_lens(
-      validate_kv_seq_lens,
-      batch_size,
-      num_speculative_tokens + 1,
-      use_chunked_prefill_spec_verify_path());
+  // The composite graph has already derived the accepted-prefix base state
+  // from its Device acceptance result. Keep that state as the source for the
+  // next draft/cache transition instead of reconstructing it from the Host
+  // verify metadata. The overlap path is still outside unified admission, so
+  // these persistent output views are consumed before a subsequent replay.
+  torch::Tensor base_positions_for_cache = graph_output.next_positions;
+  torch::Tensor base_kv_seq_lens = graph_output.next_kv_seq_lens;
 
   torch::Tensor accepted_tokens_host =
       acquire_accepted_tokens_host_buffer(graph_output.committed_tokens);
