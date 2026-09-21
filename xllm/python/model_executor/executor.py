@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -476,7 +478,16 @@ class ModelExecutor:
             draft_activate=draft_activate,
             target_activate=target_activate,
         )
-        return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare)
+        kv_payload_oracle = None
+        if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1":
+            from xllm.python.model_executor.runners.mtp_kv_oracle import MtpKvPayloadOracle
+
+            if backend != "aclgraph" or prepare is not None:
+                raise ValueError("MTP KV oracle requires ACL graph role adapters without an external prepare hook")
+            kv_payload_oracle = MtpKvPayloadOracle(
+                recipe, draft_executor.eager_runner.layer_caches, self.eager_runner.layer_caches
+            )
+        return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare, kv_payload_oracle=kv_payload_oracle)
 
     def create_mtp_graph_runner_from_metadata(
         self,
@@ -491,6 +502,7 @@ class ModelExecutor:
         kv_seq_lens: torch.Tensor | None = None,
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
+        target_step_major_layout: bool = False,
     ) -> MtpAclGraphRunner:
         """Construct both role adapters and their recipe in one Python call."""
         draft_forward = draft_executor.create_mtp_role_adapter(
@@ -502,6 +514,7 @@ class ModelExecutor:
             (target_metadata,),
             speculative_tokens=speculative_tokens,
             target=True,
+            step_major_layout=target_step_major_layout,
         )
         return self.create_mtp_graph_runner(
             draft_executor,
@@ -521,6 +534,7 @@ class ModelExecutor:
         *,
         speculative_tokens: int,
         target: bool = False,
+        step_major_layout: bool = False,
         layer_synchronizer: LayerSynchronizer | None = None,
         repair_token_ids: torch.Tensor | None = None,
     ) -> MtpRoleAdapter:
@@ -537,6 +551,7 @@ class ModelExecutor:
             metadata_by_step,
             speculative_tokens=speculative_tokens,
             target=target,
+            step_major_layout=step_major_layout,
             layer_synchronizer=layer_synchronizer,
             repair_token_ids=repair_token_ids,
         )

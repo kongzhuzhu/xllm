@@ -29,6 +29,9 @@ limitations under the License.
 #include "core/framework/speculative/mtp_json_object_state.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "runtime/speculative_worker_impl.h"
+#if defined(USE_NPU)
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
 
 namespace xllm {
 
@@ -285,6 +288,11 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                                 ForwardInput combined_input);
   void submit_pending_first_draft(const ForwardInput& batch_identity_input,
                                   ForwardInput draft_input);
+#if defined(USE_NPU)
+  kernel::npu::MtpPrepareNextDraftWorkspace* acquire_mtp_prepare_workspace(
+      const ForwardInput& block_table_source,
+      const torch::Tensor& accepted_embeddings);
+#endif
   bool pending_draft_context_matches(const ForwardInput& input) const;
 
   void write_target_context_to_cache(const ForwardInput& input,
@@ -310,6 +318,15 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // have finished reading it.
   torch::Tensor accepted_tokens_host_buffer_;
   torch::Tensor accepted_count_host_buffer_;
+  // Unified decode keeps the accepted Device state after the non-overlap Host
+  // cache flush. The next iteration consumes these tensors to build the fused
+  // [repair, current] draft metadata without reconstructing it from Host.
+  torch::Tensor unified_device_accepted_tokens_;
+  torch::Tensor unified_device_accepted_embeddings_;
+  torch::Tensor unified_device_base_positions_;
+  torch::Tensor unified_device_base_kv_seq_lens_;
+  std::vector<int32_t> unified_device_context_embedding_ids_;
+  std::vector<std::string> unified_device_context_request_ids_;
   // Draft step 0 is submitted at the tail of the preceding target validation,
   // before control returns to the scheduler.  The following scheduler turn
   // consumes this output and only submits draft steps 1..N-1.
@@ -349,5 +366,13 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       unified_python_mtp_graph_variants_;
   std::unordered_map<std::string, size_t>
       unified_python_mtp_graph_variant_index_;
+#if defined(USE_NPU)
+  // Keep one output/workspace owner per fixed metadata shape. Existing
+  // captured variants retain their addresses when a later request creates a
+  // different shape variant.
+  std::unordered_map<std::string,
+                     std::unique_ptr<kernel::npu::MtpPrepareNextDraftWorkspace>>
+      mtp_prepare_workspaces_;
+#endif
 };
 }  // namespace xllm

@@ -29,7 +29,7 @@ only uses fixed-shape tensors and device operations, so it can be captured by
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Sized
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Literal
 
@@ -48,6 +48,7 @@ from xllm.python.model_executor.runners.base import (
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
     from xllm.python.model_executor.forward_context import LayerSynchronizer
+    from xllm.python.model_executor.runners.mtp_kv_oracle import MtpKvPayloadOracle
 
 GraphBackend = Literal["eager", "aclgraph"]
 ForwardFn = Callable[
@@ -126,6 +127,33 @@ def _metadata_signature(metadata: AttentionMetadata) -> tuple[object, ...]:
     )
 
 
+def _normalize_request_major_rows(
+    values: torch.Tensor,
+    batch_size: int,
+    row_width: int,
+    *,
+    step_major_layout: bool,
+) -> torch.Tensor:
+    """Normalize sequence-major or step-major rows to ``[B, row_width]``."""
+    if batch_size <= 0 or row_width <= 0:
+        raise ValueError("row normalization requires positive batch and width")
+    flat = values.reshape(-1)
+    expected = batch_size * row_width
+    if flat.numel() != expected:
+        raise ValueError(f"row layout has {flat.numel()} values, expected {expected}")
+    if step_major_layout:
+        return flat.view(row_width, batch_size).transpose(0, 1).contiguous()
+    return flat.view(batch_size, row_width)
+
+
+def _metadata_values_empty(values: object) -> bool:
+    if values is None:
+        return True
+    if isinstance(values, torch.Tensor):
+        return values.numel() == 0
+    return isinstance(values, Sized) and len(values) == 0
+
+
 class MtpRoleAdapter:
     """Role-scoped body adapter for one composite MTP graph.
 
@@ -143,6 +171,7 @@ class MtpRoleAdapter:
         *,
         speculative_tokens: int,
         target: bool = False,
+        step_major_layout: bool = False,
         layer_synchronizer: LayerSynchronizer | None = None,
         repair_token_ids: torch.Tensor | None = None,
     ) -> None:
@@ -163,6 +192,7 @@ class MtpRoleAdapter:
         else:
             self._metadata_by_step = tuple(item.clone_for_graph() for item in metadata_by_step)
         self._target = target
+        self._step_major_layout = step_major_layout
         self._layer_synchronizer = layer_synchronizer
         self._repair_token_ids = torch.empty_like(repair_token_ids) if repair_token_ids is not None else None
         if self._repair_token_ids is not None:
@@ -177,6 +207,101 @@ class MtpRoleAdapter:
             raise RuntimeError("MTP role backend count does not match metadata plan")
         self._graph_prepared = False
         self._step_execution_states: tuple[AclGraphExecutionState | None, ...] = ()
+
+    def create_eager_reference(self) -> MtpRoleAdapter:
+        """Create an independent backend/metadata context for diagnostics."""
+        return MtpRoleAdapter(
+            self._executor,
+            self._metadata_by_step,
+            speculative_tokens=len(self._metadata_by_step),
+            target=self._target,
+            step_major_layout=self._step_major_layout,
+            layer_synchronizer=self._layer_synchronizer,
+            repair_token_ids=self._repair_token_ids,
+        )
+
+    def cache_write_slots(self) -> torch.Tensor:
+        """Return every planned write, including draft repair rows."""
+        return torch.cat([metadata.slot_mapping.reshape(-1) for metadata in self._metadata_by_step])
+
+    def verify_slots(self, batch_size: int) -> torch.Tensor:
+        """Return target verify writes in request-major rows for diagnostics."""
+        if not self._target:
+            raise RuntimeError("only the target role has verify slots")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        slot_mapping = self._metadata_by_step[0].slot_mapping.reshape(-1)
+        if slot_mapping.numel() % batch_size != 0:
+            raise RuntimeError("target verify slot mapping cannot be divided by graph batch size")
+        verify_width = slot_mapping.numel() // batch_size
+        return _normalize_request_major_rows(
+            slot_mapping,
+            batch_size,
+            verify_width,
+            step_major_layout=self._step_major_layout,
+        )
+
+    def attention_read_plan(self, batch_size: int) -> tuple[torch.Tensor, object, int]:
+        """Expose the backend's current read table and KV lengths to the oracle."""
+        if not self._target:
+            raise RuntimeError("only the target role has an attention read plan")
+        if not self._attention_backends:
+            raise RuntimeError("attention read observation requires prepared role backends")
+        metadata = self._metadata_by_step[0]
+        backend = self._attention_backends[0]
+        # The backend resolves expanded decode/DCP layout before execution.
+        # Observe that resolved table first; generic metadata can describe a
+        # logical table that is not the table consumed by the attention call.
+        block_table = getattr(backend, "_block_table_i32", None)
+        if block_table is None:
+            block_table = getattr(metadata, "block_table", None)
+        if block_table is None or block_table.ndim != 2:
+            raise RuntimeError("target attention read observation requires a 2-D block table")
+        block_table = block_table.detach()
+        if block_table.shape[0] != batch_size:
+            if block_table.shape[0] % batch_size != 0:
+                raise RuntimeError("target attention read block table cannot be normalized to requests")
+            verify_width = block_table.shape[0] // batch_size
+            rows = _normalize_request_major_rows(
+                block_table,
+                batch_size,
+                verify_width,
+                step_major_layout=self._step_major_layout,
+            )
+            first_rows = rows[:, :1, :]
+            if not torch.equal(rows, first_rows.expand_as(rows)):
+                raise RuntimeError("target attention read block table changes within a request")
+            block_table = rows[:, 0, :].contiguous()
+        page_size = getattr(backend, "logical_page_size", None)
+        if page_size is None:
+            page_size = getattr(backend, "page_size", None)
+        if page_size is None or int(page_size) <= 0:
+            raise RuntimeError("target attention read observation requires a positive page size")
+        kv_seq_lens = getattr(backend, "_actual_seq_kv", None)
+        if _metadata_values_empty(kv_seq_lens):
+            kv_seq_lens = getattr(backend, "_mla_actual_seq_kv_host", None)
+        if _metadata_values_empty(kv_seq_lens):
+            kv_seq_lens = getattr(metadata, "kv_seq_lens_host_values", None)
+        if _metadata_values_empty(kv_seq_lens):
+            kv_seq_lens = getattr(metadata, "kv_seq_lens", None)
+        if _metadata_values_empty(kv_seq_lens):
+            raise RuntimeError("target attention read observation requires KV sequence lengths")
+        if isinstance(kv_seq_lens, torch.Tensor):
+            kv_seq_lens = kv_seq_lens.detach().reshape(-1)
+        else:
+            kv_seq_lens = torch.as_tensor(kv_seq_lens, dtype=torch.long)
+        if kv_seq_lens.numel() != batch_size:
+            if kv_seq_lens.numel() % batch_size != 0:
+                raise RuntimeError("target attention read KV lengths cannot be normalized to requests")
+            verify_width = kv_seq_lens.numel() // batch_size
+            rows = _normalize_request_major_rows(
+                kv_seq_lens,
+                batch_size,
+                verify_width,
+                step_major_layout=self._step_major_layout,
+            )
+            kv_seq_lens = rows[:, 0].contiguous()
+        return block_table, kv_seq_lens, int(page_size)
 
     def bind_graph_context(
         self,
@@ -782,6 +907,7 @@ class MtpAclGraphRunner:
         backend: GraphBackend = "aclgraph",
         warmup_steps: int = 2,
         prepare: PrepareFn | None = None,
+        kv_payload_oracle: MtpKvPayloadOracle | None = None,
     ) -> None:
         if backend not in ("eager", "aclgraph"):
             raise ValueError(f"unknown MTP graph backend: {backend!r}")
@@ -791,6 +917,7 @@ class MtpAclGraphRunner:
         self.backend = backend
         self.warmup_steps = warmup_steps
         self.prepare = prepare
+        self.kv_payload_oracle = kv_payload_oracle
         self._captured = False
         self._graph = None
         self._capture_stream = None
@@ -933,7 +1060,9 @@ class MtpAclGraphRunner:
         self._validate_recurrent_inputs(draft_input_embedding, draft_topk_indices)
         if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
             raise RuntimeError("ACL graph backend requires torch.npu.NPUGraph")
+        initial_cache = self.kv_payload_oracle.snapshot() if self.kv_payload_oracle is not None else None
         stage = "input copy"
+        capture_error: RuntimeError | None = None
         try:
             self._static_seed_token_ids.copy_(seed_token_ids)
             self._static_base_positions.copy_(base_positions)
@@ -972,7 +1101,20 @@ class MtpAclGraphRunner:
             with torch.npu.stream(self._capture_stream), torch.npu.graph(self._graph, stream=self._capture_stream):
                 self._static_output = self._run_static()
         except Exception as exc:
-            raise RuntimeError(f"MTP ACL graph capture failed during {stage}: {exc}") from exc
+            capture_error = RuntimeError(f"MTP ACL graph capture failed during {stage}: {exc}")
+        finally:
+            if initial_cache is not None:
+                try:
+                    if self._capture_stream is not None:
+                        self._capture_stream.synchronize()
+                    initial_cache.restore()
+                    torch.npu.current_stream().synchronize()
+                except Exception as restore_error:
+                    if capture_error is None:
+                        raise RuntimeError("MTP ACL graph capture cache restore failed") from restore_error
+                    raise RuntimeError(f"{capture_error}; cache restore failed: {restore_error}") from capture_error
+        if capture_error is not None:
+            raise capture_error
         self._entry.graph = self._graph
         self._entry.generation += 1
         self._entry.captured = True
@@ -988,6 +1130,12 @@ class MtpAclGraphRunner:
     ) -> SpeculativeExecutionOutput:
         self._validate_inputs(seed_token_ids, base_positions, kv_seq_lens)
         self._validate_recurrent_inputs(draft_input_embedding, draft_topk_indices)
+        reference = None
+        if self.kv_payload_oracle is not None:
+            self.kv_payload_oracle.observe_next_attention_read_set()
+            reference = self.kv_payload_oracle.run_reference(
+                seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding, draft_topk_indices
+            )
         if self.backend == "eager":
             if self.prepare is not None:
                 self.prepare(seed_token_ids, base_positions, kv_seq_lens)
@@ -1029,7 +1177,7 @@ class MtpAclGraphRunner:
             topk_indices=output.next_topk_indices,
             committed_mask=output.accepted_mask,
         )
-        return SpeculativeExecutionOutput(
+        result = SpeculativeExecutionOutput(
             accepted_ids=output.accepted_ids,
             accepted_mask=output.accepted_mask,
             accepted_count=output.accepted_count,
@@ -1039,3 +1187,8 @@ class MtpAclGraphRunner:
             draft_tokens=output.draft_tokens,
             target_tokens=output.target_tokens,
         )
+        if self.kv_payload_oracle is not None:
+            assert reference is not None
+            self.kv_payload_oracle.compare(result, reference)
+            self.kv_payload_oracle.record_rejected_target_slots(result)
+        return result

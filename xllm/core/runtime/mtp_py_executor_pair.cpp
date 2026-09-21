@@ -66,7 +66,8 @@ std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
     const torch::Tensor& kv_seq_lens,
     int32_t batch_size,
     int32_t speculative_tokens,
-    int64_t vocab_size) {
+    int64_t vocab_size,
+    bool target_step_major_layout) {
   py::gil_scoped_acquire gil;
   py::object runner =
       target_executor.create_mtp_graph_runner(draft_executor,
@@ -76,7 +77,8 @@ std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
                                               kv_seq_lens,
                                               batch_size,
                                               speculative_tokens,
-                                              vocab_size);
+                                              vocab_size,
+                                              target_step_major_layout);
   return std::unique_ptr<MtpPyExecutorPair>(
       new MtpPyExecutorPair(std::move(runner)));
 }

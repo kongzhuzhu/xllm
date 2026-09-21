@@ -261,13 +261,15 @@ PhysicalKvCommitMetadata build_physical_kv_commit_metadata(
   CHECK_GT(batch_size, 0);
   CHECK_GT(verify_width, 0);
   CHECK_GT(block_size, 0);
+  CHECK(verify_positions.defined());
+  CHECK(verify_slots.defined());
+  CHECK(block_tables.defined());
+  CHECK(accepted_count.defined());
+  CHECK(base_positions.defined());
   CHECK_EQ(verify_positions.numel(), batch_size * verify_width);
   CHECK_EQ(verify_slots.numel(), batch_size * verify_width);
   CHECK_EQ(accepted_count.numel(), batch_size);
   CHECK_EQ(base_positions.numel(), batch_size);
-  CHECK(verify_positions.defined());
-  CHECK(verify_slots.defined());
-  CHECK(block_tables.defined());
   CHECK_EQ(block_tables.dim(), 2);
 
   auto normalize_rows = [batch_size, verify_width, step_major_layout](
@@ -301,6 +303,7 @@ PhysicalKvCommitMetadata build_physical_kv_commit_metadata(
 
   const int64_t block_table_rows = block_tables.size(0);
   const int64_t block_table_width = block_tables.size(1);
+  CHECK_GT(block_table_rows, 0);
   CHECK_GT(block_table_width, 0);
   torch::Tensor table_rows;
   if (block_table_rows == batch_size) {
@@ -327,6 +330,8 @@ PhysicalKvCommitMetadata build_physical_kv_commit_metadata(
   torch::Tensor expected_block_ids =
       table_rows.gather(/*dim=*/2, block_indices.unsqueeze(/*dim=*/2))
           .squeeze(/*dim=*/2);
+  CHECK(!torch::any(expected_block_ids.lt(0)).item<bool>())
+      << "target verify positions map to an invalid KV block";
   metadata.expected_slots =
       expected_block_ids * block_size + positions_long.remainder(block_size);
 

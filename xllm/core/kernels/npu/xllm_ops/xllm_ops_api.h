@@ -78,6 +78,14 @@ struct MtpPrepareNextDraftOutput {
   torch::Tensor cache_slots;
 };
 
+// Owns the fixed-address output and ACL workspace for one MTP metadata
+// variant.  The owner must outlive every graph replay that consumes output.
+struct MtpPrepareNextDraftWorkspace {
+  MtpPrepareNextDraftOutput output;
+  torch::Tensor workspace;
+  uint64_t workspace_size = 0;
+};
+
 std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& accepted_embeddings,
@@ -85,7 +93,8 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
     const torch::Tensor& block_tables,
-    int64_t block_size);
+    int64_t block_size,
+    MtpPrepareNextDraftWorkspace* reusable_workspace = nullptr);
 
 void beam_search_rec(const torch::Tensor& logprobs,
                      const torch::Tensor& top_tokens,

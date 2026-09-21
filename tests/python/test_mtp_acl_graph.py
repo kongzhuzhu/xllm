@@ -18,13 +18,71 @@ import pytest
 import torch
 
 from tests.python.mtp_graph_test_utils import make_recipe, output_tensors, scalar_reference
+from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpAclGraphRunner,
     MtpGraphRecipe,
     MtpRoleAdapter,
     _committed_tokens,
+    _normalize_request_major_rows,
     greedy_acceptance,
 )
+from xllm.python.model_executor.runners.mtp_kv_oracle import (
+    PagedKvSnapshot,
+    build_attention_read_slots,
+)
+
+
+def test_paged_kv_snapshot_restores_selected_physical_payloads() -> None:
+    key = torch.arange(2 * 4 * 1 * 3, dtype=torch.float32).reshape(2, 4, 1, 3)
+    value = key + 100
+    index = torch.arange(2 * 4 * 1 * 2, dtype=torch.float32).reshape(2, 4, 1, 2)
+    scale = torch.arange(2 * 4, dtype=torch.float32).reshape(2, 4, 1)
+    expected_key = key.clone()
+    expected_value = value.clone()
+    expected_index = index.clone()
+    expected_scale = scale.clone()
+    cache = LayerCache(key, value, index=index, indexer_scale=scale)
+    slots = torch.tensor([-1, 0, 3, 5], dtype=torch.long)
+    snapshot = PagedKvSnapshot.capture([("target", [cache], slots)])
+
+    key.view(-1, 1, 3).index_fill_(0, torch.tensor([0, 3, 5]), -1)
+    value.view(-1, 1, 3).index_fill_(0, torch.tensor([0, 3, 5]), -2)
+    index.view(-1, 1, 2).index_fill_(0, torch.tensor([0, 3, 5]), -3)
+    scale.view(-1, 1).index_fill_(0, torch.tensor([0, 3, 5]), -4)
+    snapshot.restore()
+
+    assert torch.equal(key, expected_key)
+    assert torch.equal(value, expected_value)
+    assert torch.equal(index, expected_index)
+    assert torch.equal(scale, expected_scale)
+    assert snapshot.tensor_count == 4
+
+
+def test_attention_read_slots_follow_kv_lengths_and_page_table() -> None:
+    block_table = torch.tensor([[4, 2, -1], [7, 1, -1]], dtype=torch.int32)
+    read_slots = build_attention_read_slots(block_table, [5, 3], page_size=4)
+
+    assert read_slots[0].tolist() == [16, 17, 18, 19, 8]
+    assert read_slots[1].tolist() == [28, 29, 30]
+
+    with pytest.raises(ValueError, match="invalid page"):
+        build_attention_read_slots(torch.tensor([[4, -1]], dtype=torch.int32), [5], page_size=4)
+
+
+def test_mtp_metadata_rows_normalize_sequence_and_step_major_layouts() -> None:
+    sequence_major = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
+    step_major = torch.tensor([0, 3, 1, 4, 2, 5], dtype=torch.long)
+
+    expected = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
+    assert torch.equal(
+        _normalize_request_major_rows(sequence_major, 2, 3, step_major_layout=False),
+        expected,
+    )
+    assert torch.equal(
+        _normalize_request_major_rows(step_major, 2, 3, step_major_layout=True),
+        expected,
+    )
 
 
 @pytest.mark.parametrize("steps", [1, 2, 3, 4, 5])

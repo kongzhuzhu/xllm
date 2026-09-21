@@ -53,7 +53,8 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
       const torch::Tensor& kv_seq_lens,
       int32_t batch_size,
       int32_t speculative_tokens,
-      int64_t vocab_size);
+      int64_t vocab_size,
+      bool target_step_major_layout);
 
   ~MtpPyExecutorPair();
 

@@ -1601,7 +1601,8 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
               kv_seq_lens,
               batch_size,
               num_speculative_tokens,
-              context_.get_model_args().vocab_size());
+              context_.get_model_args().vocab_size(),
+              uses_step_major_validate_layout());
       LOG(INFO) << "MTP unified pair create done; capture begin; variant="
                 << unified_python_mtp_graph_variants_.size();
       graph_output = new_variant->capture_and_execute(
@@ -1740,6 +1741,14 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                              std::move(accepted_tokens_host),
                              std::move(accepted_count_host),
                              {});
+  unified_device_accepted_tokens_ = graph_output.committed_tokens;
+  unified_device_accepted_embeddings_ = graph_output.target_embeddings;
+  unified_device_base_positions_ = graph_output.next_positions;
+  unified_device_base_kv_seq_lens_ = graph_output.next_kv_seq_lens;
+  unified_device_context_embedding_ids_ =
+      input.input_params.embedding.embedding_ids;
+  unified_device_context_request_ids_ =
+      input.input_params.embedding.request_ids;
   target_output.ready_event = ready_event;
 
   if (!enable_schedule_overlap()) {
@@ -1784,13 +1793,45 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   // cache flush. The prelaunched draft can be valid before the batch is marked
   // device-context ready, while flush_pending_target_context() clears the
   // owning context below.
-  const torch::Tensor accepted_tokens = pending_target_context_.accepted_tokens;
+  const bool persistent_unified_state_matches =
+      unified_device_context_embedding_ids_ ==
+          input.input_params.embedding.embedding_ids &&
+      unified_device_context_request_ids_ ==
+          input.input_params.embedding.request_ids &&
+      unified_device_accepted_tokens_.defined() &&
+      unified_device_accepted_embeddings_.defined() &&
+      unified_device_base_positions_.defined() &&
+      unified_device_base_kv_seq_lens_.defined();
+  const bool has_pending_device_state =
+      pending_target_context_.accepted_tokens.defined();
+  const torch::Tensor accepted_tokens =
+      has_pending_device_state
+          ? pending_target_context_.accepted_tokens
+          : (persistent_unified_state_matches ? unified_device_accepted_tokens_
+                                              : torch::Tensor());
   const torch::Tensor accepted_embeddings =
-      pending_target_context_.accepted_embeddings;
+      has_pending_device_state ? pending_target_context_.accepted_embeddings
+                               : (persistent_unified_state_matches
+                                      ? unified_device_accepted_embeddings_
+                                      : torch::Tensor());
   const torch::Tensor target_base_positions =
-      pending_target_context_.base_positions;
+      has_pending_device_state
+          ? pending_target_context_.base_positions
+          : (persistent_unified_state_matches ? unified_device_base_positions_
+                                              : torch::Tensor());
   const torch::Tensor target_base_kv_seq_lens =
-      pending_target_context_.base_kv_seq_lens;
+      has_pending_device_state
+          ? pending_target_context_.base_kv_seq_lens
+          : (persistent_unified_state_matches ? unified_device_base_kv_seq_lens_
+                                              : torch::Tensor());
+  if (!persistent_unified_state_matches && !matching_device_target_context) {
+    unified_device_accepted_tokens_ = torch::Tensor();
+    unified_device_accepted_embeddings_ = torch::Tensor();
+    unified_device_base_positions_ = torch::Tensor();
+    unified_device_base_kv_seq_lens_ = torch::Tensor();
+    unified_device_context_embedding_ids_.clear();
+    unified_device_context_request_ids_.clear();
+  }
   const StreamEventPtr target_context_ready_event =
       pending_target_context_.ready_event;
   if (pending_draft_context_.output.has_value() &&
@@ -1956,7 +1997,15 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
         target_base_kv_seq_lens,
         /*use_chunked_prefill=*/false,
         /*rebuild_expanded_decode_metadata=*/true,
-        logical_block_size());
+        logical_block_size(),
+        /*require_fused_npu_kernel=*/use_unified_python_graph,
+#if defined(USE_NPU)
+        use_unified_python_graph
+            ? acquire_mtp_prepare_workspace(input, accepted_embeddings)
+            : nullptr);
+#else
+        nullptr);
+#endif
   } else {
     // First decode after prefill and batch transitions use the host cache.
     std::vector<EmbeddingCache::DecodeState> last_states =
@@ -1981,6 +2030,33 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
                                 last_states,
                                 current_draft_input,
                                 /*force_two_rows=*/use_unified_python_graph);
+    const bool has_device_accepted_state =
+        accepted_tokens.defined() || accepted_embeddings.defined() ||
+        target_base_positions.defined() || target_base_kv_seq_lens.defined();
+    if (use_unified_python_graph && has_device_accepted_state) {
+      CHECK(accepted_tokens.defined() && accepted_embeddings.defined() &&
+            target_base_positions.defined() &&
+            target_base_kv_seq_lens.defined())
+          << "unified MTP accepted state must be complete before fused "
+             "next-draft preparation";
+      mtp_async::prepare_next_draft_from_accepted_state(
+          current_draft_input,
+          input,
+          accepted_tokens,
+          accepted_embeddings,
+          embedding_cache_->embedding_placeholder(),
+          target_base_positions,
+          target_base_kv_seq_lens,
+          /*use_chunked_prefill=*/false,
+          /*rebuild_expanded_decode_metadata=*/true,
+          logical_block_size(),
+          /*require_fused_npu_kernel=*/true,
+#if defined(USE_NPU)
+          acquire_mtp_prepare_workspace(input, accepted_embeddings));
+#else
+          nullptr);
+#endif
+    }
   }
   if (use_unified_python_graph) {
     return run_unified_python_mtp_graph(
@@ -3164,6 +3240,32 @@ bool MTPWorkerImpl::can_prelaunch_next_first_draft(
   }
   return device_target_context_ready_for_batch(input);
 }
+
+#if defined(USE_NPU)
+kernel::npu::MtpPrepareNextDraftWorkspace*
+MTPWorkerImpl::acquire_mtp_prepare_workspace(
+    const ForwardInput& block_table_source,
+    const torch::Tensor& accepted_embeddings) {
+  const torch::Tensor& block_tables =
+      block_table_source.input_params.attention.device.block_tables;
+  CHECK(block_tables.defined())
+      << "fused next-draft preparation requires block tables";
+  std::string key =
+      "device=" + std::to_string(accepted_embeddings.device().index()) +
+      ":batch=" + std::to_string(accepted_embeddings.size(0)) +
+      ":width=" + std::to_string(accepted_embeddings.size(1)) +
+      ":hidden=" + std::to_string(accepted_embeddings.size(2)) + ":dtype=" +
+      std::to_string(static_cast<int32_t>(accepted_embeddings.scalar_type())) +
+      ":table=" + std::to_string(block_tables.size(0)) + "x" +
+      std::to_string(block_tables.size(1)) +
+      ":block=" + std::to_string(logical_block_size());
+  auto [it, inserted] = mtp_prepare_workspaces_.try_emplace(key);
+  if (inserted) {
+    it->second = std::make_unique<kernel::npu::MtpPrepareNextDraftWorkspace>();
+  }
+  return it->second.get();
+}
+#endif
 
 void MTPWorkerImpl::prepare_next_first_draft_template(
     const ForwardInput& input,

@@ -54,7 +54,7 @@ bool is_supported_mtp_prepare_input(const torch::Tensor& accepted_tokens,
          embedding_placeholder.numel() == hidden_size &&
          base_positions.numel() >= batch_size &&
          base_kv_seq_lens.numel() >= batch_size &&
-         block_tables.size(0) >= batch_size &&
+         block_tables.size(0) == batch_size &&
          (hidden_size * accepted_embeddings.element_size()) % 32 == 0 &&
          accepted_tokens.is_contiguous() &&
          accepted_embeddings.is_contiguous() &&
@@ -76,7 +76,8 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
     const torch::Tensor& block_tables,
-    int64_t block_size) {
+    int64_t block_size,
+    MtpPrepareNextDraftWorkspace* reusable_workspace) {
   if (!is_supported_mtp_prepare_input(accepted_tokens,
                                       accepted_embeddings,
                                       embedding_placeholder,
@@ -94,14 +95,27 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
   const torch::Tensor kv_seq_len_rows =
       base_kv_seq_lens.flatten().slice(0, 0, batch_size);
 
-  MtpPrepareNextDraftOutput output;
-  output.token_ids = torch::empty({batch_size * 2},
-                                  accepted_tokens.options().dtype(torch::kInt));
-  output.embeddings = torch::empty({batch_size * 2, hidden_size},
-                                   accepted_embeddings.options());
-  output.positions = torch::empty({batch_size * 2}, base_positions.options());
-  output.kv_seq_lens = torch::empty({batch_size}, base_kv_seq_lens.options());
-  output.cache_slots = torch::empty({batch_size * 2}, base_positions.options());
+  MtpPrepareNextDraftOutput local_output;
+  MtpPrepareNextDraftOutput& output =
+      reusable_workspace == nullptr ? local_output : reusable_workspace->output;
+  auto ensure_tensor = [](torch::Tensor& tensor,
+                          const torch::IntArrayRef& sizes,
+                          const torch::TensorOptions& options) {
+    if (!tensor.defined() || tensor.sizes() != sizes ||
+        tensor.scalar_type() != options.dtype().toScalarType() ||
+        tensor.device() != options.device()) {
+      tensor = torch::empty(sizes, options);
+    }
+  };
+  ensure_tensor(output.token_ids,
+                {batch_size * 2},
+                accepted_tokens.options().dtype(torch::kInt));
+  ensure_tensor(output.embeddings,
+                {batch_size * 2, hidden_size},
+                accepted_embeddings.options());
+  ensure_tensor(output.positions, {batch_size * 2}, base_positions.options());
+  ensure_tensor(output.kv_seq_lens, {batch_size}, base_kv_seq_lens.options());
+  ensure_tensor(output.cache_slots, {batch_size * 2}, base_positions.options());
 
   aclTensor* accepted_tokens_acl = nullptr;
   aclTensor* accepted_embeddings_acl = nullptr;
@@ -146,11 +160,24 @@ std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
                                                &workspace_size,
                                                &executor),
       "mtp_prepare_next_draft: failed to get workspace size");
-  torch::Tensor workspace;
+  torch::Tensor local_workspace;
+  torch::Tensor& workspace = reusable_workspace == nullptr
+                                 ? local_workspace
+                                 : reusable_workspace->workspace;
+  uint64_t retained_workspace_size =
+      reusable_workspace == nullptr ? 0 : reusable_workspace->workspace_size;
   void* workspace_addr = nullptr;
-  if (workspace_size > 0) {
+  if (workspace_size > 0 &&
+      (!workspace.defined() || retained_workspace_size < workspace_size ||
+       workspace.device() != accepted_tokens.device())) {
     workspace = torch::empty({static_cast<int64_t>(workspace_size)},
                              accepted_tokens.options().dtype(torch::kUInt8));
+    retained_workspace_size = workspace_size;
+    if (reusable_workspace != nullptr) {
+      reusable_workspace->workspace_size = retained_workspace_size;
+    }
+  }
+  if (workspace_size > 0) {
     workspace_addr = workspace.data_ptr();
   }
   CHECK_ACL_SUCCESS(aclnnMtpPrepareNextDraft(

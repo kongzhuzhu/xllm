@@ -190,7 +190,8 @@ py::object PyExecutorImpl::create_mtp_graph_runner(
     const torch::Tensor& kv_seq_lens,
     int32_t batch_size,
     int32_t speculative_tokens,
-    int64_t vocab_size) {
+    int64_t vocab_size,
+    bool target_step_major_layout) {
   CHECK(!draft_metadata.empty())
       << "MTP graph requires draft metadata for every fixed K step";
   CHECK_GT(batch_size, 0) << "MTP graph batch size must be positive";
@@ -220,6 +221,7 @@ py::object PyExecutorImpl::create_mtp_graph_runner(
           py::arg("speculative_tokens") = speculative_tokens,
           py::arg("vocab_size") = vocab_size,
           py::arg("kv_seq_lens") = kv_seq_lens,
+          py::arg("target_step_major_layout") = target_step_major_layout,
           py::arg("draft_activate") = draft_activate,
           py::arg("target_activate") = target_activate);
   LOG(INFO) << "MTP Python pair graph runner done";
