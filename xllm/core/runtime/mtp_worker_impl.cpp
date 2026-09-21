@@ -1681,6 +1681,29 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                      expected_state.base_kv_seq_lens))
       << "unified MTP next KV lengths disagree with accepted prefix";
 
+  const auto physical_state = mtp_async::build_physical_kv_commit_metadata(
+      validate_input.positions,
+      validate_input.input_params.attention.device.new_cache_slots,
+      validate_input.input_params.graph.expanded_block_tables.defined()
+          ? validate_input.input_params.graph.expanded_block_tables
+          : validate_input.input_params.attention.device.block_tables,
+      graph_output.accepted_count,
+      validate_base_positions,
+      batch_size,
+      num_speculative_tokens + 1,
+      logical_block_size(),
+      uses_step_major_validate_layout());
+  CHECK(
+      torch::equal(physical_state.verify_slots, physical_state.expected_slots))
+      << "unified MTP target verify slots disagree with block-table mapping";
+  CHECK(torch::equal(
+      physical_state.committed_slot_mask.sum(/*dim=*/1).to(torch::kLong),
+      graph_output.accepted_count.to(torch::kLong) + 1))
+      << "unified MTP committed KV slot count disagrees with accepted prefix";
+  CHECK(torch::equal(physical_state.next_write_reuses_rejected_slot,
+                     graph_output.accepted_count.lt(num_speculative_tokens)))
+      << "unified MTP next draft write does not cover rejected KV slot";
+
   ForwardOutput target_output;
   target_output.sample_output.next_tokens = graph_output.committed_tokens;
   target_output.sample_output.embeddings = graph_output.target_embeddings;

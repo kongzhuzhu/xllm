@@ -244,5 +244,73 @@ TEST(MtpAsyncStateTest, BuildsLaterDraftMetadataFromAcceptedDeviceBase) {
       torch::tensor({45, 89}, torch::kInt)));
 }
 
+TEST(MtpAsyncStateTest, ValidatesPhysicalVerifySlotsAndRejectedReuse) {
+  const torch::Tensor positions =
+      torch::tensor({4, 5, 6, 7, 10, 11, 12, 13}, torch::kLong);
+  const torch::Tensor slots =
+      torch::tensor({4, 5, 6, 7, 42, 43, 44, 45}, torch::kLong);
+  const torch::Tensor block_tables =
+      torch::tensor({{0, 1, 2, 3}, {8, 9, 10, 11}}, torch::kInt);
+  const torch::Tensor accepted_count = torch::tensor({1, 3}, torch::kInt);
+  const torch::Tensor base_positions = torch::tensor({4, 10}, torch::kLong);
+
+  const PhysicalKvCommitMetadata metadata =
+      build_physical_kv_commit_metadata(positions,
+                                        slots,
+                                        block_tables,
+                                        accepted_count,
+                                        base_positions,
+                                        /*batch_size=*/2,
+                                        /*verify_width=*/4,
+                                        /*block_size=*/4,
+                                        /*step_major_layout=*/false);
+
+  EXPECT_TRUE(torch::equal(
+      metadata.expected_slots,
+      torch::tensor({{4, 5, 6, 7}, {42, 43, 44, 45}}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(
+      metadata.committed_slot_mask,
+      torch::tensor({{true, true, false, false}, {true, true, true, true}})));
+  EXPECT_TRUE(torch::equal(metadata.next_write_slots,
+                           torch::tensor({6, 46}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(metadata.next_write_reuses_rejected_slot,
+                           torch::tensor({true, false})));
+}
+
+TEST(MtpAsyncStateTest, NormalizesStepMajorPhysicalVerifyRows) {
+  const torch::Tensor positions =
+      torch::tensor({4, 10, 5, 11, 6, 12, 7, 13}, torch::kLong);
+  const torch::Tensor slots =
+      torch::tensor({4, 42, 5, 43, 6, 44, 7, 45}, torch::kLong);
+  const torch::Tensor block_tables = torch::tensor({{0, 1, 2, 3},
+                                                    {8, 9, 10, 11},
+                                                    {0, 1, 2, 3},
+                                                    {8, 9, 10, 11},
+                                                    {0, 1, 2, 3},
+                                                    {8, 9, 10, 11},
+                                                    {0, 1, 2, 3},
+                                                    {8, 9, 10, 11}},
+                                                   torch::kInt);
+  const PhysicalKvCommitMetadata metadata =
+      build_physical_kv_commit_metadata(positions,
+                                        slots,
+                                        block_tables,
+                                        torch::tensor({1, 1}, torch::kInt),
+                                        torch::tensor({4, 10}, torch::kLong),
+                                        /*batch_size=*/2,
+                                        /*verify_width=*/4,
+                                        /*block_size=*/4,
+                                        /*step_major_layout=*/true);
+
+  EXPECT_TRUE(torch::equal(
+      metadata.verify_positions,
+      torch::tensor({{4, 5, 6, 7}, {10, 11, 12, 13}}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(
+      metadata.expected_slots,
+      torch::tensor({{4, 5, 6, 7}, {42, 43, 44, 45}}, torch::kLong)));
+  EXPECT_TRUE(torch::equal(metadata.next_write_reuses_rejected_slot,
+                           torch::tensor({true, true})));
+}
+
 }  // namespace
 }  // namespace xllm::mtp_async
