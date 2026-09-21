@@ -262,12 +262,11 @@ class MtpRoleAdapter:
             if block_table.shape[0] % batch_size != 0:
                 raise RuntimeError("target attention read block table cannot be normalized to requests")
             verify_width = block_table.shape[0] // batch_size
-            rows = _normalize_request_major_rows(
-                block_table,
-                batch_size,
-                verify_width,
-                step_major_layout=self._step_major_layout,
-            )
+            table_width = block_table.shape[1]
+            if self._step_major_layout:
+                rows = block_table.view(verify_width, batch_size, table_width).transpose(0, 1)
+            else:
+                rows = block_table.view(batch_size, verify_width, table_width)
             first_rows = rows[:, :1, :]
             if not torch.equal(rows, first_rows.expand_as(rows)):
                 raise RuntimeError("target attention read block table changes within a request")
@@ -1132,7 +1131,7 @@ class MtpAclGraphRunner:
         self._validate_recurrent_inputs(draft_input_embedding, draft_topk_indices)
         reference = None
         if self.kv_payload_oracle is not None:
-            self.kv_payload_oracle.observe_next_attention_read_set()
+            self.kv_payload_oracle.observe_next_attention_read_set(base_positions)
             reference = self.kv_payload_oracle.run_reference(
                 seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding, draft_topk_indices
             )

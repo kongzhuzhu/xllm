@@ -181,6 +181,7 @@ class MtpKvPayloadOracle:
         self._target_caches = tuple(target_caches)
         self._checks = 0
         self._rejected_target_slots: tuple[torch.Tensor, ...] | None = None
+        self._expected_next_base_positions: torch.Tensor | None = None
 
     def snapshot(self) -> PagedKvSnapshot:
         return PagedKvSnapshot.capture(
@@ -190,18 +191,40 @@ class MtpKvPayloadOracle:
             )
         )
 
-    def observe_next_attention_read_set(self) -> None:
-        """Reject any next-round attention read of a rejected target slot."""
+    def observe_next_attention_read_set(self, base_positions: torch.Tensor) -> None:
+        """Reject stale reads of rejected slots on the next target request.
+
+        Chunked target verification may read a slot that it rewrites in the
+        same invocation.  That is a causal intra-chunk dependency, not a read
+        of the rejected payload left by the preceding invocation.  Remove the
+        current target write set before checking the rejected-slot invariant.
+        """
         if self._rejected_target_slots is None:
+            return
+        expected = self._expected_next_base_positions
+        if expected is None or not torch.equal(base_positions.detach().cpu().reshape(-1), expected):
+            # Capture warmup and a later user request can share one graph
+            # variant while belonging to different sequences.  Do not carry
+            # rejected physical slots across that request boundary.
+            self._rejected_target_slots = None
+            self._expected_next_base_positions = None
+            logger.info("MTP rejected-slot attention probe reset at request boundary")
             return
         target = self._recipe.target_forward
         block_table, kv_seq_lens, page_size = target.attention_read_plan(self._recipe.batch_size)
         read_slots = build_attention_read_slots(block_table, kv_seq_lens, page_size)
-        for request, (rejected, readable) in enumerate(zip(self._rejected_target_slots, read_slots, strict=True)):
-            overlap = sorted(set(rejected.tolist()).intersection(readable.tolist()))
+        verify_slots = target.verify_slots(self._recipe.batch_size)
+        for request, (rejected, readable, writes) in enumerate(
+            zip(self._rejected_target_slots, read_slots, verify_slots, strict=True)
+        ):
+            rewritten = set(writes[writes.ge(0)].tolist())
+            historical = [slot for slot in readable.tolist() if slot not in rewritten]
+            overlap = sorted(set(rejected.tolist()).intersection(historical))
             if overlap:
                 raise AssertionError(
-                    f"MTP rejected target slots are readable on next attention request={request}: {overlap}"
+                    "MTP rejected target slots are readable on next attention "
+                    f"request={request}: overlap={overlap}, rejected={rejected.tolist()}, "
+                    f"readable={readable.tolist()}, rewritten={writes[writes.ge(0)].tolist()}"
                 )
         logger.info(
             "MTP rejected-slot attention read probe passed: requests=%s page_size=%s",
@@ -223,6 +246,7 @@ class MtpKvPayloadOracle:
             suffix = verify_slots[request, committed_width:]
             rejected.append(suffix[suffix.ge(0)].contiguous())
         self._rejected_target_slots = tuple(rejected)
+        self._expected_next_base_positions = output.next_state.positions.detach().cpu().reshape(-1).clone()
 
     @torch.inference_mode()
     def run_reference(
