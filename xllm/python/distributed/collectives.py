@@ -244,6 +244,12 @@ def tp_rank(device: torch.device | str) -> int:
     return group.rank() if group is not None else 0
 
 
+def tp_world_size(device: torch.device | str) -> int:
+    """World size of the TP group for ``device`` (1 when absent)."""
+    group = _groups.get(("tp", str(torch.device(device))))
+    return group.size() if group is not None else 1
+
+
 def cp_rank(device: torch.device | str) -> int:
     """Rank in the CP group for ``device`` (0 when no CP group exists)."""
     group = _groups.get(("cp", str(torch.device(device))))
@@ -442,6 +448,7 @@ __all__ = [
     "init_process_group",
     "init_tp_group",
     "tp_rank",
+    "tp_world_size",
     "cp_rank",
     "cp_world_size",
     "layerwise_rank",

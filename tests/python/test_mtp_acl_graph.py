@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from tests.python.mtp_graph_test_utils import make_recipe, output_tensors, scalar_reference
+from xllm.python import distributed
 from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpAclGraphRunner,
@@ -207,6 +208,32 @@ def test_sampling_explicit_uniforms_are_replay_deterministic() -> None:
     second = sample_logits(logits, plan, uniform=uniform)
     assert first.tokens.item() == second.tokens.item()
     torch.testing.assert_close(first.probs, second.probs, rtol=0, atol=0)
+
+
+def test_random_sampling_runs_tp_consensus_before_target_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = MtpSamplingPlan(
+        batch_size=1,
+        do_sample=torch.ones(1, dtype=torch.bool),
+        all_random_sample=True,
+        all_greedy_sample=False,
+    )
+    calls: list[tuple[torch.Tensor, int, str]] = []
+
+    def broadcast(value: torch.Tensor, src: int, group_name: str) -> None:
+        calls.append((value.clone(), src, group_name))
+        value.fill_(2)
+
+    monkeypatch.setattr(distributed, "tp_world_size", lambda _device: 2)
+    monkeypatch.setattr(distributed, "broadcast_", broadcast)
+    sampled = sample_logits(
+        torch.tensor([[0.0, 1.0, 2.0]]),
+        plan,
+        uniform=torch.full((1, 3), 0.5),
+    )
+
+    assert sampled.tokens.tolist() == [2]
+    assert len(calls) == 1
+    assert calls[0][1:] == (0, "tp")
 
 
 def test_gumbel_max_matches_categorical_distribution() -> None:

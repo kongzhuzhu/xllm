@@ -33,12 +33,14 @@ from xllm.python.distributed.collectives import (
     tp_all_gather,
     tp_all_reduce,
     tp_rank,
+    tp_world_size,
 )
 
 __all__ = [
     "init_process_group",
     "init_tp_group",
     "tp_rank",
+    "tp_world_size",
     "cp_rank",
     "cp_world_size",
     "layerwise_rank",

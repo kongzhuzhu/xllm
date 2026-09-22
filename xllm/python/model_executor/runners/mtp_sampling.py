@@ -27,6 +27,8 @@ from typing import Mapping
 
 import torch
 
+from xllm.python import distributed
+
 
 @dataclass(frozen=True)
 class MtpSamplingPlan:
@@ -402,6 +404,15 @@ def _gumbel_argmax(log_probs: torch.Tensor, uniform: torch.Tensor | None = None)
     return (log_probs.to(torch.float32) + noise).argmax(dim=-1)
 
 
+def _tp_consensus(value: torch.Tensor) -> torch.Tensor:
+    """Keep sampled control tokens identical across one attention TP group."""
+    if distributed.tp_world_size(value.device) <= 1:
+        return value
+    value = value.contiguous()
+    distributed.broadcast_(value, src=0, group_name="tp")
+    return value
+
+
 def sample_logits(
     logits: torch.Tensor, plan: MtpSamplingPlan, *, uniform: torch.Tensor | None = None
 ) -> MtpSampledLogits:
@@ -423,6 +434,7 @@ def sample_logits(
             tokens = random_tokens
         else:
             tokens = torch.where(plan.request_do_sample(device=logits.device), random_tokens, greedy_tokens)
+        tokens = _tp_consensus(tokens)
     return MtpSampledLogits(tokens=tokens.to(torch.long), probs=probs, log_probs=log_probs)
 
 
@@ -462,6 +474,7 @@ def probabilistic_acceptance(
     greedy_accept = draft_tokens.eq(target_tokens[:, :speculative_tokens])
     do_sample = do_sample.to(device=draft_tokens.device, dtype=torch.bool).view(batch_size, 1)
     accepted = torch.where(do_sample, random_accept, greedy_accept)
+    accepted = _tp_consensus(accepted.to(torch.int32)).to(torch.bool)
     accepted_mask = torch.cumprod(accepted.to(torch.int32), dim=1).to(torch.bool)
     accepted_count = accepted_mask.sum(dim=1, dtype=torch.int32)
 
@@ -476,6 +489,7 @@ def probabilistic_acceptance(
     # log(0) must remain -inf: masked tokens cannot be recovered, even with
     # extreme noise or a very small positive residual mass.
     residual_tokens = _gumbel_argmax(torch.log(residual_probs), recovery_uniform)
+    residual_tokens = _tp_consensus(residual_tokens)
     residual_tokens = residual_tokens.reshape(batch_size, speculative_tokens)
     random_replacement = residual_tokens[:, 0]
     replacement_indices = accepted_count.to(torch.long).clamp_max(speculative_tokens - 1)

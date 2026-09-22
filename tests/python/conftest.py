@@ -39,6 +39,8 @@ def _install_python_package_stub() -> None:
     package.distributed = distributed
 
     distributed.tp_rank = lambda device: 0
+    distributed.tp_world_size = lambda device: 1
+    distributed.broadcast_ = lambda value, src, group_name="tp": None
 
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels
