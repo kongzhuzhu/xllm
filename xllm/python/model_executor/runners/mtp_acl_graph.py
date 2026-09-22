@@ -46,6 +46,7 @@ from xllm.python.model_executor.runners.base import (
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
+    MtpSamplingRandomInputs,
     coerce_sampling_plan,
     probabilistic_acceptance,
     sample_logits,
@@ -682,6 +683,7 @@ class MtpGraphRecipe(nn.Module):
         target_activate: ActivateFn | None = None,
         draft_sampling: MtpSamplingPlan | None = None,
         target_sampling: MtpSamplingPlan | None = None,
+        sampling_random_inputs: MtpSamplingRandomInputs | None = None,
     ) -> None:
         super().__init__()
         if batch_size <= 0:
@@ -710,6 +712,10 @@ class MtpGraphRecipe(nn.Module):
             raise ValueError("draft and target sampling plans must be provided together")
         self.draft_sampling = None if draft_sampling is None else draft_sampling.clone_for_graph()
         self.target_sampling = None if target_sampling is None else target_sampling.clone_for_graph()
+        self.sampling_random_inputs = (
+            None if sampling_random_inputs is None else sampling_random_inputs.clone_for_graph()
+        )
+        self._validate_sampling_random_inputs()
         self.register_buffer(
             "_kv_seq_lens_template",
             kv_seq_lens.to(device=device, dtype=torch.int32).contiguous()
@@ -771,7 +777,47 @@ class MtpGraphRecipe(nn.Module):
             _metadata_signature(target_metadata),
             None if draft_sampling is None else draft_sampling.layout_signature(),
             None if target_sampling is None else target_sampling.layout_signature(),
+            None if self.sampling_random_inputs is None else self.sampling_random_inputs.layout_signature(),
         )
+
+    def _validate_sampling_random_inputs(self) -> None:
+        self._validate_sampling_random_inputs_for(self.sampling_random_inputs)
+
+    def _validate_sampling_random_inputs_for(self, random_inputs: MtpSamplingRandomInputs | None) -> None:
+        if random_inputs is None:
+            return
+        batch_size = self.batch_size
+        steps = self.speculative_tokens
+        vocab_size = self.vocab_size
+        expected = {
+            "draft_uniform": (batch_size, steps, vocab_size),
+            "target_uniform": (batch_size, steps + 1, vocab_size),
+            "acceptance_uniform": (batch_size, steps),
+            "recovery_uniform": (batch_size, steps, vocab_size),
+        }
+        for name, shape in expected.items():
+            value = getattr(random_inputs, name)
+            if value is None:
+                continue
+            if value.device != self.device or value.dtype != torch.float32:
+                raise ValueError(f"{name} must be float32 on {self.device}")
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+
+    def can_update_sampling_random_inputs(self, random_inputs: MtpSamplingRandomInputs | None) -> bool:
+        if (self.sampling_random_inputs is None) != (random_inputs is None):
+            return False
+        if self.sampling_random_inputs is None:
+            return True
+        assert random_inputs is not None
+        return self.sampling_random_inputs.layout_signature() == random_inputs.layout_signature()
+
+    def update_sampling_random_inputs(self, random_inputs: MtpSamplingRandomInputs | None) -> None:
+        if not self.can_update_sampling_random_inputs(random_inputs):
+            raise RuntimeError("MTP random-input layout is incompatible with captured graph")
+        if self.sampling_random_inputs is not None:
+            assert random_inputs is not None
+            self.sampling_random_inputs.update_from(random_inputs)
 
     def can_update_sampling_plans(
         self,
@@ -862,7 +908,12 @@ class MtpGraphRecipe(nn.Module):
             if self.draft_sampling is None:
                 current_ids = step_logits.argmax(dim=-1)
             else:
-                sampled = sample_logits(step_logits, self.draft_sampling)
+                draft_uniform = None
+                if self.sampling_random_inputs is not None:
+                    draft_uniform = self.sampling_random_inputs.draft_uniform
+                    if draft_uniform is not None:
+                        draft_uniform = draft_uniform[:, step, :]
+                sampled = sample_logits(step_logits, self.draft_sampling, uniform=draft_uniform)
                 current_ids = sampled.tokens
                 if self.draft_sampling.all_greedy_sample:
                     draft_probs.append(torch.zeros_like(sampled.probs).scatter_(-1, current_ids.unsqueeze(-1), 1.0))
@@ -905,9 +956,17 @@ class MtpGraphRecipe(nn.Module):
         if self.target_sampling is None:
             target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
         else:
+            target_uniform = None
+            if self.sampling_random_inputs is not None:
+                target_uniform = self.sampling_random_inputs.target_uniform
+                if target_uniform is not None:
+                    target_uniform = target_uniform.reshape(
+                        self.batch_size * (self.speculative_tokens + 1), self.vocab_size
+                    )
             sampled_target = sample_logits(
                 target_logits,
                 self.target_sampling.expand_for_rows(self.batch_size * (self.speculative_tokens + 1)),
+                uniform=target_uniform,
             )
             target_tokens = sampled_target.tokens.reshape(self.batch_size, self.speculative_tokens + 1)
             target_probs = sampled_target.probs.reshape(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
@@ -930,6 +989,11 @@ class MtpGraphRecipe(nn.Module):
         else:
             assert target_probs is not None
             draft_prob_matrix = torch.stack(draft_probs, dim=1)
+            acceptance_uniform = None
+            recovery_uniform = None
+            if self.sampling_random_inputs is not None:
+                acceptance_uniform = self.sampling_random_inputs.acceptance_uniform
+                recovery_uniform = self.sampling_random_inputs.recovery_uniform
             (
                 accepted_ids,
                 accepted_mask,
@@ -941,6 +1005,8 @@ class MtpGraphRecipe(nn.Module):
                 target_tokens,
                 target_probs,
                 self.target_sampling.request_do_sample(device=target_tokens.device),
+                acceptance_uniform=acceptance_uniform,
+                recovery_uniform=recovery_uniform,
             )
         committed_tokens = _committed_tokens(
             accepted_ids,
@@ -1194,6 +1260,21 @@ class MtpAclGraphRunner:
         draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.recipe.batch_size)
         target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.recipe.batch_size)
         self.recipe.update_sampling_plans(draft_sampling, target_sampling)
+
+    def can_update_sampling_random_inputs(self, random_inputs: MtpSamplingRandomInputs | None) -> bool:
+        """Check whether fixed random controls fit the captured graph."""
+        if not self._captured:
+            return False
+        if random_inputs is not None:
+            self.recipe._validate_sampling_random_inputs_for(random_inputs)
+        return self.recipe.can_update_sampling_random_inputs(random_inputs)
+
+    def update_sampling_random_inputs(self, random_inputs: MtpSamplingRandomInputs | None) -> None:
+        """Update graph-owned fixed random inputs without changing its layout."""
+        if not self._captured:
+            raise RuntimeError("MTP ACL graph must be captured before random-input update")
+        self.recipe._validate_sampling_random_inputs_for(random_inputs)
+        self.recipe.update_sampling_random_inputs(random_inputs)
 
     def capture(
         self,

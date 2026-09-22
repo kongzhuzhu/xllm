@@ -33,6 +33,7 @@ from xllm.python.model_executor.runners.mtp_kv_oracle import (
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
+    MtpSamplingRandomInputs,
     probabilistic_acceptance,
     sample_logits,
 )
@@ -190,6 +191,51 @@ def test_sampling_plan_mixed_mode_uses_request_do_sample() -> None:
     sampled = sample_logits(logits, plan)
     assert sampled.tokens[0].item() == 1
     assert sampled.tokens[1].item() == 1
+
+
+def test_sampling_explicit_uniforms_are_replay_deterministic() -> None:
+    plan = MtpSamplingPlan(
+        batch_size=1,
+        do_sample=torch.ones(1, dtype=torch.bool),
+        all_random_sample=True,
+        all_greedy_sample=False,
+    )
+    logits = torch.zeros((1, 4))
+    uniform = torch.tensor([[0.2, 0.4, 0.6, 0.8]], dtype=torch.float32)
+    first = sample_logits(logits, plan, uniform=uniform)
+    second = sample_logits(logits, plan, uniform=uniform)
+    assert first.tokens.item() == second.tokens.item()
+    torch.testing.assert_close(first.probs, second.probs, rtol=0, atol=0)
+
+
+def test_probabilistic_acceptance_explicit_uniforms_force_residual_recovery() -> None:
+    draft_tokens = torch.tensor([[1, 2]], dtype=torch.long)
+    target_tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    draft_probs = torch.tensor([[[0.0, 0.8, 0.2], [0.2, 0.1, 0.7]]])
+    target_probs = torch.tensor([[[0.6, 0.2, 0.2], [0.2, 0.1, 0.7], [0.2, 0.3, 0.5]]])
+    accepted_ids, accepted_mask, accepted_count, next_tokens = probabilistic_acceptance(
+        draft_tokens,
+        draft_probs,
+        target_tokens,
+        target_probs,
+        torch.ones(1, dtype=torch.bool),
+        acceptance_uniform=torch.tensor([[0.9, 0.0]]),
+        recovery_uniform=torch.full((1, 2, 3), 0.5),
+    )
+    assert accepted_ids.tolist() == [[-1, -1]]
+    assert accepted_mask.tolist() == [[False, False]]
+    assert accepted_count.tolist() == [0]
+    assert next_tokens.tolist() == [0]
+
+
+def test_sampling_random_inputs_validate_fixed_graph_layout() -> None:
+    random_inputs = MtpSamplingRandomInputs(
+        draft_uniform=torch.zeros((2, 3, 5)),
+        target_uniform=torch.zeros((2, 4, 5)),
+        acceptance_uniform=torch.zeros((2, 3)),
+        recovery_uniform=torch.zeros((2, 3, 5)),
+    )
+    assert random_inputs.layout_signature()[0] == ((2, 3, 5), "torch.float32", "cpu")
 
 
 def test_probabilistic_acceptance_accepts_equal_proposals() -> None:
