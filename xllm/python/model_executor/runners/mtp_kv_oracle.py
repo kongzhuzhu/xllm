@@ -271,6 +271,9 @@ class MtpKvPayloadOracle:
             kv_seq_lens=kv_seq_lens,
             draft_activate=recipe.draft_activate,
             target_activate=recipe.target_activate,
+            draft_sampling=recipe.draft_sampling,
+            target_sampling=recipe.target_sampling,
+            sampling_random_inputs=recipe.sampling_random_inputs,
         )
         # Preserve caller-owned input views, including previous graph outputs.
         inputs = tuple(

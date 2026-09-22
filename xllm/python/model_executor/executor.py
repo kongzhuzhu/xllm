@@ -45,7 +45,10 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpRoleAdapter,
     PrepareFn,
 )
-from xllm.python.model_executor.runners.mtp_sampling import MtpSamplingPlan
+from xllm.python.model_executor.runners.mtp_sampling import (
+    MtpSamplingPlan,
+    MtpSamplingRandomInputs,
+)
 from xllm.python.platform import current_platform
 
 
@@ -56,6 +59,36 @@ def _resolve_graph_backend(config: dict) -> str:
         if current_platform.is_npu():
             return "aclgraph"
     return graph_backend
+
+
+def _build_mtp_sampling_random_inputs(
+    *,
+    device: torch.device,
+    batch_size: int,
+    speculative_tokens: int,
+    vocab_size: int,
+) -> MtpSamplingRandomInputs | None:
+    """Build deterministic Device draws for an explicitly requested oracle."""
+    if os.environ.get("XLLM_MTP_FIXED_RANDOM_INPUTS", "0") != "1":
+        return None
+
+    def ramp(shape: tuple[int, ...], start: float, end: float) -> torch.Tensor:
+        return torch.linspace(
+            start,
+            end,
+            steps=int(torch.tensor(shape).prod().item()),
+            dtype=torch.float32,
+            device=device,
+        ).reshape(shape)
+
+    return MtpSamplingRandomInputs(
+        draft_uniform=ramp((batch_size, speculative_tokens, vocab_size), 0.01, 0.99),
+        target_uniform=ramp((batch_size, speculative_tokens + 1, vocab_size), 0.99, 0.01),
+        acceptance_uniform=torch.full((batch_size, speculative_tokens), 0.25, dtype=torch.float32, device=device),
+        recovery_uniform=torch.full(
+            (batch_size, speculative_tokens, vocab_size), 0.5, dtype=torch.float32, device=device
+        ),
+    )
 
 
 def _validate_npu_cp_model_config(config: dict, num_decoding_tokens: int) -> None:
@@ -477,6 +510,12 @@ class ModelExecutor:
 
         draft_sampling_plan = coerce_sampling_plan(draft_sampling)
         target_sampling_plan = coerce_sampling_plan(target_sampling)
+        sampling_random_inputs = _build_mtp_sampling_random_inputs(
+            device=next(self.model.parameters()).device,
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            vocab_size=vocab_size,
+        )
 
         recipe = MtpGraphRecipe(
             draft_forward,
@@ -492,6 +531,7 @@ class ModelExecutor:
             target_activate=target_activate,
             draft_sampling=draft_sampling_plan,
             target_sampling=target_sampling_plan,
+            sampling_random_inputs=sampling_random_inputs,
         )
         kv_payload_oracle = None
         if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1":
