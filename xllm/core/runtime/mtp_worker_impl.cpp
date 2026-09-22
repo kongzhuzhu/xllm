@@ -16,6 +16,7 @@ limitations under the License.
 #include "mtp_worker_impl.h"
 
 #include <glog/logging.h>
+#include <torch/python.h>
 #if defined(USE_NPU)
 #include <acl/acl.h>
 #include <c10/core/DeviceType.h>
