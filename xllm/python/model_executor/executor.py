@@ -45,6 +45,7 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpRoleAdapter,
     PrepareFn,
 )
+from xllm.python.model_executor.runners.mtp_sampling import MtpSamplingPlan
 from xllm.python.platform import current_platform
 
 
@@ -437,6 +438,8 @@ class ModelExecutor:
         prepare: PrepareFn | None = None,
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
+        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
     ) -> MtpAclGraphRunner:
         """Create a paired MTP runner with explicit role adapters.
 
@@ -465,6 +468,16 @@ class ModelExecutor:
         def target_logits(hidden: torch.Tensor) -> torch.Tensor:
             return self.model.compute_logits(hidden, None)
 
+        def coerce_sampling_plan(
+            value: MtpSamplingPlan | dict[str, object] | None,
+        ) -> MtpSamplingPlan | None:
+            if value is None or isinstance(value, MtpSamplingPlan):
+                return value
+            return MtpSamplingPlan.from_mapping(value, batch_size=batch_size)
+
+        draft_sampling_plan = coerce_sampling_plan(draft_sampling)
+        target_sampling_plan = coerce_sampling_plan(target_sampling)
+
         recipe = MtpGraphRecipe(
             draft_forward,
             draft_logits,
@@ -477,6 +490,8 @@ class ModelExecutor:
             kv_seq_lens=kv_seq_lens,
             draft_activate=draft_activate,
             target_activate=target_activate,
+            draft_sampling=draft_sampling_plan,
+            target_sampling=target_sampling_plan,
         )
         kv_payload_oracle = None
         if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1":
@@ -503,6 +518,8 @@ class ModelExecutor:
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
         target_step_major_layout: bool = False,
+        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
     ) -> MtpAclGraphRunner:
         """Construct both role adapters and their recipe in one Python call."""
         draft_forward = draft_executor.create_mtp_role_adapter(
@@ -526,6 +543,8 @@ class ModelExecutor:
             kv_seq_lens=kv_seq_lens,
             draft_activate=draft_activate,
             target_activate=target_activate,
+            draft_sampling=draft_sampling,
+            target_sampling=target_sampling,
         )
 
     def create_mtp_role_adapter(

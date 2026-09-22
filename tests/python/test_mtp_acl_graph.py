@@ -31,6 +31,11 @@ from xllm.python.model_executor.runners.mtp_kv_oracle import (
     PagedKvSnapshot,
     build_attention_read_slots,
 )
+from xllm.python.model_executor.runners.mtp_sampling import (
+    MtpSamplingPlan,
+    probabilistic_acceptance,
+    sample_logits,
+)
 
 
 def test_paged_kv_snapshot_restores_selected_physical_payloads() -> None:
@@ -140,6 +145,117 @@ def test_recipe_rejects_nonpositive_k(steps: int) -> None:
 def test_acceptance_rejects_zero_draft_width() -> None:
     with pytest.raises(ValueError, match="at least one draft"):
         greedy_acceptance(torch.empty(2, 0, dtype=torch.long), torch.zeros(2, 1, dtype=torch.long))
+
+
+def test_sampling_plan_applies_temperature_and_top_k() -> None:
+    plan = MtpSamplingPlan(
+        batch_size=2,
+        do_sample=torch.zeros(2, dtype=torch.bool),
+        temperatures=torch.ones(2),
+        top_k=torch.ones(2, dtype=torch.long),
+        all_greedy_sample=True,
+        return_probs=True,
+    )
+    logits = torch.tensor([[1.0, 4.0, 3.0], [5.0, 2.0, 4.0]])
+    sampled = sample_logits(logits, plan)
+    assert sampled.tokens.tolist() == [1, 0]
+    assert torch.equal(sampled.probs.argmax(dim=-1), sampled.tokens)
+
+
+def test_sampling_plan_matches_unlimited_top_k_and_bitmask_contracts() -> None:
+    logits = torch.tensor([[1.0, 4.0, 3.0], [1.0, 4.0, 3.0]])
+    plan = MtpSamplingPlan(
+        batch_size=2,
+        do_sample=torch.zeros(2, dtype=torch.bool),
+        top_k=torch.tensor([0, 1], dtype=torch.long),
+        filter_bitmask=torch.tensor([[0b010], [0b111]], dtype=torch.int64),
+        all_greedy_sample=True,
+        return_probs=True,
+    )
+    sampled = sample_logits(logits, plan)
+    # top_k=0 is unlimited; the bitmask leaves token 1 as the only option.
+    assert sampled.tokens.tolist() == [1, 1]
+    assert sampled.probs.shape == logits.shape
+
+
+def test_sampling_plan_mixed_mode_uses_request_do_sample() -> None:
+    logits = torch.tensor([[1.0, 4.0, 3.0], [1.0, 4.0, 3.0]])
+    plan = MtpSamplingPlan(
+        batch_size=2,
+        do_sample=torch.tensor([False, True]),
+        top_k=torch.ones(2, dtype=torch.long),
+        all_greedy_sample=False,
+        all_random_sample=False,
+    )
+    sampled = sample_logits(logits, plan)
+    assert sampled.tokens[0].item() == 1
+    assert sampled.tokens[1].item() == 1
+
+
+def test_probabilistic_acceptance_accepts_equal_proposals() -> None:
+    draft_tokens = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    target_tokens = torch.tensor([[1, 2, 0], [2, 1, 3]], dtype=torch.long)
+    draft_probs = torch.tensor([[[0.1, 0.7, 0.2], [0.2, 0.1, 0.7]], [[0.2, 0.1, 0.7], [0.1, 0.7, 0.2]]])
+    target_probs = torch.cat((draft_probs, torch.tensor([[[0.2, 0.3, 0.5]], [[0.1, 0.2, 0.7]]])), dim=1)
+    accepted_ids, accepted_mask, accepted_count, next_tokens = probabilistic_acceptance(
+        draft_tokens,
+        draft_probs,
+        target_tokens,
+        target_probs,
+        torch.ones(2, dtype=torch.bool),
+    )
+    assert accepted_ids.tolist() == [[1, 2], [2, 1]]
+    assert accepted_mask.tolist() == [[True, True], [True, True]]
+    assert accepted_count.tolist() == [2, 2]
+    assert next_tokens.tolist() == [0, 3]
+
+
+def test_eager_recipe_runs_random_sampling_and_probability_acceptance() -> None:
+    batch_size = 1
+    speculative_tokens = 2
+    vocab_size = 8
+
+    def body(
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        step: int,
+        input_embedding: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del positions, step, input_embedding, topk_indices
+        return ids.to(torch.float32).unsqueeze(-1)
+
+    def head(hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.zeros((hidden.shape[0], vocab_size))
+        token_ids = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
+        return logits.scatter(1, token_ids.unsqueeze(-1), 3.0)
+
+    plan = MtpSamplingPlan(
+        batch_size=batch_size,
+        do_sample=torch.ones(batch_size, dtype=torch.bool),
+        all_random_sample=True,
+        all_greedy_sample=False,
+        return_probs=True,
+    )
+    runner = MtpAclGraphRunner(
+        MtpGraphRecipe(
+            body,
+            head,
+            body,
+            head,
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            vocab_size=vocab_size,
+            device=torch.device("cpu"),
+            draft_sampling=plan,
+            target_sampling=plan,
+        ),
+        backend="eager",
+    )
+    output = runner.execute(torch.tensor([1]), torch.tensor([10]))
+    assert output.accepted_count.shape == (batch_size,)
+    assert output.next_state.token_ids.shape == (batch_size,)
+    assert output.next_state.token_ids.device.type == "cpu"
 
 
 def test_eager_recipe_carries_mtp_embedding_and_topk_state() -> None:

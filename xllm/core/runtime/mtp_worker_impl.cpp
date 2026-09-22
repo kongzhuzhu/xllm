@@ -83,6 +83,37 @@ bool has_active_dp_tokens(const ForwardInput& input) {
   });
 }
 
+py::object sampling_tensor_or_none(const torch::Tensor& tensor) {
+  return tensor.defined() ? py::cast(tensor) : py::none();
+}
+
+py::dict build_mtp_sampling_plan(const SamplingParameters& params,
+                                 int32_t batch_size) {
+  py::dict plan;
+  plan["batch_size"] = batch_size;
+  plan["do_sample"] = sampling_tensor_or_none(params.do_sample);
+  plan["temperatures"] = sampling_tensor_or_none(params.temperatures);
+  plan["top_p"] = sampling_tensor_or_none(params.top_p);
+  plan["top_k"] = sampling_tensor_or_none(params.top_k);
+  plan["frequency_penalties"] =
+      sampling_tensor_or_none(params.frequency_penalties);
+  plan["presence_penalties"] =
+      sampling_tensor_or_none(params.presence_penalties);
+  plan["repetition_penalties"] =
+      sampling_tensor_or_none(params.repetition_penalties);
+  plan["unique_token_ids"] = sampling_tensor_or_none(params.unique_token_ids);
+  plan["unique_token_counts"] =
+      sampling_tensor_or_none(params.unique_token_counts);
+  plan["filter_mask"] = sampling_tensor_or_none(params.filter_mask);
+  plan["filter_bitmask"] = sampling_tensor_or_none(params.filter_bitmask);
+  plan["all_random_sample"] = params.all_random_sample;
+  plan["all_greedy_sample"] = params.all_greedy_sample;
+  plan["return_probs"] = params.return_probs;
+  plan["logprobs"] = params.logprobs;
+  plan["max_top_logprobs"] = params.max_top_logprobs;
+  return plan;
+}
+
 void broadcast_tokens_in_group(torch::Tensor& tokens,
                                ProcessGroup* process_group,
                                int32_t root_rank = 0) {
@@ -1600,13 +1631,26 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
     py::object target_metadata =
         target_python_executor->attention_metadata_view(
             validate_input.input_params);
+    const SamplingParameters draft_device_sampling =
+        current_draft_input.sampling_params.to(device_, dtype_);
+    py::dict draft_sampling_plan =
+        build_mtp_sampling_plan(draft_device_sampling, batch_size);
+    // The scheduler input can still own CPU sampling tensors. Transfer them
+    // before capture; replay copies values into graph-owned device buffers.
+    const SamplingParameters target_device_sampling =
+        input.sampling_params.to(device_, dtype_);
+    py::dict target_sampling_plan =
+        build_mtp_sampling_plan(target_device_sampling, batch_size);
 
     detail::MtpPyExecutorPair* graph_variant = nullptr;
     size_t graph_variant_index = 0;
     std::string metadata_key;
     if (!unified_python_mtp_graph_variants_.empty()) {
       metadata_key = unified_python_mtp_graph_variants_.front()->metadata_key(
-          draft_metadata, target_metadata);
+          draft_metadata,
+          target_metadata,
+          draft_sampling_plan,
+          target_sampling_plan);
       auto variant_it =
           unified_python_mtp_graph_variant_index_.find(metadata_key);
       if (variant_it != unified_python_mtp_graph_variant_index_.end()) {
@@ -1616,7 +1660,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
         graph_variant =
             unified_python_mtp_graph_variants_[graph_variant_index].get();
         if (!graph_variant->can_update_metadata(draft_metadata,
-                                                target_metadata)) {
+                                                target_metadata) ||
+            !graph_variant->can_update_sampling_plans(draft_sampling_plan,
+                                                      target_sampling_plan)) {
           graph_variant = nullptr;
         }
       }
@@ -1635,14 +1681,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
               batch_size,
               num_speculative_tokens,
               context_.get_model_args().vocab_size(),
+              draft_sampling_plan,
+              target_sampling_plan,
               uses_step_major_validate_layout());
       LOG(INFO) << "MTP unified pair create done; capture begin; variant="
                 << unified_python_mtp_graph_variants_.size();
       graph_output = new_variant->capture_and_execute(
           seed_token_ids, base_positions, kv_seq_lens, draft_embedding);
       if (metadata_key.empty()) {
-        metadata_key =
-            new_variant->metadata_key(draft_metadata, target_metadata);
+        metadata_key = new_variant->metadata_key(draft_metadata,
+                                                 target_metadata,
+                                                 draft_sampling_plan,
+                                                 target_sampling_plan);
       }
       const size_t new_variant_index =
           unified_python_mtp_graph_variants_.size();
@@ -1659,7 +1709,10 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
                                                        seed_token_ids,
                                                        base_positions,
                                                        kv_seq_lens,
-                                                       draft_embedding);
+                                                       draft_embedding,
+                                                       torch::Tensor(),
+                                                       draft_sampling_plan,
+                                                       target_sampling_plan);
     }
   }
 
@@ -1743,8 +1796,17 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_unified_python_mtp_graph(
       << "unified MTP next draft write does not cover rejected KV slot";
 
   ForwardOutput target_output;
+  target_output.do_sample = input.sampling_params.do_sample;
+  target_output.logprobs = input.sampling_params.logprobs;
+  target_output.max_top_logprobs = input.sampling_params.max_top_logprobs;
   target_output.sample_output.next_tokens = graph_output.committed_tokens;
   target_output.sample_output.embeddings = graph_output.target_embeddings;
+  // Preserve the rejection sampler's [batch, K+1, ...] output layout.
+  // Worker serialization indexes the request first, then the committed row.
+  target_output.sample_output.probs = graph_output.target_probs;
+  target_output.sample_output.logprobs = graph_output.committed_log_probs;
+  target_output.sample_output.top_logprobs = graph_output.target_top_log_probs;
+  target_output.sample_output.top_tokens = graph_output.target_top_tokens;
 
   // Persist the pre-acceptance graph base together with the committed-token
   // matrix. The fused next-draft preparation adds the accepted prefix to this
@@ -1922,18 +1984,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
   const bool use_unified_python_graph =
       supports_unified_python_mtp_graph() && !use_prelaunched_first_draft &&
       !use_device_target_context && !has_json_object_states &&
-      !use_adaptive_speculative_decode &&
-      input.sampling_params.all_greedy_sample &&
-      !input.sampling_params.logprobs &&
-      input.sampling_params.max_top_logprobs == 0;
-  if (!input.sampling_params.logprobs &&
-      input.sampling_params.max_top_logprobs != 0) {
-    LOG(INFO) << "MTP unified Python graph rejected: top-logprob output is "
-                 "not part of the fused greedy output contract";
-  } else if (input.sampling_params.logprobs) {
-    LOG(INFO) << "MTP unified Python graph rejected: logprob output is not "
-                 "part of the fused greedy output contract";
-  }
+      !use_adaptive_speculative_decode;
   std::vector<uint8_t> json_invalid_suffix;
   Timer timer;
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";

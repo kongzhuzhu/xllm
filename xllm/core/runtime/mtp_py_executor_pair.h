@@ -40,6 +40,10 @@ struct MtpPyGraphOutput {
   torch::Tensor next_embeddings;
   torch::Tensor next_topk_indices;
   torch::Tensor target_embeddings;
+  torch::Tensor target_probs;
+  torch::Tensor committed_log_probs;
+  torch::Tensor target_top_log_probs;
+  torch::Tensor target_top_tokens;
 };
 
 class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
@@ -54,6 +58,8 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
       int32_t batch_size,
       int32_t speculative_tokens,
       int64_t vocab_size,
+      const pybind11::object& draft_sampling_plan,
+      const pybind11::object& target_sampling_plan,
       bool target_step_major_layout);
 
   ~MtpPyExecutorPair();
@@ -68,8 +74,14 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
   bool can_update_metadata(const std::vector<pybind11::object>& draft_metadata,
                            const pybind11::object& target_metadata) const;
 
+  bool can_update_sampling_plans(
+      const pybind11::object& draft_sampling_plan,
+      const pybind11::object& target_sampling_plan) const;
+
   std::string metadata_key(const std::vector<pybind11::object>& draft_metadata,
-                           const pybind11::object& target_metadata) const;
+                           const pybind11::object& target_metadata,
+                           const pybind11::object& draft_sampling_plan,
+                           const pybind11::object& target_sampling_plan) const;
 
   MtpPyGraphOutput update_and_execute(
       const std::vector<pybind11::object>& draft_metadata,
@@ -79,7 +91,9 @@ class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
       const torch::Tensor& base_positions,
       const torch::Tensor& kv_seq_lens,
       const torch::Tensor& draft_input_embedding,
-      const torch::Tensor& draft_topk_indices = torch::Tensor());
+      const torch::Tensor& draft_topk_indices,
+      const pybind11::object& draft_sampling_plan,
+      const pybind11::object& target_sampling_plan);
 
  private:
   explicit MtpPyExecutorPair(pybind11::object runner);

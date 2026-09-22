@@ -44,6 +44,12 @@ from xllm.python.model_executor.runners.base import (
     SpeculativeDeviceState,
     SpeculativeExecutionOutput,
 )
+from xllm.python.model_executor.runners.mtp_sampling import (
+    MtpSamplingPlan,
+    coerce_sampling_plan,
+    probabilistic_acceptance,
+    sample_logits,
+)
 
 if TYPE_CHECKING:
     from xllm.python.attention.backend import AttentionMetadata
@@ -528,8 +534,6 @@ class MtpGraphCapability:
     def require_aclgraph(self) -> None:
         if not self.supports_aclgraph:
             raise RuntimeError(self.reason or "MTP ACL graph variant is not supported")
-        if self.sampling_mode != "greedy":
-            raise NotImplementedError("the first fused MTP graph only supports greedy sampling")
 
 
 @dataclass
@@ -565,6 +569,12 @@ class MtpGraphOutput:
     next_embeddings: torch.Tensor | None
     next_topk_indices: torch.Tensor | None
     target_embeddings: torch.Tensor
+    draft_probs: torch.Tensor | None = None
+    target_probs: torch.Tensor | None = None
+    target_log_probs: torch.Tensor | None = None
+    committed_log_probs: torch.Tensor | None = None
+    target_top_log_probs: torch.Tensor | None = None
+    target_top_tokens: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -670,6 +680,8 @@ class MtpGraphRecipe(nn.Module):
         kv_seq_lens: torch.Tensor | None = None,
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
+        draft_sampling: MtpSamplingPlan | None = None,
+        target_sampling: MtpSamplingPlan | None = None,
     ) -> None:
         super().__init__()
         if batch_size <= 0:
@@ -690,6 +702,14 @@ class MtpGraphRecipe(nn.Module):
         self.target_logits = target_logits
         self.draft_activate = draft_activate
         self.target_activate = target_activate
+        if draft_sampling is not None and draft_sampling.batch_size != batch_size:
+            raise ValueError("draft sampling plan batch does not match MTP graph batch")
+        if target_sampling is not None and target_sampling.batch_size != batch_size:
+            raise ValueError("target sampling plan batch does not match MTP graph batch")
+        if (draft_sampling is None) != (target_sampling is None):
+            raise ValueError("draft and target sampling plans must be provided together")
+        self.draft_sampling = None if draft_sampling is None else draft_sampling.clone_for_graph()
+        self.target_sampling = None if target_sampling is None else target_sampling.clone_for_graph()
         self.register_buffer(
             "_kv_seq_lens_template",
             kv_seq_lens.to(device=device, dtype=torch.int32).contiguous()
@@ -736,12 +756,53 @@ class MtpGraphRecipe(nn.Module):
         self,
         draft_metadata: Sequence[AttentionMetadata],
         target_metadata: AttentionMetadata,
+        draft_sampling: MtpSamplingPlan | None = None,
+        target_sampling: MtpSamplingPlan | None = None,
     ) -> tuple[object, ...]:
         """Return the fixed graph-layout key before compatibility validation."""
+        if draft_sampling is None:
+            draft_sampling = self.draft_sampling
+        if target_sampling is None:
+            target_sampling = self.target_sampling
+        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.batch_size)
+        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.batch_size)
         return (
             tuple(_metadata_signature(metadata) for metadata in draft_metadata),
             _metadata_signature(target_metadata),
+            None if draft_sampling is None else draft_sampling.layout_signature(),
+            None if target_sampling is None else target_sampling.layout_signature(),
         )
+
+    def can_update_sampling_plans(
+        self,
+        draft_sampling: MtpSamplingPlan | None,
+        target_sampling: MtpSamplingPlan | None,
+    ) -> bool:
+        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.batch_size)
+        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.batch_size)
+        if (self.draft_sampling is None) != (draft_sampling is None):
+            return False
+        if (self.target_sampling is None) != (target_sampling is None):
+            return False
+        if self.draft_sampling is None or self.target_sampling is None:
+            return True
+        assert draft_sampling is not None and target_sampling is not None
+        return (
+            self.draft_sampling.layout_signature() == draft_sampling.layout_signature()
+            and self.target_sampling.layout_signature() == target_sampling.layout_signature()
+        )
+
+    def update_sampling_plans(
+        self,
+        draft_sampling: MtpSamplingPlan | None,
+        target_sampling: MtpSamplingPlan | None,
+    ) -> None:
+        if not self.can_update_sampling_plans(draft_sampling, target_sampling):
+            raise RuntimeError("MTP sampling plan is incompatible with captured graph")
+        if self.draft_sampling is not None:
+            assert draft_sampling is not None and self.target_sampling is not None and target_sampling is not None
+            self.draft_sampling.update_from(draft_sampling)
+            self.target_sampling.update_from(target_sampling)
 
     def update_metadata(
         self,
@@ -774,6 +835,7 @@ class MtpGraphRecipe(nn.Module):
             raise ValueError("kv_seq_lens shape does not match the captured batch")
 
         draft_tokens: list[torch.Tensor] = []
+        draft_probs: list[torch.Tensor] = []
         current_ids = seed_token_ids
         current_embedding = draft_input_embedding
         current_topk_indices = draft_topk_indices
@@ -797,7 +859,15 @@ class MtpGraphRecipe(nn.Module):
             step_logits = self.draft_logits(draft_hidden)
             if step_logits.shape != (self.batch_size, self.vocab_size):
                 raise ValueError("draft logits must have shape [batch, vocab]")
-            current_ids = step_logits.argmax(dim=-1)
+            if self.draft_sampling is None:
+                current_ids = step_logits.argmax(dim=-1)
+            else:
+                sampled = sample_logits(step_logits, self.draft_sampling)
+                current_ids = sampled.tokens
+                if self.draft_sampling.all_greedy_sample:
+                    draft_probs.append(torch.zeros_like(sampled.probs).scatter_(-1, current_ids.unsqueeze(-1), 1.0))
+                else:
+                    draft_probs.append(sampled.probs)
             # GLM MTP consumes the preceding body hidden as the next-step
             # embedding and optionally reuses the preceding DSA top-k state.
             current_embedding = draft_hidden
@@ -830,20 +900,66 @@ class MtpGraphRecipe(nn.Module):
             self.vocab_size,
         ):
             raise ValueError("target logits must have shape [batch*(K+1), vocab]")
-        target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
+        target_probs = None
+        target_log_probs = None
+        if self.target_sampling is None:
+            target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
+        else:
+            sampled_target = sample_logits(
+                target_logits,
+                self.target_sampling.expand_for_rows(self.batch_size * (self.speculative_tokens + 1)),
+            )
+            target_tokens = sampled_target.tokens.reshape(self.batch_size, self.speculative_tokens + 1)
+            target_probs = sampled_target.probs.reshape(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
+            target_log_probs = sampled_target.log_probs.reshape(
+                self.batch_size, self.speculative_tokens + 1, self.vocab_size
+            )
 
-        (
-            accepted_ids,
-            accepted_mask,
-            accepted_count,
-            next_tokens,
-        ) = greedy_acceptance(draft_matrix, target_tokens)
+        if (
+            self.draft_sampling is None
+            or self.target_sampling is None
+            or self.draft_sampling.all_greedy_sample
+            and self.target_sampling.all_greedy_sample
+        ):
+            (
+                accepted_ids,
+                accepted_mask,
+                accepted_count,
+                next_tokens,
+            ) = greedy_acceptance(draft_matrix, target_tokens)
+        else:
+            assert target_probs is not None
+            draft_prob_matrix = torch.stack(draft_probs, dim=1)
+            (
+                accepted_ids,
+                accepted_mask,
+                accepted_count,
+                next_tokens,
+            ) = probabilistic_acceptance(
+                draft_matrix,
+                draft_prob_matrix,
+                target_tokens,
+                target_probs,
+                self.target_sampling.request_do_sample(device=target_tokens.device),
+            )
         committed_tokens = _committed_tokens(
             accepted_ids,
             accepted_count,
             next_tokens,
             self.speculative_tokens,
         )
+        committed_log_probs = None
+        target_top_log_probs = None
+        target_top_tokens = None
+        if target_log_probs is not None and self.target_sampling is not None and self.target_sampling.logprobs:
+            committed_indices = committed_tokens.clamp_min(0).unsqueeze(-1)
+            committed_log_probs = target_log_probs.gather(-1, committed_indices).squeeze(-1)
+            committed_log_probs = torch.where(
+                committed_tokens.ge(0), committed_log_probs, torch.zeros_like(committed_log_probs)
+            )
+            if self.target_sampling is not None and self.target_sampling.max_top_logprobs > 0:
+                top_width = min(self.target_sampling.max_top_logprobs, self.vocab_size)
+                target_top_log_probs, target_top_tokens = target_log_probs.topk(top_width, dim=-1)
         # ``next_tokens`` is the replacement token after a rejection or the
         # bonus token after an all-accepted verify.  It is emitted in addition
         # to the accepted draft prefix, so the next decode position advances
@@ -888,6 +1004,18 @@ class MtpGraphRecipe(nn.Module):
             next_embeddings=next_embeddings,
             next_topk_indices=next_topk_indices,
             target_embeddings=target_hidden_matrix,
+            draft_probs=(torch.stack(draft_probs, dim=1) if draft_probs and self.draft_sampling.return_probs else None)
+            if self.draft_sampling is not None
+            else None,
+            target_probs=(
+                target_probs if self.target_sampling is not None and self.target_sampling.return_probs else None
+            ),
+            target_log_probs=(
+                target_log_probs if self.target_sampling is not None and self.target_sampling.logprobs else None
+            ),
+            committed_log_probs=committed_log_probs,
+            target_top_log_probs=target_top_log_probs,
+            target_top_tokens=target_top_tokens,
         )
 
 
@@ -928,6 +1056,7 @@ class MtpAclGraphRunner:
                 speculative_tokens=recipe.speculative_tokens,
                 batch_size=recipe.batch_size,
                 vocab_size=recipe.vocab_size,
+                sampling_mode=(recipe.target_sampling.mode if recipe.target_sampling is not None else "greedy"),
                 supports_aclgraph=backend == "aclgraph",
                 reason="runner was created with the explicit eager backend" if backend != "aclgraph" else None,
             )
@@ -1027,9 +1156,11 @@ class MtpAclGraphRunner:
         self,
         draft_metadata: Sequence[AttentionMetadata],
         target_metadata: AttentionMetadata,
+        draft_sampling: MtpSamplingPlan | None = None,
+        target_sampling: MtpSamplingPlan | None = None,
     ) -> tuple[object, ...]:
         """Return the fixed metadata/layout key used by the C++ registry."""
-        return self.recipe.metadata_key(draft_metadata, target_metadata)
+        return self.recipe.metadata_key(draft_metadata, target_metadata, draft_sampling, target_sampling)
 
     def update_metadata(
         self,
@@ -1041,6 +1172,28 @@ class MtpAclGraphRunner:
         if not self._captured:
             raise RuntimeError("MTP ACL graph must be captured before metadata update")
         self.recipe.update_metadata(draft_metadata, target_metadata, repair_token_ids)
+
+    def can_update_sampling_plans(
+        self,
+        draft_sampling: MtpSamplingPlan | None,
+        target_sampling: MtpSamplingPlan | None,
+    ) -> bool:
+        """Check whether replay controls fit the captured graph variant."""
+        if not self._captured:
+            return False
+        return self.recipe.can_update_sampling_plans(draft_sampling, target_sampling)
+
+    def update_sampling_plans(
+        self,
+        draft_sampling: MtpSamplingPlan | None,
+        target_sampling: MtpSamplingPlan | None,
+    ) -> None:
+        """Copy request sampling controls into graph-owned stable buffers."""
+        if not self._captured:
+            raise RuntimeError("MTP ACL graph must be captured before sampling update")
+        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.recipe.batch_size)
+        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.recipe.batch_size)
+        self.recipe.update_sampling_plans(draft_sampling, target_sampling)
 
     def capture(
         self,
@@ -1185,6 +1338,10 @@ class MtpAclGraphRunner:
             target_embeddings=output.target_embeddings,
             draft_tokens=output.draft_tokens,
             target_tokens=output.target_tokens,
+            logprobs=output.committed_log_probs,
+            top_logprobs=output.target_top_log_probs,
+            top_tokens=output.target_top_tokens,
+            target_probs=output.target_probs,
         )
         if self.kv_payload_oracle is not None:
             assert reference is not None

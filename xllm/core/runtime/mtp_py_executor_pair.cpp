@@ -44,6 +44,10 @@ MtpPyGraphOutput parse_graph_output(const py::object& output) {
       tensor_from_python(next_state.attr("topk_indices"));
   result.target_embeddings =
       tensor_from_python(output.attr("target_embeddings"));
+  result.target_probs = tensor_from_python(output.attr("target_probs"));
+  result.committed_log_probs = tensor_from_python(output.attr("logprobs"));
+  result.target_top_log_probs = tensor_from_python(output.attr("top_logprobs"));
+  result.target_top_tokens = tensor_from_python(output.attr("top_tokens"));
   return result;
 }
 
@@ -67,6 +71,8 @@ std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
     int32_t batch_size,
     int32_t speculative_tokens,
     int64_t vocab_size,
+    const py::object& draft_sampling_plan,
+    const py::object& target_sampling_plan,
     bool target_step_major_layout) {
   py::gil_scoped_acquire gil;
   py::object runner =
@@ -78,6 +84,8 @@ std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
                                               batch_size,
                                               speculative_tokens,
                                               vocab_size,
+                                              draft_sampling_plan,
+                                              target_sampling_plan,
                                               target_step_major_layout);
   return std::unique_ptr<MtpPyExecutorPair>(
       new MtpPyExecutorPair(std::move(runner)));
@@ -136,13 +144,28 @@ bool MtpPyExecutorPair::can_update_metadata(
       .cast<bool>();
 }
 
+bool MtpPyExecutorPair::can_update_sampling_plans(
+    const py::object& draft_sampling_plan,
+    const py::object& target_sampling_plan) const {
+  CHECK(runner_);
+  py::gil_scoped_acquire gil;
+  return runner_
+      .attr("can_update_sampling_plans")(draft_sampling_plan,
+                                         target_sampling_plan)
+      .cast<bool>();
+}
+
 std::string MtpPyExecutorPair::metadata_key(
     const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata) const {
+    const py::object& target_metadata,
+    const py::object& draft_sampling_plan,
+    const py::object& target_sampling_plan) const {
   CHECK(runner_);
   py::gil_scoped_acquire gil;
   py::object key = runner_.attr("metadata_key")(metadata_list(draft_metadata),
-                                                target_metadata);
+                                                target_metadata,
+                                                draft_sampling_plan,
+                                                target_sampling_plan);
   return py::repr(key).cast<std::string>();
 }
 
@@ -154,13 +177,17 @@ MtpPyGraphOutput MtpPyExecutorPair::update_and_execute(
     const torch::Tensor& base_positions,
     const torch::Tensor& kv_seq_lens,
     const torch::Tensor& draft_input_embedding,
-    const torch::Tensor& draft_topk_indices) {
+    const torch::Tensor& draft_topk_indices,
+    const py::object& draft_sampling_plan,
+    const py::object& target_sampling_plan) {
   CHECK(runner_);
   py::gil_scoped_acquire gil;
   py::object optional_topk =
       draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
   runner_.attr("update_metadata")(
       metadata_list(draft_metadata), target_metadata, repair_token_ids);
+  runner_.attr("update_sampling_plans")(draft_sampling_plan,
+                                        target_sampling_plan);
   LOG(INFO) << "MTP unified pair replay begin (reused graph)";
   py::object output;
   try {

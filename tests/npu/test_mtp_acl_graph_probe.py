@@ -27,7 +27,8 @@ import pytest
 import torch
 
 from tests.python.mtp_graph_test_utils import make_recipe, output_tensors, scalar_reference
-from xllm.python.model_executor.runners.mtp_acl_graph import MtpAclGraphRunner
+from xllm.python.model_executor.runners.mtp_acl_graph import MtpAclGraphRunner, MtpGraphRecipe
+from xllm.python.model_executor.runners.mtp_sampling import MtpSamplingPlan
 
 
 @pytest.fixture(scope="module")
@@ -68,3 +69,72 @@ def test_mtp_recipe_replay_every_rejection_position(npu_device: torch.device, st
         torch.testing.assert_close(tensor.cpu(), expected[name], rtol=0, atol=0)
         torch.testing.assert_close(tensor, eager_output[name], rtol=0, atol=0)
     assert runner.entry.generation == 1
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_mtp_sampling_random_replay_stays_on_device(npu_device: torch.device, mixed: bool) -> None:
+    """Random sampling and probability acceptance must be captured in one graph."""
+    batch_size = 1
+    speculative_tokens = 3
+    vocab_size = 16
+    plan = MtpSamplingPlan(
+        batch_size=batch_size,
+        do_sample=torch.ones(batch_size, dtype=torch.bool, device=npu_device),
+        all_random_sample=not mixed,
+        all_greedy_sample=False,
+        return_probs=True,
+    )
+
+    def body(
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        step: int,
+        input_embedding: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del positions, step, input_embedding, topk_indices
+        return ids.to(torch.float32).unsqueeze(-1)
+
+    def head(hidden: torch.Tensor) -> torch.Tensor:
+        token = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
+        offsets = torch.arange(vocab_size, device=hidden.device, dtype=torch.float32)
+        logits = -(offsets.unsqueeze(0) - token.unsqueeze(1)).abs()
+        return logits
+
+    recipe = MtpGraphRecipe(
+        body,
+        head,
+        body,
+        head,
+        batch_size=batch_size,
+        speculative_tokens=speculative_tokens,
+        vocab_size=vocab_size,
+        device=npu_device,
+        kv_seq_lens=torch.zeros(batch_size, dtype=torch.int32, device=npu_device),
+        draft_sampling=plan,
+        target_sampling=plan,
+    )
+    runner = MtpAclGraphRunner(recipe)
+    runner.capture(
+        torch.tensor([1], device=npu_device),
+        torch.tensor([10], device=npu_device),
+        torch.tensor([10], dtype=torch.int32, device=npu_device),
+    )
+    first = runner.execute(
+        torch.tensor([1], device=npu_device),
+        torch.tensor([10], device=npu_device),
+        torch.tensor([10], dtype=torch.int32, device=npu_device),
+    )
+    second = runner.execute(
+        torch.tensor([2], device=npu_device),
+        torch.tensor([11], device=npu_device),
+        torch.tensor([11], dtype=torch.int32, device=npu_device),
+    )
+    for output in (first, second):
+        assert output.accepted_count.device.type == "npu"
+        assert output.next_state.token_ids.device.type == "npu"
+        assert bool(output.accepted_count.ge(0).all().cpu())
+        assert bool(output.accepted_count.le(speculative_tokens).all().cpu())
+    assert runner._static_output is not None
+    assert runner._static_output.target_probs is not None
+    assert runner._static_output.target_probs.shape == (batch_size, speculative_tokens + 1, vocab_size)

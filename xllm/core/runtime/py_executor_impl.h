@@ -73,6 +73,8 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
       int32_t batch_size,
       int32_t speculative_tokens,
       int64_t vocab_size,
+      const pybind11::object& draft_sampling_plan,
+      const pybind11::object& target_sampling_plan,
       bool target_step_major_layout);
 
  private:
