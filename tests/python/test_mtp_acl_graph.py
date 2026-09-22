@@ -34,6 +34,7 @@ from xllm.python.model_executor.runners.mtp_kv_oracle import (
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
     MtpSamplingRandomInputs,
+    _gumbel_argmax,
     probabilistic_acceptance,
     sample_logits,
 )
@@ -206,6 +207,19 @@ def test_sampling_explicit_uniforms_are_replay_deterministic() -> None:
     second = sample_logits(logits, plan, uniform=uniform)
     assert first.tokens.item() == second.tokens.item()
     torch.testing.assert_close(first.probs, second.probs, rtol=0, atol=0)
+
+
+def test_gumbel_max_matches_categorical_distribution() -> None:
+    """The ACL-safe sampler must preserve multinomial probabilities."""
+    sample_count = 32768
+    logits = torch.log(torch.tensor([[1.0, 3.0, 6.0]])).expand(sample_count, -1)
+    generator = torch.Generator().manual_seed(20260922)
+    uniform = torch.rand((sample_count, logits.shape[-1]), generator=generator)
+
+    sampled = _gumbel_argmax(torch.log_softmax(logits, dim=-1), uniform)
+    frequencies = torch.bincount(sampled, minlength=logits.shape[-1]).to(torch.float32) / sample_count
+    expected = torch.softmax(logits[0], dim=-1)
+    torch.testing.assert_close(frequencies, expected, rtol=0, atol=0.015)
 
 
 def test_probabilistic_acceptance_explicit_uniforms_force_residual_recovery() -> None:
