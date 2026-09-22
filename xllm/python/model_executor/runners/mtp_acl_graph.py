@@ -974,12 +974,7 @@ class MtpGraphRecipe(nn.Module):
                 self.batch_size, self.speculative_tokens + 1, self.vocab_size
             )
 
-        if (
-            self.draft_sampling is None
-            or self.target_sampling is None
-            or self.draft_sampling.all_greedy_sample
-            and self.target_sampling.all_greedy_sample
-        ):
+        if self.target_sampling is None or self.target_sampling.all_greedy_sample:
             (
                 accepted_ids,
                 accepted_mask,

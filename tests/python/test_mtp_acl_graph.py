@@ -304,6 +304,60 @@ def test_eager_recipe_runs_random_sampling_and_probability_acceptance() -> None:
     assert output.next_state.token_ids.device.type == "cpu"
 
 
+def test_greedy_target_keeps_equality_acceptance_with_random_draft() -> None:
+    batch_size = 1
+    speculative_tokens = 2
+    vocab_size = 8
+
+    def body(
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        step: int,
+        input_embedding: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del positions, step, input_embedding, topk_indices
+        return ids.to(torch.float32).unsqueeze(-1)
+
+    def head(hidden: torch.Tensor) -> torch.Tensor:
+        logits = torch.zeros((hidden.shape[0], vocab_size))
+        token_ids = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
+        return logits.scatter(1, token_ids.unsqueeze(-1), 3.0)
+
+    draft_plan = MtpSamplingPlan(
+        batch_size=batch_size,
+        do_sample=torch.ones(batch_size, dtype=torch.bool),
+        all_random_sample=True,
+        all_greedy_sample=False,
+        return_probs=True,
+    )
+    target_plan = MtpSamplingPlan(
+        batch_size=batch_size,
+        do_sample=torch.zeros(batch_size, dtype=torch.bool),
+        all_random_sample=False,
+        all_greedy_sample=True,
+        return_probs=True,
+    )
+    recipe = MtpGraphRecipe(
+        body,
+        head,
+        body,
+        head,
+        batch_size=batch_size,
+        speculative_tokens=speculative_tokens,
+        vocab_size=vocab_size,
+        device=torch.device("cpu"),
+        draft_sampling=draft_plan,
+        target_sampling=target_plan,
+        sampling_random_inputs=MtpSamplingRandomInputs(
+            draft_uniform=torch.full((batch_size, speculative_tokens, vocab_size), 0.5)
+        ),
+    )
+    output = MtpAclGraphRunner(recipe, backend="eager").execute(torch.tensor([1]), torch.tensor([10]))
+    assert output.accepted_count.tolist() == [speculative_tokens]
+    assert output.next_state.token_ids.numel() == batch_size
+
+
 def test_eager_recipe_carries_mtp_embedding_and_topk_state() -> None:
     batch_size = 2
     speculative_tokens = 3
