@@ -229,3 +229,93 @@ def test_mtp_sampling_fixed_random_inputs_match_eager_oracle(npu_device: torch.d
     ):
         assert actual_tensor is not None and expected_tensor is not None
         torch.testing.assert_close(actual_tensor.cpu(), expected_tensor.cpu(), rtol=2e-4, atol=2e-4)
+
+
+def test_mtp_mixed_greedy_random_batch_matches_eager_oracle(
+    npu_device: torch.device,
+) -> None:
+    """A single captured graph must support greedy and random rows together."""
+    batch_size = 2
+    speculative_tokens = 3
+    vocab_size = 16
+    plan = MtpSamplingPlan(
+        batch_size=batch_size,
+        do_sample=torch.tensor([False, True], dtype=torch.bool, device=npu_device),
+        all_random_sample=False,
+        all_greedy_sample=False,
+        return_probs=True,
+        logprobs=True,
+        max_top_logprobs=3,
+    )
+    random_inputs = MtpSamplingRandomInputs(
+        draft_uniform=torch.linspace(
+            0.05,
+            0.95,
+            batch_size * speculative_tokens * vocab_size,
+            device=npu_device,
+            dtype=torch.float32,
+        ).reshape(batch_size, speculative_tokens, vocab_size),
+        target_uniform=torch.linspace(
+            0.95,
+            0.05,
+            batch_size * (speculative_tokens + 1) * vocab_size,
+            device=npu_device,
+            dtype=torch.float32,
+        ).reshape(batch_size, speculative_tokens + 1, vocab_size),
+        acceptance_uniform=torch.full((batch_size, speculative_tokens), 0.25, device=npu_device),
+        recovery_uniform=torch.full((batch_size, speculative_tokens, vocab_size), 0.5, device=npu_device),
+    )
+
+    def body(
+        ids: torch.Tensor,
+        positions: torch.Tensor,
+        step: int,
+        input_embedding: torch.Tensor | None,
+        topk_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del positions, step, input_embedding, topk_indices
+        return ids.to(torch.float32).unsqueeze(-1)
+
+    def head(hidden: torch.Tensor) -> torch.Tensor:
+        token = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
+        offsets = torch.arange(vocab_size, device=hidden.device, dtype=torch.float32)
+        return -(offsets.unsqueeze(0) - token.unsqueeze(1)).abs()
+
+    def recipe() -> MtpGraphRecipe:
+        return MtpGraphRecipe(
+            body,
+            head,
+            body,
+            head,
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            vocab_size=vocab_size,
+            device=npu_device,
+            kv_seq_lens=torch.zeros(batch_size, dtype=torch.int32, device=npu_device),
+            draft_sampling=plan,
+            target_sampling=plan,
+            sampling_random_inputs=random_inputs,
+        )
+
+    runner = MtpAclGraphRunner(recipe())
+    eager = MtpAclGraphRunner(recipe(), backend="eager")
+    inputs = (
+        torch.tensor([1, 2], device=npu_device),
+        torch.tensor([10, 20], device=npu_device),
+        torch.tensor([10, 20], dtype=torch.int32, device=npu_device),
+    )
+    runner.capture(*inputs)
+    actual = runner.execute(*inputs)
+    expected = eager.execute(*inputs)
+    for actual_tensor, expected_tensor in (
+        (actual.accepted_ids, expected.accepted_ids),
+        (actual.accepted_count, expected.accepted_count),
+        (actual.committed_tokens, expected.committed_tokens),
+        (actual.next_state.token_ids, expected.next_state.token_ids),
+        (actual.logprobs, expected.logprobs),
+        (actual.top_tokens, expected.top_tokens),
+        (actual.top_logprobs, expected.top_logprobs),
+        (actual.target_probs, expected.target_probs),
+    ):
+        assert actual_tensor is not None and expected_tensor is not None
+        torch.testing.assert_close(actual_tensor.cpu(), expected_tensor.cpu(), rtol=2e-4, atol=2e-4)
