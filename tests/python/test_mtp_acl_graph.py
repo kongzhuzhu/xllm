@@ -22,6 +22,7 @@ from xllm.python import distributed
 from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpAclGraphRunner,
+    MtpGraphOutput,
     MtpGraphRecipe,
     MtpRoleAdapter,
     _committed_tokens,
@@ -137,6 +138,41 @@ def test_eager_recipe_matches_scalar_oracle_for_each_fixed_k(steps: int) -> None
         torch.testing.assert_close(actual, expected[name], rtol=0, atol=0)
     assert len(prepare_calls) == 1
     assert activation_calls == ["draft"] * steps + ["target"]
+
+
+def test_mtp_graph_output_clone_detaches_every_replay_tensor() -> None:
+    values = {
+        "accepted_ids": torch.tensor([[1, -1]]),
+        "accepted_mask": torch.tensor([[True, False]]),
+        "accepted_count": torch.tensor([1], dtype=torch.int32),
+        "next_tokens": torch.tensor([2]),
+        "committed_tokens": torch.tensor([[1, 2]]),
+        "draft_tokens": torch.tensor([[1]]),
+        "target_tokens": torch.tensor([[1, 2]]),
+        "next_positions": torch.tensor([3]),
+        "next_kv_seq_lens": torch.tensor([4], dtype=torch.int32),
+        "next_embeddings": torch.tensor([[5.0]]),
+        "next_topk_indices": torch.tensor([[6]]),
+        "target_embeddings": torch.tensor([[[7.0], [8.0]]]),
+        "draft_probs": torch.tensor([[[0.25, 0.75]]]),
+        "target_probs": torch.tensor([[[0.2, 0.8], [0.3, 0.7]]]),
+        "target_log_probs": torch.tensor([[[-1.0, -0.2], [-0.7, -0.3]]]),
+        "committed_log_probs": torch.tensor([[-0.2, -0.3]]),
+        "target_top_log_probs": torch.tensor([[[-0.2], [-0.3]]]),
+        "target_top_tokens": torch.tensor([[[1], [2]]]),
+    }
+    output = MtpGraphOutput(**values)
+    cloned = MtpAclGraphRunner._clone_graph_output(output)
+
+    for name, value in values.items():
+        cloned_value = getattr(cloned, name)
+        assert cloned_value is not value
+        assert torch.equal(cloned_value, value)
+
+    values["committed_tokens"].fill_(-99)
+    values["target_embeddings"].fill_(-99)
+    assert cloned.committed_tokens.tolist() == [[1, 2]]
+    assert cloned.target_embeddings.tolist() == [[[7.0], [8.0]]]
 
 
 @pytest.mark.parametrize("steps", [0, -1])

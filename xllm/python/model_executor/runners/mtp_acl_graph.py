@@ -1203,6 +1203,40 @@ class MtpAclGraphRunner:
             self._static_draft_topk_indices,
         )
 
+    @staticmethod
+    def _clone_graph_output(output: MtpGraphOutput) -> MtpGraphOutput:
+        """Detach one replay result from the persistent ACL graph buffers.
+
+        ACL graph replay writes the same output allocations on every call.
+        Schedule overlap can keep an earlier MTP result alive while the next
+        draft or target invocation starts, so returning those allocations
+        directly allows a later replay to overwrite data still in use.
+        """
+
+        def clone(value: torch.Tensor | None) -> torch.Tensor | None:
+            return None if value is None else value.clone()
+
+        return MtpGraphOutput(
+            accepted_ids=output.accepted_ids.clone(),
+            accepted_mask=output.accepted_mask.clone(),
+            accepted_count=output.accepted_count.clone(),
+            next_tokens=output.next_tokens.clone(),
+            committed_tokens=output.committed_tokens.clone(),
+            draft_tokens=output.draft_tokens.clone(),
+            target_tokens=output.target_tokens.clone(),
+            next_positions=output.next_positions.clone(),
+            next_kv_seq_lens=clone(output.next_kv_seq_lens),
+            next_embeddings=clone(output.next_embeddings),
+            next_topk_indices=clone(output.next_topk_indices),
+            target_embeddings=output.target_embeddings.clone(),
+            draft_probs=clone(output.draft_probs),
+            target_probs=clone(output.target_probs),
+            target_log_probs=clone(output.target_log_probs),
+            committed_log_probs=clone(output.committed_log_probs),
+            target_top_log_probs=clone(output.target_top_log_probs),
+            target_top_tokens=clone(output.target_top_tokens),
+        )
+
     def can_update_metadata(
         self,
         draft_metadata: Sequence[AttentionMetadata],
@@ -1394,7 +1428,7 @@ class MtpAclGraphRunner:
                 self._graph.replay()
             torch.npu.current_stream().wait_stream(self._capture_stream)
             assert self._static_output is not None
-            output = self._static_output
+            output = self._clone_graph_output(self._static_output)
 
         next_state = SpeculativeDeviceState(
             token_ids=output.next_tokens,
