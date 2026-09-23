@@ -74,6 +74,30 @@ def test_mtp_recipe_replay_every_rejection_position(npu_device: torch.device, st
     assert runner.entry.generation == 1
 
 
+def test_mtp_replay_output_survives_the_next_replay(npu_device: torch.device) -> None:
+    """A returned graph result must not alias the next replay's buffers."""
+    steps = 3
+    runner = MtpAclGraphRunner(make_recipe(torch.tensor([1], device=npu_device), steps))
+    first_inputs = (
+        torch.tensor([2], device=npu_device),
+        torch.tensor([10], device=npu_device),
+        torch.tensor([11], dtype=torch.int32, device=npu_device),
+    )
+    second_inputs = (
+        torch.tensor([9], device=npu_device),
+        torch.tensor([20], device=npu_device),
+        torch.tensor([21], dtype=torch.int32, device=npu_device),
+    )
+    runner.capture(*first_inputs)
+    first = runner.execute(*first_inputs)
+    first_snapshot = {name: tensor.clone() for name, tensor in output_tensors(first).items()}
+    second = runner.execute(*second_inputs)
+    assert not torch.equal(first_snapshot["draft_tokens"], output_tensors(second)["draft_tokens"])
+
+    for name, expected in first_snapshot.items():
+        torch.testing.assert_close(output_tensors(first)[name], expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("mixed", [False, True])
 def test_mtp_sampling_random_replay_stays_on_device(npu_device: torch.device, mixed: bool) -> None:
     """Random sampling and probability acceptance must be captured in one graph."""
