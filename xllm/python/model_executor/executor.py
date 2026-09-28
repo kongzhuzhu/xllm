@@ -45,11 +45,8 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpGraphRecipe,
     MtpGraphVariantRegistry,
     MtpRoleAdapter,
-    PrepareFn,
-)
-from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
-    coerce_sampling_plan,
+    PrepareFn,
 )
 from xllm.python.model_executor.runners.mtp_sparse_metadata import (
     MtpSparseMetadataStorage,
@@ -452,8 +449,7 @@ class ModelExecutor:
         prepare: PrepareFn | None = None,
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
-        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
-        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        target_sampling: MtpSamplingPlan | None = None,
         runtime_outputs_only: bool = False,
         position_storage: MtpSparsePositionStorage | None = None,
     ) -> MtpAclGraphRunner:
@@ -484,8 +480,6 @@ class ModelExecutor:
         def target_logits(hidden: torch.Tensor) -> torch.Tensor:
             return self.model.compute_logits(hidden, None)
 
-        draft_sampling_plan = coerce_sampling_plan(draft_sampling, batch_size=batch_size)
-        target_sampling_plan = coerce_sampling_plan(target_sampling, batch_size=batch_size)
         recipe = MtpGraphRecipe(
             draft_forward,
             draft_logits,
@@ -498,8 +492,7 @@ class ModelExecutor:
             kv_seq_lens=kv_seq_lens,
             draft_activate=draft_activate,
             target_activate=target_activate,
-            draft_sampling=draft_sampling_plan,
-            target_sampling=target_sampling_plan,
+            target_sampling=target_sampling,
             draft_greedy=getattr(draft_executor.model, "compute_greedy_tokens", None),
             target_greedy=getattr(self.model, "compute_greedy_tokens", None),
             runtime_outputs_only=runtime_outputs_only,
@@ -550,8 +543,7 @@ class ModelExecutor:
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
         target_step_major_layout: bool = False,
-        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
-        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        target_sampling: MtpSamplingPlan | None = None,
         runtime_outputs_only: bool = False,
         draft_metadata_storage: MtpSparseMetadataStorage | None = None,
         target_metadata_storage: MtpSparseMetadataStorage | None = None,
@@ -582,7 +574,6 @@ class ModelExecutor:
             kv_seq_lens=kv_seq_lens,
             draft_activate=draft_activate,
             target_activate=target_activate,
-            draft_sampling=draft_sampling,
             target_sampling=target_sampling,
             runtime_outputs_only=runtime_outputs_only,
             position_storage=position_storage,

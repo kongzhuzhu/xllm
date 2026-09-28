@@ -22,7 +22,6 @@ import pytest
 import torch
 
 from tests.python.mtp_graph_test_utils import make_recipe, output_tensors, scalar_reference
-from xllm.python import distributed
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
     ForwardContext,
@@ -34,13 +33,8 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpGraphOutput,
     MtpGraphRecipe,
     MtpRoleAdapter,
-    _pack_metadata_tensors,
-)
-from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
-    _gumbel_argmax,
-    probabilistic_acceptance,
-    sample_logits,
+    _pack_metadata_tensors,
 )
 from xllm.python.model_executor.runners.mtp_sparse_metadata import MtpSparsePositionStorage
 
@@ -112,207 +106,6 @@ def test_mtp_graph_output_clone_detaches_every_replay_tensor() -> None:
     values["target_embeddings"].fill_(-99)
     assert cloned.committed_tokens.tolist() == [[1, 2]]
     assert cloned.target_embeddings.tolist() == [[[7.0], [8.0]]]
-
-
-@pytest.mark.parametrize("with_lengths", [False, True])
-def test_penalty_padding_neither_penalizes_nor_overwrites_token_zero(with_lengths: bool) -> None:
-    logits = torch.tensor([[10.0, 6.0, 1.0], [10.0, 6.0, 1.0]])
-    plan = MtpSamplingPlan(
-        batch_size=2,
-        repetition_penalties=torch.tensor([2.0, 2.0]),
-        unique_token_ids=torch.tensor([[2, 0, 0], [0, 0, 0]]),
-        unique_token_counts=torch.tensor([[1, 0, 0], [1, 0, 0]]),
-        unique_token_ids_lens=torch.tensor([1, 1]) if with_lengths else None,
-        return_probs=False,
-        logprobs=True,
-    )
-    owned = plan.clone_for_graph()
-    expected = torch.tensor([[10.0, 6.0, 0.5], [5.0, 6.0, 1.0]])
-    sampled = sample_logits(logits, owned)
-    assert sampled.tokens.tolist() == [0, 1]
-    torch.testing.assert_close(sampled.log_probs, expected.log_softmax(-1))
-    infinite_logits = logits.clone()
-    infinite_logits[0, 2] = float("-inf")
-    assert sample_logits(infinite_logits, owned).tokens.tolist() == [0, 1]
-    expanded = owned.expand_for_rows(4)
-    assert sample_logits(logits.repeat_interleave(2, 0), expanded).tokens.tolist() == [0, 0, 1, 1]
-    if with_lengths:
-        owned.unique_token_ids_lens.zero_()
-        assert sample_logits(logits, owned).tokens.tolist() == [0, 0]
-
-
-def test_sampling_plan_applies_temperature_and_top_k() -> None:
-    plan = MtpSamplingPlan(
-        batch_size=2,
-        do_sample=torch.zeros(2, dtype=torch.bool),
-        temperatures=torch.ones(2),
-        top_k=torch.ones(2, dtype=torch.long),
-        all_greedy_sample=True,
-        return_probs=True,
-    )
-    logits = torch.tensor([[1.0, 4.0, 3.0], [5.0, 2.0, 4.0]])
-    sampled = sample_logits(logits, plan)
-    assert sampled.tokens.tolist() == [1, 0]
-    assert torch.equal(sampled.probs.argmax(dim=-1), sampled.tokens)
-
-
-def test_sampling_plan_matches_unlimited_top_k_and_bitmask_contracts() -> None:
-    logits = torch.tensor([[1.0, 4.0, 3.0], [1.0, 4.0, 3.0]])
-    plan = MtpSamplingPlan(
-        batch_size=2,
-        do_sample=torch.zeros(2, dtype=torch.bool),
-        top_k=torch.tensor([0, 1], dtype=torch.long),
-        filter_bitmask=torch.tensor([[0b010], [0b111]], dtype=torch.int64),
-        all_greedy_sample=True,
-        return_probs=True,
-    )
-    sampled = sample_logits(logits, plan)
-    # top_k=0 is unlimited; the bitmask leaves token 1 as the only option.
-    assert sampled.tokens.tolist() == [1, 1]
-    assert sampled.probs.shape == logits.shape
-
-
-def test_sampling_plan_mixed_mode_uses_request_do_sample() -> None:
-    logits = torch.tensor([[1.0, 4.0, 3.0], [1.0, 4.0, 3.0]])
-    plan = MtpSamplingPlan(
-        batch_size=2,
-        do_sample=torch.tensor([False, True]),
-        top_k=torch.ones(2, dtype=torch.long),
-        all_greedy_sample=False,
-        all_random_sample=False,
-    )
-    sampled = sample_logits(logits, plan)
-    assert sampled.tokens[0].item() == 1
-    assert sampled.tokens[1].item() == 1
-
-
-def test_random_sampling_runs_tp_consensus_before_target_verify(monkeypatch: pytest.MonkeyPatch) -> None:
-    plan = MtpSamplingPlan(
-        batch_size=1,
-        do_sample=torch.ones(1, dtype=torch.bool),
-        all_random_sample=True,
-        all_greedy_sample=False,
-    )
-    calls: list[tuple[torch.Tensor, int, str]] = []
-
-    def broadcast(value: torch.Tensor, src: int, group_name: str) -> None:
-        calls.append((value.clone(), src, group_name))
-        value.fill_(2)
-
-    monkeypatch.setattr(distributed, "tp_world_size", lambda _device: 2)
-    monkeypatch.setattr(distributed, "broadcast_", broadcast)
-    sampled = sample_logits(
-        torch.tensor([[0.0, 1.0, 2.0]]),
-        plan,
-        uniform=torch.full((1, 3), 0.5),
-    )
-
-    assert sampled.tokens.tolist() == [2]
-    assert len(calls) == 1
-    assert calls[0][1:] == (0, "tp")
-
-
-def test_gumbel_max_matches_categorical_distribution() -> None:
-    """The ACL-safe sampler must preserve multinomial probabilities."""
-    sample_count = 32768
-    logits = torch.log(torch.tensor([[1.0, 3.0, 6.0]])).expand(sample_count, -1)
-    generator = torch.Generator().manual_seed(20260922)
-    uniform = torch.rand((sample_count, logits.shape[-1]), generator=generator)
-
-    sampled = _gumbel_argmax(torch.log_softmax(logits, dim=-1), uniform)
-    frequencies = torch.bincount(sampled, minlength=logits.shape[-1]).to(torch.float32) / sample_count
-    expected = torch.softmax(logits[0], dim=-1)
-    torch.testing.assert_close(frequencies, expected, rtol=0, atol=0.015)
-
-
-def test_probabilistic_acceptance_explicit_uniforms_force_residual_recovery() -> None:
-    draft_tokens = torch.tensor([[1, 2]], dtype=torch.long)
-    target_tokens = torch.tensor([[1, 2, 3]], dtype=torch.long)
-    draft_probs = torch.tensor([[[0.0, 0.8, 0.2], [0.2, 0.1, 0.7]]])
-    target_probs = torch.tensor([[[0.6, 0.2, 0.2], [0.2, 0.1, 0.7], [0.2, 0.3, 0.5]]])
-    accepted_ids, accepted_mask, accepted_count, next_tokens = probabilistic_acceptance(
-        draft_tokens,
-        draft_probs,
-        target_tokens,
-        target_probs,
-        torch.ones(1, dtype=torch.bool),
-        acceptance_uniform=torch.tensor([[0.9, 0.0]]),
-        recovery_uniform=torch.full((1, 2, 3), 0.5),
-    )
-    assert accepted_ids.tolist() == [[-1, -1]]
-    assert accepted_mask.tolist() == [[False, False]]
-    assert accepted_count.tolist() == [0]
-    assert next_tokens.tolist() == [0]
-
-
-def test_probabilistic_acceptance_accepts_equal_proposals() -> None:
-    draft_tokens = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
-    target_tokens = torch.tensor([[1, 2, 0], [2, 1, 3]], dtype=torch.long)
-    draft_probs = torch.tensor([[[0.1, 0.7, 0.2], [0.2, 0.1, 0.7]], [[0.2, 0.1, 0.7], [0.1, 0.7, 0.2]]])
-    target_probs = torch.cat((draft_probs, torch.tensor([[[0.2, 0.3, 0.5]], [[0.1, 0.2, 0.7]]])), dim=1)
-    accepted_ids, accepted_mask, accepted_count, next_tokens = probabilistic_acceptance(
-        draft_tokens,
-        draft_probs,
-        target_tokens,
-        target_probs,
-        torch.ones(2, dtype=torch.bool),
-    )
-    assert accepted_ids.tolist() == [[1, 2], [2, 1]]
-    assert accepted_mask.tolist() == [[True, True], [True, True]]
-    assert accepted_count.tolist() == [2, 2]
-    assert next_tokens.tolist() == [0, 3]
-
-
-def test_greedy_target_keeps_equality_acceptance_with_random_draft() -> None:
-    batch_size = 1
-    speculative_tokens = 2
-    vocab_size = 8
-
-    def body(
-        ids: torch.Tensor,
-        positions: torch.Tensor,
-        step: int,
-        input_embedding: torch.Tensor | None,
-        topk_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
-        del positions, step, input_embedding, topk_indices
-        return ids.to(torch.float32).unsqueeze(-1)
-
-    def head(hidden: torch.Tensor) -> torch.Tensor:
-        logits = torch.zeros((hidden.shape[0], vocab_size))
-        token_ids = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
-        return logits.scatter(1, token_ids.unsqueeze(-1), 3.0)
-
-    draft_plan = MtpSamplingPlan(
-        batch_size=batch_size,
-        top_k=torch.ones(batch_size, dtype=torch.long),
-        do_sample=torch.ones(batch_size, dtype=torch.bool),
-        all_random_sample=True,
-        all_greedy_sample=False,
-        return_probs=True,
-    )
-    target_plan = MtpSamplingPlan(
-        batch_size=batch_size,
-        do_sample=torch.zeros(batch_size, dtype=torch.bool),
-        all_random_sample=False,
-        all_greedy_sample=True,
-        return_probs=True,
-    )
-    recipe = MtpGraphRecipe(
-        body,
-        head,
-        body,
-        head,
-        batch_size=batch_size,
-        speculative_tokens=speculative_tokens,
-        vocab_size=vocab_size,
-        device=torch.device("cpu"),
-        draft_sampling=draft_plan,
-        target_sampling=target_plan,
-    )
-    output = MtpAclGraphRunner(recipe, backend="eager").execute(torch.tensor([1]), torch.tensor([10]))
-    assert output.accepted_count.tolist() == [speculative_tokens]
-    assert output.next_state.token_ids.numel() == batch_size
 
 
 def test_eager_recipe_carries_mtp_embedding_and_topk_state() -> None:
@@ -535,34 +328,6 @@ def test_metadata_arena_preserves_aliases_and_separates_dtypes() -> None:
     torch.testing.assert_close(lengths, torch.tensor([3, 7], dtype=torch.int32))
 
 
-def test_greedy_without_probability_outputs_skips_vocab_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
-    logits = torch.tensor([[1.0, 3.0, 2.0], [9.0, 5.0, 7.0]])
-    controls = dict(temperatures=torch.tensor([0.0, 0.7]), top_k=torch.tensor([1, 2]), top_p=torch.tensor([0.9, 1.0]))
-    reference = sample_logits(logits, MtpSamplingPlan(batch_size=2, return_probs=True, **controls))
-
-    def unexpected(*args: object, **kwargs: object) -> None:
-        pytest.fail("greedy token-only sampling performed vocabulary normalization/sort")
-
-    monkeypatch.setattr(torch, "log_softmax", unexpected)
-    monkeypatch.setattr(torch, "sort", unexpected)
-    sampled = sample_logits(logits, MtpSamplingPlan(batch_size=2, return_probs=False, **controls))
-    torch.testing.assert_close(sampled.tokens, reference.tokens)
-    assert sampled.probs is None and sampled.log_probs is None
-    half_logits = logits.to(torch.bfloat16)
-    monkeypatch.setattr(torch.Tensor, "to", unexpected)
-    assert sample_logits(half_logits, MtpSamplingPlan(batch_size=2, return_probs=False)).tokens.tolist() == [1, 0]
-
-
-@pytest.mark.parametrize("logprobs,top_width", [(True, 0), (False, 2)])
-def test_greedy_probability_outputs_remain_available(logprobs: bool, top_width: int) -> None:
-    logits = torch.tensor([[1.0, 3.0, 2.0]])
-    plan = MtpSamplingPlan(batch_size=1, return_probs=False, logprobs=logprobs, max_top_logprobs=top_width)
-    sampled = sample_logits(logits, plan)
-    assert sampled.probs is None
-    torch.testing.assert_close(sampled.log_probs, torch.log_softmax(logits, -1))
-    assert sampled.tokens.item() == 1
-
-
 @pytest.mark.parametrize("steps", [3, 5])
 @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("logprobs,top_width", [(False, 0), (True, 0), (True, 2), (False, 2)])
@@ -573,7 +338,6 @@ def test_greedy_recipe_fast_path_matches_full_probability_recipe(
     fast = make_recipe(rejects, steps, logits_dtype=logits_dtype)
     reference = make_recipe(rejects, steps, logits_dtype=logits_dtype)
     for recipe, probabilities in ((fast, False), (reference, True)):
-        recipe.draft_sampling = MtpSamplingPlan(batch_size=steps + 1, return_probs=probabilities)
         recipe.target_sampling = MtpSamplingPlan(
             batch_size=steps + 1,
             return_probs=probabilities,
@@ -595,7 +359,6 @@ def test_greedy_recipe_fast_path_matches_full_probability_recipe(
 
 def test_draft_temporaries_live_only_as_long_as_their_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
     recipe = make_recipe(torch.tensor([1]), 3)
-    recipe.draft_sampling = MtpSamplingPlan(batch_size=1, return_probs=True, logprobs=True, max_top_logprobs=3)
     recipe.target_sampling = MtpSamplingPlan(batch_size=1, return_probs=False)
     draft_forward, draft_head, target_forward = recipe.draft_forward, recipe.draft_logits, recipe.target_forward
     logits_refs: list[weakref.ReferenceType[torch.Tensor]] = []
@@ -661,7 +424,6 @@ def test_runtime_output_uses_only_consumed_snapshots_and_greedy_heads(steps: int
     rejects = torch.arange(steps + 1)
     fast, reference = make_recipe(rejects, steps), make_recipe(rejects, steps)
     for recipe in (fast, reference):
-        recipe.draft_sampling = MtpSamplingPlan(batch_size=steps + 1, return_probs=False)
         recipe.target_sampling = MtpSamplingPlan(batch_size=steps + 1, return_probs=False, logprobs=logprobs)
     fast.runtime_outputs_only = True
     draft_head, target_head = fast.draft_logits, fast.target_logits

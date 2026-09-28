@@ -47,11 +47,6 @@ from xllm.python.model_executor.runners.base import (
     SpeculativeExecutionOutput,
     SpeculativeRuntimeOutput,
 )
-from xllm.python.model_executor.runners.mtp_sampling import (
-    MtpSamplingPlan,
-    probabilistic_acceptance,
-    sample_logits,
-)
 from xllm.python.model_executor.runners.mtp_sparse_metadata import (
     MtpSparseMetadataBinding,
     MtpSparseMetadataStorage,
@@ -71,6 +66,20 @@ ForwardFn = Callable[
 LogitsFn = Callable[[torch.Tensor], torch.Tensor]
 PrepareFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None]
 ActivateFn = Callable[[], None]
+
+
+@dataclass(frozen=True)
+class MtpSamplingPlan:
+    batch_size: int
+    return_probs: bool = True
+    logprobs: bool = False
+    max_top_logprobs: int = 0
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("MTP sampling batch_size must be positive")
+        if self.max_top_logprobs < 0:
+            raise ValueError("max_top_logprobs must be nonnegative")
 
 
 @torch.inference_mode()
@@ -468,7 +477,6 @@ class MtpGraphRecipe(nn.Module):
         kv_seq_lens: torch.Tensor | None = None,
         draft_activate: ActivateFn | None = None,
         target_activate: ActivateFn | None = None,
-        draft_sampling: MtpSamplingPlan | None = None,
         target_sampling: MtpSamplingPlan | None = None,
         draft_greedy: LogitsFn | None = None,
         target_greedy: LogitsFn | None = None,
@@ -498,14 +506,9 @@ class MtpGraphRecipe(nn.Module):
         self.target_activate = target_activate
         self.runtime_outputs_only = runtime_outputs_only
         self._position_storage = position_storage
-        if draft_sampling is not None and draft_sampling.batch_size != batch_size:
-            raise ValueError("draft sampling plan batch does not match MTP graph batch")
         if target_sampling is not None and target_sampling.batch_size != batch_size:
             raise ValueError("target sampling plan batch does not match MTP graph batch")
-        if (draft_sampling is None) != (target_sampling is None):
-            raise ValueError("draft and target sampling plans must be provided together")
-        self.draft_sampling = None if draft_sampling is None else draft_sampling.clone_for_graph()
-        self.target_sampling = None if target_sampling is None else target_sampling.clone_for_graph()
+        self.target_sampling = target_sampling
         self.register_buffer(
             "_kv_seq_lens_template",
             kv_seq_lens.to(device=device, dtype=torch.int32).contiguous()
@@ -560,16 +563,10 @@ class MtpGraphRecipe(nn.Module):
         draft_topk_indices: torch.Tensor | None = None,
     ) -> MtpGraphOutput | SpeculativeRuntimeOutput:
         draft_tokens: list[torch.Tensor] = []
-        draft_probs: list[torch.Tensor] = []
         current_ids = seed_token_ids
         current_embedding = draft_input_embedding
         current_topk_indices = draft_topk_indices
-        needs_acceptance_probs = self.target_sampling is not None and not self.target_sampling.all_greedy_sample
-        use_draft_greedy = (
-            self.draft_greedy is not None
-            and not needs_acceptance_probs
-            and (self.draft_sampling is None or self.draft_sampling.plain_greedy)
-        )
+        use_draft_greedy = self.draft_greedy is not None
         for step in range(self.speculative_tokens):
             if self.draft_activate is not None:
                 self.draft_activate()
@@ -591,22 +588,8 @@ class MtpGraphRecipe(nn.Module):
                 current_ids = self.draft_greedy(draft_hidden)
             elif step_logits.shape != (self.batch_size, self.vocab_size):
                 raise ValueError("draft logits must have shape [batch, vocab]")
-            elif self.draft_sampling is None or (self.draft_sampling.plain_greedy and not needs_acceptance_probs):
-                # Draft distributions and logprobs have no output consumer;
-                # only probability acceptance needs them as intermediates.
-                current_ids = step_logits.argmax(dim=-1)
             else:
-                sampled = sample_logits(
-                    step_logits,
-                    self.draft_sampling,
-                    require_probs=needs_acceptance_probs,
-                )
-                current_ids = sampled.tokens
-                if needs_acceptance_probs and sampled.probs is not None and self.draft_sampling.all_greedy_sample:
-                    draft_probs.append(torch.zeros_like(sampled.probs).scatter_(-1, current_ids.unsqueeze(-1), 1.0))
-                elif needs_acceptance_probs and sampled.probs is not None:
-                    draft_probs.append(sampled.probs)
-                del sampled
+                current_ids = step_logits.argmax(dim=-1)
             # GLM MTP consumes the preceding body hidden as the next-step
             # embedding and optionally reuses the preceding DSA top-k state.
             current_embedding = draft_hidden
@@ -635,11 +618,10 @@ class MtpGraphRecipe(nn.Module):
             raise ValueError("target hidden must have one row per target verification token")
         use_target_greedy = self.target_greedy is not None and (
             self.target_sampling is None
-            or (
-                self.target_sampling.plain_greedy
-                and not self.target_sampling.return_probs
-                and not self.target_sampling.logprobs
-                and self.target_sampling.max_top_logprobs == 0
+            or not (
+                self.target_sampling.return_probs
+                or self.target_sampling.logprobs
+                or self.target_sampling.max_top_logprobs
             )
         )
         target_logits = None if use_target_greedy else self.target_logits(target_hidden)
@@ -649,12 +631,10 @@ class MtpGraphRecipe(nn.Module):
         ):
             raise ValueError("target logits must have shape [batch*(K+1), vocab]")
         target_probs = None
-        target_log_probs = None
         target_log_normalizer = None
-        plain_greedy = self.target_sampling is not None and self.target_sampling.plain_greedy
         if use_target_greedy:
             target_tokens = self.target_greedy(target_hidden).reshape(self.batch_size, self.speculative_tokens + 1)
-        elif self.target_sampling is None or (plain_greedy and not self.target_sampling.return_probs):
+        elif self.target_sampling is None or not self.target_sampling.return_probs:
             target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
             if self.target_sampling is not None and (
                 self.target_sampling.logprobs or self.target_sampling.max_top_logprobs > 0
@@ -665,50 +645,29 @@ class MtpGraphRecipe(nn.Module):
                     self.batch_size, self.speculative_tokens + 1, 1
                 )
         else:
-            sampled_target = sample_logits(
-                target_logits,
-                self.target_sampling.expand_for_rows(self.batch_size * (self.speculative_tokens + 1)),
+            target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
+            target_probs = torch.softmax(target_logits.float(), dim=-1).reshape(
+                self.batch_size, self.speculative_tokens + 1, self.vocab_size
             )
-            target_tokens = sampled_target.tokens.reshape(self.batch_size, self.speculative_tokens + 1)
-            if sampled_target.probs is not None:
-                target_probs = sampled_target.probs.reshape(
-                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
-                )
-            if sampled_target.log_probs is not None:
-                target_log_probs = sampled_target.log_probs.reshape(
-                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
+            if self.target_sampling.logprobs or self.target_sampling.max_top_logprobs:
+                target_log_normalizer = torch.logsumexp(target_logits.float(), dim=-1).reshape(
+                    self.batch_size, self.speculative_tokens + 1, 1
                 )
 
         token_state = None
         compact_hidden = None
-        greedy = self.target_sampling is None or self.target_sampling.all_greedy_sample
-        if self.runtime_outputs_only and greedy:
+        if self.runtime_outputs_only:
             token_state, compact_hidden = _greedy_runtime_commit(draft_matrix, target_tokens, target_hidden)
             committed_tokens, accepted_count = _runtime_token_views(
                 token_state, self.batch_size, self.speculative_tokens
             )
-        elif greedy:
+        else:
             (
                 accepted_ids,
                 accepted_mask,
                 accepted_count,
                 next_tokens,
             ) = greedy_acceptance(draft_matrix, target_tokens)
-        else:
-            assert target_probs is not None
-            draft_prob_matrix = torch.stack(draft_probs, dim=1)
-            (
-                accepted_ids,
-                accepted_mask,
-                accepted_count,
-                next_tokens,
-            ) = probabilistic_acceptance(
-                draft_matrix,
-                draft_prob_matrix,
-                target_tokens,
-                target_probs,
-                self.target_sampling.request_do_sample(device=target_tokens.device),
-            )
         if token_state is None:
             committed_tokens = _committed_tokens(
                 accepted_ids,
@@ -718,9 +677,11 @@ class MtpGraphRecipe(nn.Module):
         committed_log_probs = None
         target_top_log_probs = None
         target_top_tokens = None
-        score_rows = target_log_probs
-        if target_log_normalizer is not None:
-            score_rows = target_logits.view(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
+        score_rows = (
+            target_logits.view(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
+            if target_log_normalizer is not None
+            else None
+        )
         if score_rows is not None and self.target_sampling is not None and self.target_sampling.logprobs:
             committed_indices = committed_tokens.clamp_min(0).unsqueeze(-1)
             selected_scores = score_rows.gather(-1, committed_indices).float()
@@ -1226,7 +1187,6 @@ class MtpGraphVariantRegistry:
             target_factory = self._target_metadata_factory
             if draft_factory is None or target_factory is None:
                 raise RuntimeError("sparse MTP registry requires native metadata factories")
-            draft_plan = MtpSamplingPlan(batch_size=batch_size, return_probs=False)
             target_plan = MtpSamplingPlan(
                 batch_size=batch_size, return_probs=return_probs, logprobs=logprobs, max_top_logprobs=max_top_logprobs
             )
@@ -1254,7 +1214,6 @@ class MtpGraphVariantRegistry:
                 target_step_major_layout=target_step_major_layout,
                 draft_activate=self._draft_activate,
                 target_activate=self._target_activate,
-                draft_sampling=draft_plan,
                 target_sampling=target_plan,
                 runtime_outputs_only=True,
                 draft_metadata_storage=draft_storage,

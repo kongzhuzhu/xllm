@@ -95,6 +95,7 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
 bool UnifiedMtpWorkerImpl::supports_unified_python_mtp_graph(
     const ForwardInput& input) const {
   return unified_graph_capable_ &&
+         draft_sampling_mode_ == DraftSamplingMode::GREEDY &&
          supports_unified_mtp_request(
              input,
              adaptive_enabled() && SpeculativeProfileRegistry::get_instance()

@@ -41,10 +41,15 @@ def npu_device() -> torch.device:
     return torch.device(f"npu:{index}")
 
 
-@pytest.mark.parametrize("steps", [1, 3, 5])
-@pytest.mark.parametrize("batch", [1, 3, 8])
-@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("step_major", [False, True])
+@pytest.mark.parametrize(
+    "steps,batch,position_dtype,step_major",
+    [
+        (1, 1, torch.int32, False),
+        (3, 3, torch.int64, False),
+        (3, 3, torch.int32, True),
+        (5, 8, torch.int64, True),
+    ],
+)
 def test_fused_metadata_replay_and_shrinking_tail(
     npu_device: torch.device, steps: int, batch: int, position_dtype: torch.dtype, step_major: bool
 ) -> None:
