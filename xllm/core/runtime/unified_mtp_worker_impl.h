@@ -32,6 +32,8 @@ class UnifiedMtpWorkerImpl : public MtpRuntime {
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
+  bool task_models_loaded() const override;
+  bool uses_worker_task_pipeline() const override { return true; }
   std::optional<ForwardOutput> step(const ForwardInput& input) override;
 
  protected:

@@ -16,7 +16,9 @@ limitations under the License.
 #pragma once
 #include <folly/futures/Future.h>
 
+#include <cstdint>
 #include <deque>
+#include <mutex>
 #include <optional>
 
 #include "core/framework/model/causal_lm.h"
@@ -60,6 +62,7 @@ struct TaskModel {
 };
 
 class ProcessGroup;
+class WorkerImpl;
 
 enum class SpeculativeTaskKind : uint8_t { MTP, DFLASH, DFLASH2 };
 
@@ -89,6 +92,37 @@ struct TaskResult {
   Status status;
   ForwardOutput output;
   uint64_t task_id = 0;
+};
+
+// Adapts the Unified worker's single-graph execution to the task result
+// protocol. The worker owns its graph, input arena and cross-round state;
+// this queue owns only completion futures and allocates no Device Slots.
+class UnifiedTaskPipeline final {
+ public:
+  UnifiedTaskPipeline(ThreadPool& state_executor,
+                      WorkerImpl& worker,
+                      bool overlap);
+  ~UnifiedTaskPipeline();
+  UnifiedTaskPipeline(const UnifiedTaskPipeline&) = delete;
+  UnifiedTaskPipeline& operator=(const UnifiedTaskPipeline&) = delete;
+
+  TaskSubmission submit(const ForwardInput& input);
+  folly::Future<TaskResult> take_result_async(
+      std::optional<uint64_t> expected_task_id = std::nullopt);
+
+ private:
+  struct Task {
+    uint64_t id;
+    folly::SemiFuture<std::optional<ForwardOutput>> future;
+  };
+
+  ThreadPool& state_executor_;
+  WorkerImpl& worker_;
+  bool overlap_;
+  uint32_t capacity_;
+  uint64_t next_task_id_ = 1;
+  std::mutex mutex_;
+  std::deque<Task> accepted_;
 };
 
 // One or two Slots with ordinary or speculative eager/ACL graph execution.

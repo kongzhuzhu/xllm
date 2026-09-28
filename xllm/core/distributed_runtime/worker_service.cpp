@@ -253,7 +253,10 @@ void WorkerService::step(
   const bool use_default_stream =
       !options_.enable_schedule_overlap() && options_.backend() == "llm";
   const bool task_pipeline = options_.enable_task_pipeline();
-  if (options_.enable_schedule_overlap() && !task_pipeline) {
+  const bool cpu_ready_task_result =
+      task_pipeline && !worker_->task_pipeline_uses_worker_prepare();
+  if (options_.enable_schedule_overlap() &&
+      (!task_pipeline || worker_->task_pipeline_uses_worker_prepare())) {
     stabilize_schedule_overlap_host_views(fwd_input);
   }
   // execute model
@@ -345,7 +348,7 @@ void WorkerService::step(
                         /*non_blocking=*/true);
           }
         };
-        if (task_pipeline) {
+        if (cpu_ready_task_result) {
           // The pipeline Future completes after Consume produces CPU results.
           copy_output_to_host();
         } else {
@@ -907,6 +910,8 @@ void WorkerService::GetLastStepResult(
             !options_.enable_schedule_overlap() && options_.backend() == "llm";
 
         const bool task_pipeline = options_.enable_task_pipeline();
+        const bool cpu_ready_task_result =
+            task_pipeline && !worker_->task_pipeline_uses_worker_prepare();
         auto future = worker_->get_last_step_result_async();
         auto forward_outputs = std::move(future).get();
         if (forward_outputs) {
@@ -983,7 +988,7 @@ void WorkerService::GetLastStepResult(
             }
           };
 
-          if (task_pipeline) {
+          if (cpu_ready_task_result) {
             // The pipeline Future completes after Consume produces CPU results.
             copy_output_to_host();
           } else {

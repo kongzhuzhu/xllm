@@ -162,6 +162,7 @@ Worker::~Worker() {
     });
     std::move(future).get();
     task_pipeline_.reset();
+    unified_task_pipeline_.reset();
   }
   delete impl_;
 }
@@ -173,7 +174,13 @@ bool Worker::initialize_task_pipeline() {
   if (!impl_->task_models_loaded()) {
     return true;
   }
-  CHECK(task_pipeline_ == nullptr);
+  CHECK(task_pipeline_ == nullptr && unified_task_pipeline_ == nullptr);
+  if (impl_->uses_worker_task_pipeline()) {
+    unified_task_pipeline_ = std::make_unique<UnifiedTaskPipeline>(
+        threadpool_, *impl_, impl_->enable_schedule_overlap());
+    LOG(INFO) << "Unified task pipeline uses worker-owned graph and buffers";
+    return true;
+  }
   const Status status = impl_->create_task_pipeline(task_pipeline_);
   if (!status.ok()) {
     LOG(ERROR) << status.message();
@@ -244,6 +251,10 @@ std::optional<ForwardOutput> Worker::step(const ForwardInput& inputs) {
 
 const bool Worker::is_driver() { return impl_->is_driver(); }
 
+bool Worker::task_pipeline_uses_worker_prepare() const {
+  return unified_task_pipeline_ != nullptr;
+}
+
 folly::SemiFuture<std::tuple<int64_t, int64_t>>
 Worker::estimate_kv_cache_capacity_async() {
   return impl_->estimate_kv_cache_capacity_async();
@@ -252,14 +263,21 @@ Worker::estimate_kv_cache_capacity_async() {
 folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
     const ForwardInput& inputs) {
   if (enable_task_pipeline_) {
-    CHECK(task_pipeline_ != nullptr);
-    const TaskSubmission submission = task_pipeline_->submit(inputs);
+    CHECK(task_pipeline_ != nullptr || unified_task_pipeline_ != nullptr);
+    const TaskSubmission submission =
+        unified_task_pipeline_ != nullptr
+            ? unified_task_pipeline_->submit(inputs)
+            : task_pipeline_->submit(inputs);
     CHECK(submission.status.ok()) << submission.status.message();
     if (impl_->enable_schedule_overlap()) {
       // PrepareAck releases all caller views. GetLast consumes the FIFO later.
       return folly::makeSemiFuture(std::optional<ForwardOutput>{});
     }
-    return task_pipeline_->take_result_async(submission.task_id)
+    auto result =
+        unified_task_pipeline_ != nullptr
+            ? unified_task_pipeline_->take_result_async(submission.task_id)
+            : task_pipeline_->take_result_async(submission.task_id);
+    return std::move(result)
         .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
           CHECK(result.status.ok()) << result.status.message();
           return std::move(result.output);
@@ -340,8 +358,11 @@ Worker::get_last_step_result_async() {
   if (enable_task_pipeline_) {
     CHECK(impl_->enable_schedule_overlap())
         << "Task results without scheduler overlap are returned by step_async.";
-    CHECK(task_pipeline_ != nullptr);
-    return task_pipeline_->take_result_async()
+    CHECK(task_pipeline_ != nullptr || unified_task_pipeline_ != nullptr);
+    auto result = unified_task_pipeline_ != nullptr
+                      ? unified_task_pipeline_->take_result_async()
+                      : task_pipeline_->take_result_async();
+    return std::move(result)
         .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
           CHECK(result.status.ok()) << result.status.message();
           return std::move(result.output);

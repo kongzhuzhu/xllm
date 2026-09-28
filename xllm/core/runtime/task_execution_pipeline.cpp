@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/task_execution_pipeline_speculative.h"
+#include "core/runtime/worker_impl.h"
 #include "core/util/tensor_helper.h"
 
 namespace xllm {
@@ -33,6 +34,67 @@ Status invalid(const char* message) {
 }
 
 }  // namespace
+
+UnifiedTaskPipeline::UnifiedTaskPipeline(ThreadPool& state_executor,
+                                         WorkerImpl& worker,
+                                         bool overlap)
+    : state_executor_(state_executor),
+      worker_(worker),
+      overlap_(overlap),
+      capacity_(overlap ? 2U : 1U) {}
+
+UnifiedTaskPipeline::~UnifiedTaskPipeline() {
+  while (!accepted_.empty()) {
+    take_result_async().get();
+  }
+}
+
+TaskSubmission UnifiedTaskPipeline::submit(const ForwardInput& input) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (accepted_.size() == capacity_) {
+    return {Status(StatusCode::RESOURCE_EXHAUSTED,
+                   "All Unified tasks still hold unconsumed results."),
+            0};
+  }
+  CHECK_LT(next_task_id_, std::numeric_limits<uint64_t>::max());
+  // WorkerImpl completes its Host-to-Device prepare before returning this
+  // future. The launch stays ordered on the worker's single execution thread.
+  const uint64_t id = next_task_id_++;
+  accepted_.emplace_back(Task{id, worker_.step_async(input)});
+  return {Status(), id};
+}
+
+folly::Future<TaskResult> UnifiedTaskPipeline::take_result_async(
+    std::optional<uint64_t> expected_task_id) {
+  folly::Promise<TaskResult> promise;
+  auto future = promise.getFuture();
+  state_executor_.schedule(
+      [this, expected_task_id, promise = std::move(promise)]() mutable {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (accepted_.empty() || (expected_task_id.has_value() &&
+                                  *expected_task_id != accepted_.front().id)) {
+          lock.unlock();
+          promise.setValue(
+              TaskResult{Status(StatusCode::INVALID_ARGUMENT,
+                                "No matching oldest unconsumed Unified task."),
+                         {}});
+          return;
+        }
+        Task& task = accepted_.front();
+        std::optional<ForwardOutput> output = std::move(task.future).get();
+        if (overlap_ && worker_.is_driver()) {
+          output = worker_.get_last_step_result();
+        }
+        const uint64_t id = task.id;
+        accepted_.pop_front();
+        lock.unlock();
+        promise.setValue(TaskResult{
+            Status(),
+            output.has_value() ? std::move(*output) : ForwardOutput{},
+            id});
+      });
+  return future;
+}
 
 TaskExecutionPipeline::TaskExecutionPipeline(ThreadPool& state_executor,
                                              CausalLM& model,

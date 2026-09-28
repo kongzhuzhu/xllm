@@ -36,8 +36,6 @@ std::unique_ptr<WorkerImpl> make_mtp_worker(const ParallelArgs& args,
   CHECK(options.enable_speculative_decode() &&
         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()))
       << "MTP worker plugins require the MTP speculative algorithm";
-  CHECK(!options.enable_task_pipeline())
-      << "MTP worker plugins do not use the task pipeline";
   return std::make_unique<WorkerClass>(args, device, options, type);
 }
 std::unique_ptr<WorkerImpl> make_unified_worker(const ParallelArgs& args,
@@ -55,11 +53,19 @@ std::unique_ptr<WorkerImpl> make_unified_worker(const ParallelArgs& args,
   return nullptr;
 #endif
 }
+std::unique_ptr<WorkerImpl> make_legacy_worker(const ParallelArgs& args,
+                                               const torch::Device& device,
+                                               const runtime::Options& options,
+                                               WorkerType type) {
+  CHECK(!options.enable_task_pipeline())
+      << "legacy_mtp worker plugin does not use the task pipeline";
+  return make_mtp_worker<MTPWorkerImpl>(args, device, options, type);
+}
 struct WorkerPlugins {
   std::mutex mutex;
   std::unordered_map<std::string, WorkerPluginCreator> creators = {
       {"unified_mtp", make_unified_worker},
-      {"legacy_mtp", make_mtp_worker<MTPWorkerImpl>}};
+      {"legacy_mtp", make_legacy_worker}};
 };
 WorkerPlugins& plugins() {
   static WorkerPlugins registry;

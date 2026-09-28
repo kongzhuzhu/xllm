@@ -30,6 +30,17 @@ limitations under the License.
 #include "core/runtime/unified_mtp_executor.h"
 
 namespace xllm {
+namespace {
+runtime::Options unified_leaf_options(const runtime::Options& options) {
+  runtime::Options leaf_options = options;
+  leaf_options.enable_task_pipeline(false)
+      .enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return leaf_options;
+}
+}  // namespace
+
 using mtp_detail::check_mtp_decode_states;
 
 bool supports_unified_mtp_request(const ForwardInput& input, bool adaptive) {
@@ -48,7 +59,13 @@ UnifiedMtpWorkerImpl::UnifiedMtpWorkerImpl(const ParallelArgs& parallel_args,
                                            const torch::Device& device,
                                            const runtime::Options& options,
                                            WorkerType worker_type)
-    : MtpRuntime(parallel_args, device, options, worker_type) {}
+    : MtpRuntime(parallel_args,
+                 device,
+                 options,
+                 unified_leaf_options(options),
+                 unified_leaf_options(options),
+                 worker_type,
+                 /*enable_adaptive_speculative_decode=*/true) {}
 
 UnifiedMtpWorkerImpl::~UnifiedMtpWorkerImpl() {
   // Derived graph owners must survive all queued work, before base teardown.
@@ -90,6 +107,12 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
   // once after the pair loads; each step only examines request controls.
   unified_graph_capable_ = result && supports_unified_configuration();
   return result;
+}
+
+bool UnifiedMtpWorkerImpl::task_models_loaded() const {
+  return impl_ != nullptr && draft_impl_ != nullptr &&
+         impl_->get_status() == WorkerImpl::Status::LOADED &&
+         draft_impl_->get_status() == WorkerImpl::Status::LOADED;
 }
 
 bool UnifiedMtpWorkerImpl::supports_unified_python_mtp_graph(

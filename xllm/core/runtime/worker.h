@@ -35,6 +35,8 @@ limitations under the License.
 
 namespace xllm {
 
+class UnifiedTaskPipeline;
+
 class Worker {
  public:
   Worker(const ParallelArgs& parallel_args,
@@ -87,6 +89,7 @@ class Worker {
   bool unlink_p2p(const std::string& remote_addr);
 
   const bool is_driver();
+  bool task_pipeline_uses_worker_prepare() const;
 
   // prepare input for execution
   ForwardInput prepare_inputs(Batch& batch);
@@ -127,8 +130,8 @@ class Worker {
       Slice<BlockTransferInfo>& block_transfer_info);
 
   // Run the model asynchronously. Task pipeline with overlap returns an
-  // empty PrepareAck; without overlap, successful completion returns
-  // independent CPU results that are ready to read.
+  // empty PrepareAck. The native Slot pipeline returns ready CPU results;
+  // the Unified adapter retains the worker's ready-event contract.
   folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
 
@@ -136,8 +139,8 @@ class Worker {
 
   const torch::Device& device() const;
 
-  // Task pipeline completes this Future after Consume finishes D2H and
-  // returns independent CPU results that are ready to read.
+  // Native task pipeline finishes D2H before completing this Future. Unified
+  // task results retain the worker's ready event and output lease.
   folly::SemiFuture<std::optional<ForwardOutput>> get_last_step_result_async();
 
   int64_t get_active_activation_memory();
@@ -149,6 +152,7 @@ class Worker {
   bool enable_task_pipeline_ = false;
   WorkerImpl* impl_ = nullptr;
   std::unique_ptr<TaskExecutionPipeline> task_pipeline_;
+  std::unique_ptr<UnifiedTaskPipeline> unified_task_pipeline_;
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,
                          /*pool_name=*/"Worker.async"};

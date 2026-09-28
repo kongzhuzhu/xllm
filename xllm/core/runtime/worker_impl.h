@@ -76,6 +76,7 @@ class WorkerImpl {
   virtual ::xllm::Status create_task_pipeline(
       std::unique_ptr<TaskExecutionPipeline>& output);
   virtual bool task_models_loaded() const { return status_ == Status::LOADED; }
+  virtual bool uses_worker_task_pipeline() const { return false; }
   ::xllm::Status task_capacity(const runtime::Options& options,
                                LlmTaskCapacity& output) const;
   TaskModel task_model();
