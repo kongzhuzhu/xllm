@@ -634,22 +634,17 @@ class MtpGraphRecipe(nn.Module):
         target_log_normalizer = None
         if use_target_greedy:
             target_tokens = self.target_greedy(target_hidden).reshape(self.batch_size, self.speculative_tokens + 1)
-        elif self.target_sampling is None or not self.target_sampling.return_probs:
+        else:
             target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
+            if self.target_sampling is not None and self.target_sampling.return_probs:
+                target_probs = torch.softmax(target_logits.float(), dim=-1).reshape(
+                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
+                )
             if self.target_sampling is not None and (
-                self.target_sampling.logprobs or self.target_sampling.max_top_logprobs > 0
+                self.target_sampling.logprobs or self.target_sampling.max_top_logprobs
             ):
                 # Only committed and top-k scores leave the graph. A scalar
                 # normalizer per row avoids a full-vocabulary log-prob tensor.
-                target_log_normalizer = torch.logsumexp(target_logits.float(), dim=-1).reshape(
-                    self.batch_size, self.speculative_tokens + 1, 1
-                )
-        else:
-            target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
-            target_probs = torch.softmax(target_logits.float(), dim=-1).reshape(
-                self.batch_size, self.speculative_tokens + 1, self.vocab_size
-            )
-            if self.target_sampling.logprobs or self.target_sampling.max_top_logprobs:
                 target_log_normalizer = torch.logsumexp(target_logits.float(), dim=-1).reshape(
                     self.batch_size, self.speculative_tokens + 1, 1
                 )
@@ -684,9 +679,7 @@ class MtpGraphRecipe(nn.Module):
         )
         if score_rows is not None and self.target_sampling is not None and self.target_sampling.logprobs:
             committed_indices = committed_tokens.clamp_min(0).unsqueeze(-1)
-            selected_scores = score_rows.gather(-1, committed_indices).float()
-            if target_log_normalizer is not None:
-                selected_scores = selected_scores - target_log_normalizer
+            selected_scores = score_rows.gather(-1, committed_indices).float() - target_log_normalizer
             committed_log_probs = selected_scores.squeeze(-1)
             committed_log_probs = torch.where(
                 committed_tokens.ge(0), committed_log_probs, torch.zeros_like(committed_log_probs)
@@ -694,8 +687,7 @@ class MtpGraphRecipe(nn.Module):
         if score_rows is not None and self.target_sampling is not None and self.target_sampling.max_top_logprobs > 0:
             top_width = min(self.target_sampling.max_top_logprobs, self.vocab_size)
             target_top_log_probs, target_top_tokens = score_rows.topk(top_width, dim=-1)
-            if target_log_normalizer is not None:
-                target_top_log_probs = target_top_log_probs.float() - target_log_normalizer
+            target_top_log_probs = target_top_log_probs.float() - target_log_normalizer
         if self.runtime_outputs_only:
             if compact_hidden is None:
                 compact_hidden = _compact_target_hidden(target_hidden, accepted_count, self.speculative_tokens)
@@ -707,9 +699,7 @@ class MtpGraphRecipe(nn.Module):
                 logprobs=committed_log_probs,
                 top_logprobs=target_top_log_probs,
                 top_tokens=target_top_tokens,
-                target_probs=(
-                    target_probs if self.target_sampling is not None and self.target_sampling.return_probs else None
-                ),
+                target_probs=target_probs,
             )
         # ``next_tokens`` is the replacement token after a rejection or the
         # bonus token after an all-accepted verify.  It is emitted in addition
@@ -755,9 +745,7 @@ class MtpGraphRecipe(nn.Module):
             next_embeddings=next_embeddings,
             next_topk_indices=next_topk_indices,
             target_embeddings=target_hidden_matrix,
-            target_probs=(
-                target_probs if self.target_sampling is not None and self.target_sampling.return_probs else None
-            ),
+            target_probs=target_probs,
             committed_log_probs=committed_log_probs,
             target_top_log_probs=target_top_log_probs,
             target_top_tokens=target_top_tokens,
