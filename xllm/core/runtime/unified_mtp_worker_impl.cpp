@@ -234,24 +234,7 @@ std::optional<ForwardOutput> UnifiedMtpWorkerImpl::run_unified_python_mtp_graph(
 
   // The graph writes token IDs and counts into one arena. One owned Device
   // snapshot and one pinned D2H lease serve both consumers, with no pack op.
-  if (!graph_output.token_state.defined()) {
-    // Full oracle/trace output deliberately retains diagnostic tensors. Pack
-    // only this diagnostic branch; the production compact output is zero-copy.
-    CHECK_EQ(graph_output.committed_tokens.scalar_type(), torch::kLong);
-    const int64_t token_bytes =
-        graph_output.committed_tokens.numel() * sizeof(int64_t);
-    graph_output.token_state = torch::empty(
-        {token_bytes + batch_size * static_cast<int64_t>(sizeof(int32_t))},
-        graph_output.committed_tokens.options().dtype(torch::kUInt8));
-    graph_output.token_state.narrow(0, 0, token_bytes)
-        .view(torch::kLong)
-        .view_as(graph_output.committed_tokens)
-        .copy_(graph_output.committed_tokens);
-    graph_output.token_state
-        .narrow(0, token_bytes, batch_size * sizeof(int32_t))
-        .view(torch::kInt)
-        .copy_(graph_output.accepted_count);
-  }
+  CHECK(graph_output.token_state.defined());
   CHECK_EQ(graph_output.token_state.scalar_type(), torch::kUInt8);
   const int64_t token_bytes =
       graph_output.committed_tokens.numel() * sizeof(int64_t);

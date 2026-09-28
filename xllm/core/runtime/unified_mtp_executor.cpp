@@ -179,39 +179,7 @@ UnifiedMtpExecutionResult UnifiedMtpExecutor::execute(
       destination;
 #endif
 
-  CHECK(graph_output.committed_tokens.defined())
-      << "unified Python MTP graph did not return committed tokens";
-  CHECK(graph_output.target_embeddings.defined())
-      << "unified Python MTP graph did not return target embeddings";
-  CHECK_EQ(graph_output.committed_tokens.size(0), batch_size);
-  CHECK_EQ(graph_output.committed_tokens.size(1), speculative_tokens + 1);
-  if (graph_output.target_embeddings.dim() == 2) {
-    CHECK_EQ(graph_output.target_embeddings.size(0), batch_size * 2);
-  } else {
-    // Full oracle/trace results preserve [B,K+1,H]. Both the cache and fused
-    // next-draft input accept this layout; no compact gather is needed here.
-    CHECK(!graph_output.token_state.defined());
-    CHECK_EQ(graph_output.target_embeddings.dim(), 3);
-    CHECK_EQ(graph_output.target_embeddings.size(0), batch_size);
-    CHECK_EQ(graph_output.target_embeddings.size(1), speculative_tokens + 1);
-  }
-  if (input.sampling_params.logprobs) {
-    CHECK(graph_output.committed_log_probs.defined())
-        << "unified Python MTP graph did not return requested logprobs";
-  }
-  if (input.sampling_params.max_top_logprobs > 0) {
-    CHECK(graph_output.target_top_log_probs.defined() &&
-          graph_output.target_top_tokens.defined())
-        << "unified Python MTP graph did not return requested top logprobs";
-  }
-
-  CHECK(graph_output.accepted_count.defined());
-  CHECK_EQ(graph_output.accepted_count.numel(), batch_size);
-
-  // Record the route only after all graph outputs have passed the shape and
-  // contract checks above.  This is intentionally one increment per replay,
-  // independent of the number of HTTP requests or speculative tokens, and is
-  // therefore suitable for validating unified decode independently.
+  // Count one completed graph execution, independent of batch size or K.
   COUNTER_INC(speculative_unified_graph_executions_total);
 
   continuation_.accepted_tokens = graph_output.committed_tokens;

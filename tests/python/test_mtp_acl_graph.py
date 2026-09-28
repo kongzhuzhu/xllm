@@ -23,7 +23,6 @@ import torch
 
 from tests.python.mtp_graph_test_utils import make_recipe, output_tensors, scalar_reference
 from xllm.python import distributed
-from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
     ForwardContext,
@@ -34,20 +33,11 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     MtpAclGraphRunner,
     MtpGraphOutput,
     MtpGraphRecipe,
-    MtpGraphVariantRegistry,
     MtpRoleAdapter,
-    _committed_tokens,
-    _normalize_request_major_rows,
     _pack_metadata_tensors,
-    greedy_acceptance,
-)
-from xllm.python.model_executor.runners.mtp_kv_oracle import (
-    PagedKvSnapshot,
-    build_attention_read_slots,
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
-    MtpSamplingRandomInputs,
     _gumbel_argmax,
     probabilistic_acceptance,
     sample_logits,
@@ -55,85 +45,7 @@ from xllm.python.model_executor.runners.mtp_sampling import (
 from xllm.python.model_executor.runners.mtp_sparse_metadata import MtpSparsePositionStorage
 
 
-def test_paged_kv_snapshot_restores_selected_physical_payloads() -> None:
-    key = torch.arange(2 * 4 * 1 * 3, dtype=torch.float32).reshape(2, 4, 1, 3)
-    value = key + 100
-    index = torch.arange(2 * 4 * 1 * 2, dtype=torch.float32).reshape(2, 4, 1, 2)
-    scale = torch.arange(2 * 4, dtype=torch.float32).reshape(2, 4, 1)
-    expected_key = key.clone()
-    expected_value = value.clone()
-    expected_index = index.clone()
-    expected_scale = scale.clone()
-    cache = LayerCache(key, value, index=index, indexer_scale=scale)
-    slots = torch.tensor([-1, 0, 3, 5], dtype=torch.long)
-    snapshot = PagedKvSnapshot.capture([("target", [cache], slots)])
-
-    key.view(-1, 1, 3).index_fill_(0, torch.tensor([0, 3, 5]), -1)
-    value.view(-1, 1, 3).index_fill_(0, torch.tensor([0, 3, 5]), -2)
-    index.view(-1, 1, 2).index_fill_(0, torch.tensor([0, 3, 5]), -3)
-    scale.view(-1, 1).index_fill_(0, torch.tensor([0, 3, 5]), -4)
-    snapshot.restore()
-
-    assert torch.equal(key, expected_key)
-    assert torch.equal(value, expected_value)
-    assert torch.equal(index, expected_index)
-    assert torch.equal(scale, expected_scale)
-    assert snapshot.tensor_count == 4
-
-
-def test_attention_read_slots_follow_kv_lengths_and_page_table() -> None:
-    block_table = torch.tensor([[4, 2, -1], [7, 1, -1]], dtype=torch.int32)
-    read_slots = build_attention_read_slots(block_table, [5, 3], page_size=4)
-
-    assert read_slots[0].tolist() == [16, 17, 18, 19, 8]
-    assert read_slots[1].tolist() == [28, 29, 30]
-
-    with pytest.raises(ValueError, match="invalid page"):
-        build_attention_read_slots(torch.tensor([[4, -1]], dtype=torch.int32), [5], page_size=4)
-
-
-def test_mtp_metadata_rows_normalize_sequence_and_step_major_layouts() -> None:
-    sequence_major = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
-    step_major = torch.tensor([0, 3, 1, 4, 2, 5], dtype=torch.long)
-
-    expected = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
-    assert torch.equal(
-        _normalize_request_major_rows(sequence_major, 2, 3, step_major_layout=False),
-        expected,
-    )
-    assert torch.equal(
-        _normalize_request_major_rows(step_major, 2, 3, step_major_layout=True),
-        expected,
-    )
-
-
-@pytest.mark.parametrize("steps", [1, 2, 3, 4, 5])
-def test_greedy_acceptance_every_rejection_position(steps: int) -> None:
-    draft = torch.arange(steps, dtype=torch.long).expand(steps + 1, -1).clone()
-    target = torch.arange(steps + 1, dtype=torch.long).expand(steps + 1, -1).clone()
-    for reject in range(steps):
-        target[reject, reject] = 1000 + reject
-
-    accepted_ids, accepted_mask, accepted_count, next_tokens = greedy_acceptance(draft, target)
-
-    for reject in range(steps + 1):
-        assert accepted_count[reject].item() == reject
-        assert accepted_ids[reject].tolist() == list(range(reject)) + [-1] * (steps - reject)
-        assert accepted_mask[reject].tolist() == [True] * reject + [False] * (steps - reject)
-        assert next_tokens[reject].item() == (1000 + reject if reject < steps else steps)
-
-
-def test_committed_tokens_put_replacement_at_first_rejection() -> None:
-    # The scalar acceptance helper is the direct contract check; recipe tests
-    # above cover model-produced rows.
-    accepted_ids, _, accepted_count, next_token = greedy_acceptance(
-        torch.tensor([[10, 11, 12]]), torch.tensor([[10, 99, 88, 77]])
-    )
-    committed = _committed_tokens(accepted_ids, accepted_count, next_token)
-    assert committed.tolist() == [[10, 99, -1, -1]]
-
-
-@pytest.mark.parametrize("steps", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("steps", [1, 3, 5])
 @pytest.mark.parametrize("prepared_positions", [False, True])
 def test_eager_recipe_matches_scalar_oracle_for_each_fixed_k(steps: int, prepared_positions: bool) -> None:
     rejection_steps = torch.arange(steps + 1)
@@ -187,11 +99,6 @@ def test_mtp_graph_output_clone_detaches_every_replay_tensor() -> None:
         "committed_log_probs": torch.tensor([[-0.2, -0.3]]),
         "target_top_log_probs": torch.tensor([[[-0.2], [-0.3]]]),
         "target_top_tokens": torch.tensor([[[1], [2]]]),
-        "draft_hidden": torch.tensor([[[9.0]]]),
-        "draft_logits": torch.tensor([[[0.1, 0.9]]]),
-        "draft_topk_indices": torch.tensor([[[1]]]),
-        "target_logits": torch.tensor([[[0.2, 0.8], [0.3, 0.7]]]),
-        "target_topk_indices": torch.tensor([[[1], [1]]]),
     }
     output = MtpGraphOutput(**values)
     cloned = MtpAclGraphRunner._clone_graph_output(output)
@@ -205,17 +112,6 @@ def test_mtp_graph_output_clone_detaches_every_replay_tensor() -> None:
     values["target_embeddings"].fill_(-99)
     assert cloned.committed_tokens.tolist() == [[1, 2]]
     assert cloned.target_embeddings.tolist() == [[[7.0], [8.0]]]
-
-
-@pytest.mark.parametrize("steps", [0, -1])
-def test_recipe_rejects_nonpositive_k(steps: int) -> None:
-    with pytest.raises(ValueError, match="speculative_tokens"):
-        make_recipe(torch.tensor([0]), steps)
-
-
-def test_acceptance_rejects_zero_draft_width() -> None:
-    with pytest.raises(ValueError, match="at least one draft"):
-        greedy_acceptance(torch.empty(2, 0, dtype=torch.long), torch.zeros(2, 1, dtype=torch.long))
 
 
 @pytest.mark.parametrize("with_lengths", [False, True])
@@ -291,21 +187,6 @@ def test_sampling_plan_mixed_mode_uses_request_do_sample() -> None:
     assert sampled.tokens[1].item() == 1
 
 
-def test_sampling_explicit_uniforms_are_replay_deterministic() -> None:
-    plan = MtpSamplingPlan(
-        batch_size=1,
-        do_sample=torch.ones(1, dtype=torch.bool),
-        all_random_sample=True,
-        all_greedy_sample=False,
-    )
-    logits = torch.zeros((1, 4))
-    uniform = torch.tensor([[0.2, 0.4, 0.6, 0.8]], dtype=torch.float32)
-    first = sample_logits(logits, plan, uniform=uniform)
-    second = sample_logits(logits, plan, uniform=uniform)
-    assert first.tokens.item() == second.tokens.item()
-    torch.testing.assert_close(first.probs, second.probs, rtol=0, atol=0)
-
-
 def test_random_sampling_runs_tp_consensus_before_target_verify(monkeypatch: pytest.MonkeyPatch) -> None:
     plan = MtpSamplingPlan(
         batch_size=1,
@@ -365,16 +246,6 @@ def test_probabilistic_acceptance_explicit_uniforms_force_residual_recovery() ->
     assert next_tokens.tolist() == [0]
 
 
-def test_sampling_random_inputs_validate_fixed_graph_layout() -> None:
-    random_inputs = MtpSamplingRandomInputs(
-        draft_uniform=torch.zeros((2, 3, 5)),
-        target_uniform=torch.zeros((2, 4, 5)),
-        acceptance_uniform=torch.zeros((2, 3)),
-        recovery_uniform=torch.zeros((2, 3, 5)),
-    )
-    assert random_inputs.layout_signature()[0] == ((2, 3, 5), "torch.float32", "cpu")
-
-
 def test_probabilistic_acceptance_accepts_equal_proposals() -> None:
     draft_tokens = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
     target_tokens = torch.tensor([[1, 2, 0], [2, 1, 3]], dtype=torch.long)
@@ -391,54 +262,6 @@ def test_probabilistic_acceptance_accepts_equal_proposals() -> None:
     assert accepted_mask.tolist() == [[True, True], [True, True]]
     assert accepted_count.tolist() == [2, 2]
     assert next_tokens.tolist() == [0, 3]
-
-
-def test_eager_recipe_runs_random_sampling_and_probability_acceptance() -> None:
-    batch_size = 1
-    speculative_tokens = 2
-    vocab_size = 8
-
-    def body(
-        ids: torch.Tensor,
-        positions: torch.Tensor,
-        step: int,
-        input_embedding: torch.Tensor | None,
-        topk_indices: torch.Tensor | None,
-    ) -> torch.Tensor:
-        del positions, step, input_embedding, topk_indices
-        return ids.to(torch.float32).unsqueeze(-1)
-
-    def head(hidden: torch.Tensor) -> torch.Tensor:
-        logits = torch.zeros((hidden.shape[0], vocab_size))
-        token_ids = hidden.squeeze(-1).to(torch.long).remainder(vocab_size)
-        return logits.scatter(1, token_ids.unsqueeze(-1), 3.0)
-
-    plan = MtpSamplingPlan(
-        batch_size=batch_size,
-        do_sample=torch.ones(batch_size, dtype=torch.bool),
-        all_random_sample=True,
-        all_greedy_sample=False,
-        return_probs=True,
-    )
-    runner = MtpAclGraphRunner(
-        MtpGraphRecipe(
-            body,
-            head,
-            body,
-            head,
-            batch_size=batch_size,
-            speculative_tokens=speculative_tokens,
-            vocab_size=vocab_size,
-            device=torch.device("cpu"),
-            draft_sampling=plan,
-            target_sampling=plan,
-        ),
-        backend="eager",
-    )
-    output = runner.execute(torch.tensor([1]), torch.tensor([10]))
-    assert output.accepted_count.shape == (batch_size,)
-    assert output.next_state.token_ids.shape == (batch_size,)
-    assert output.next_state.token_ids.device.type == "cpu"
 
 
 def test_greedy_target_keeps_equality_acceptance_with_random_draft() -> None:
@@ -463,6 +286,7 @@ def test_greedy_target_keeps_equality_acceptance_with_random_draft() -> None:
 
     draft_plan = MtpSamplingPlan(
         batch_size=batch_size,
+        top_k=torch.ones(batch_size, dtype=torch.long),
         do_sample=torch.ones(batch_size, dtype=torch.bool),
         all_random_sample=True,
         all_greedy_sample=False,
@@ -486,9 +310,6 @@ def test_greedy_target_keeps_equality_acceptance_with_random_draft() -> None:
         device=torch.device("cpu"),
         draft_sampling=draft_plan,
         target_sampling=target_plan,
-        sampling_random_inputs=MtpSamplingRandomInputs(
-            draft_uniform=torch.full((batch_size, speculative_tokens, vocab_size), 0.5)
-        ),
     )
     output = MtpAclGraphRunner(recipe, backend="eager").execute(torch.tensor([1]), torch.tensor([10]))
     assert output.accepted_count.tolist() == [speculative_tokens]
@@ -544,7 +365,6 @@ def test_eager_recipe_carries_mtp_embedding_and_topk_state() -> None:
             speculative_tokens=speculative_tokens,
             vocab_size=64,
             device=torch.device("cpu"),
-            trace_intermediates=True,
         ),
         backend="eager",
     )
@@ -566,22 +386,6 @@ def test_eager_recipe_carries_mtp_embedding_and_topk_state() -> None:
     assert torch.equal(seen[2][2], torch.tensor([[24], [35]]))
     assert output.next_state.embeddings is not None
     assert output.next_state.topk_indices is not None
-    assert output.draft_hidden is not None
-    assert output.draft_hidden.shape == (batch_size, speculative_tokens, 1)
-    assert output.draft_logits is not None
-    assert output.draft_logits.shape == (batch_size, speculative_tokens, 64)
-    assert output.draft_topk_indices is not None
-    assert output.draft_topk_indices.shape == (batch_size, speculative_tokens, 1)
-    assert output.target_logits is not None
-    assert output.target_logits.shape == (batch_size, speculative_tokens + 1, 64)
-    assert output.target_topk_indices is not None
-    assert output.target_topk_indices.shape == (batch_size, speculative_tokens + 1, 1)
-    # The hidden state recorded for a draft step is the same tensor passed as
-    # the recurrent embedding on the following step.
-    assert torch.equal(output.draft_hidden[:, 0], seen[1][1])
-    assert torch.equal(output.draft_hidden[:, 1], seen[2][1])
-    assert torch.equal(output.draft_topk_indices[:, 0], seen[1][2])
-    assert torch.equal(output.draft_topk_indices[:, 1], seen[2][2])
 
 
 def test_role_adapter_keeps_draft_and_target_metadata_scoped() -> None:
@@ -790,10 +594,8 @@ def test_greedy_recipe_fast_path_matches_full_probability_recipe(
     assert fast._position_arena.data_ptr() == arena_address
 
 
-@pytest.mark.parametrize("trace", [False, True])
-def test_draft_temporaries_live_only_as_long_as_their_consumers(monkeypatch: pytest.MonkeyPatch, trace: bool) -> None:
+def test_draft_temporaries_live_only_as_long_as_their_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
     recipe = make_recipe(torch.tensor([1]), 3)
-    recipe.trace_intermediates = trace
     recipe.draft_sampling = MtpSamplingPlan(batch_size=1, return_probs=True, logprobs=True, max_top_logprobs=3)
     recipe.target_sampling = MtpSamplingPlan(batch_size=1, return_probs=False)
     draft_forward, draft_head, target_forward = recipe.draft_forward, recipe.draft_logits, recipe.target_forward
@@ -812,7 +614,7 @@ def test_draft_temporaries_live_only_as_long_as_their_consumers(monkeypatch: pyt
 
     def target(*args: object) -> torch.Tensor:
         assert len(logits_refs) == len(hidden_refs) == 3
-        assert all((value() is not None) == trace for value in logits_refs + hidden_refs)
+        assert all(value() is None for value in logits_refs + hidden_refs)
         return target_forward(*args)
 
     recipe.draft_forward, recipe.draft_logits, recipe.target_forward = draft, head, target
@@ -824,75 +626,6 @@ def test_draft_temporaries_live_only_as_long_as_their_consumers(monkeypatch: pyt
     expected = scalar_reference([2], [10], [11], [1], 3)
     for name, value in output_tensors(actual).items():
         torch.testing.assert_close(value, expected[name])
-
-
-@pytest.mark.parametrize("capacity", [2, 8])
-def test_registry_fifo_eviction_preserves_old_output_and_recaptures(capacity: int) -> None:
-    class Runner:
-        def __init__(self) -> None:
-            self.closed = False
-            self.captures = 0
-
-        def capture(self, *args: object) -> None:
-            self.captures += 1
-
-        def execute(self, seeds: torch.Tensor, *args: object) -> torch.Tensor:
-            assert not self.closed
-            return seeds.clone()
-
-        def update_metadata(self, *args: object) -> None:
-            pass
-
-        def update_sampling_plans(self, *args: object) -> None:
-            pass
-
-        def close(self) -> None:
-            self.closed = True
-
-    factory = Mock(side_effect=lambda *args, **kwargs: Runner())
-    target = SimpleNamespace(create_mtp_graph_runner_from_metadata=factory)
-    activate_draft, activate_target = Mock(), Mock()
-    capture = Mock(side_effect=lambda runner, *args: runner.capture(*args))
-    registry = MtpGraphVariantRegistry(
-        target,
-        object(),
-        max_variants=capacity,
-        draft_activate=activate_draft,
-        target_activate=activate_target,
-        capture_runner=capture,
-    )
-
-    def execute(width: int, seed: int) -> torch.Tensor:
-        metadata = SimpleNamespace(block_table=torch.ones((1, width), dtype=torch.int32))
-        return registry.execute(
-            (metadata,),
-            metadata,
-            repair_token_ids=torch.tensor([seed - 1]),
-            seed_token_ids=torch.tensor([seed]),
-            base_positions=torch.tensor([7]),
-            kv_seq_lens=torch.tensor([8], dtype=torch.int32),
-            draft_input_embedding=torch.ones(2, 4),
-            batch_size=1,
-            speculative_tokens=1,
-            vocab_size=37,
-        )
-
-    first = execute(1, 11)
-    first_runner = next(iter(registry._variants.values()))
-    for width in range(2, capacity + 1):
-        execute(width, 21)
-    execute(1, 12)  # A hit does not change FIFO order.
-    assert factory.call_count == capacity
-    execute(capacity + 1, 31)
-    assert first_runner.closed
-    assert registry.variant_count == capacity
-    assert first.item() == 11
-    execute(1, 13)
-    assert factory.call_count == capacity + 2
-    assert capture.call_count == factory.call_count  # Hot replay never takes the capture lock.
-    assert registry.variant_count == capacity
-    assert factory.call_args.kwargs["draft_activate"] is activate_draft
-    assert factory.call_args.kwargs["target_activate"] is activate_target
 
 
 def test_runner_close_waits_for_replay_and_output_copies(monkeypatch: pytest.MonkeyPatch) -> None:

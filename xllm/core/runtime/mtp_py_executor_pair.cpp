@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "core/runtime/mtp_py_executor_pair.h"
 
-#include <glog/logging.h>
 #include <torch/python.h>
 
 #include <utility>
@@ -30,8 +29,7 @@ namespace {
 
 MtpPyGraphOutput parse_graph_output(const py::object& output) {
   MtpPyGraphOutput result;
-  result.token_state =
-      tensor_from_python(py::getattr(output, "token_state", py::none()));
+  result.token_state = tensor_from_python(output.attr("token_state"));
   result.accepted_count = output.attr("accepted_count").cast<torch::Tensor>();
   result.committed_tokens =
       output.attr("committed_tokens").cast<torch::Tensor>();
@@ -83,34 +81,27 @@ MtpPyGraphOutput MtpPyGraphVariantRegistry::execute_sparse(
     bool return_probs,
     bool logprobs,
     int32_t max_top_logprobs) {
-  CHECK(registry_);
   py::gil_scoped_acquire gil;
-  try {
-    py::object output = execute_sparse_(block_table,
-                                        first_kv_seq_lens,
-                                        first_slots,
-                                        repair_token_ids,
-                                        seed_token_ids,
-                                        base_positions,
-                                        kv_seq_lens,
-                                        draft_input_embedding,
-                                        batch_size,
-                                        speculative_tokens,
-                                        vocab_size,
-                                        block_size,
-                                        target_step_major_layout,
-                                        return_probs,
-                                        logprobs,
-                                        max_top_logprobs);
-    MtpPyGraphOutput parsed = parse_graph_output(output);
-    parsed.draft_embedding_destination =
-        tensor_from_python(registry_.attr("draft_embedding_destination"));
-    return parsed;
-  } catch (const py::error_already_set& error) {
-    LOG(ERROR) << "MTP Python graph variant registry execution failed: "
-               << error.what();
-    throw;
-  }
+  py::object output = execute_sparse_(block_table,
+                                      first_kv_seq_lens,
+                                      first_slots,
+                                      repair_token_ids,
+                                      seed_token_ids,
+                                      base_positions,
+                                      kv_seq_lens,
+                                      draft_input_embedding,
+                                      batch_size,
+                                      speculative_tokens,
+                                      vocab_size,
+                                      block_size,
+                                      target_step_major_layout,
+                                      return_probs,
+                                      logprobs,
+                                      max_top_logprobs);
+  MtpPyGraphOutput parsed = parse_graph_output(output);
+  parsed.draft_embedding_destination =
+      tensor_from_python(registry_.attr("draft_embedding_destination"));
+  return parsed;
 }
 
 }  // namespace xllm::detail

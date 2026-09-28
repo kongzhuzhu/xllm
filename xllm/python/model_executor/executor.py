@@ -49,7 +49,6 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
-    MtpSamplingRandomInputs,
 )
 from xllm.python.model_executor.runners.mtp_sparse_metadata import (
     MtpSparseMetadataStorage,
@@ -66,36 +65,6 @@ def _resolve_graph_backend(config: dict) -> str:
         if current_platform.is_npu():
             return "aclgraph"
     return graph_backend
-
-
-def _build_mtp_sampling_random_inputs(
-    *,
-    device: torch.device,
-    batch_size: int,
-    speculative_tokens: int,
-    vocab_size: int,
-) -> MtpSamplingRandomInputs | None:
-    """Build deterministic Device draws for an explicitly requested oracle."""
-    if os.environ.get("XLLM_MTP_FIXED_RANDOM_INPUTS", "0") != "1":
-        return None
-
-    def ramp(shape: tuple[int, ...], start: float, end: float) -> torch.Tensor:
-        return torch.linspace(
-            start,
-            end,
-            steps=int(torch.tensor(shape).prod().item()),
-            dtype=torch.float32,
-            device=device,
-        ).reshape(shape)
-
-    return MtpSamplingRandomInputs(
-        draft_uniform=ramp((batch_size, speculative_tokens, vocab_size), 0.01, 0.99),
-        target_uniform=ramp((batch_size, speculative_tokens + 1, vocab_size), 0.99, 0.01),
-        acceptance_uniform=torch.full((batch_size, speculative_tokens), 0.25, dtype=torch.float32, device=device),
-        recovery_uniform=torch.full(
-            (batch_size, speculative_tokens, vocab_size), 0.5, dtype=torch.float32, device=device
-        ),
-    )
 
 
 def _validate_npu_cp_model_config(config: dict, num_decoding_tokens: int) -> None:
@@ -523,13 +492,6 @@ class ModelExecutor:
 
         draft_sampling_plan = coerce_sampling_plan(draft_sampling)
         target_sampling_plan = coerce_sampling_plan(target_sampling)
-        sampling_random_inputs = _build_mtp_sampling_random_inputs(
-            device=next(self.model.parameters()).device,
-            batch_size=batch_size,
-            speculative_tokens=speculative_tokens,
-            vocab_size=vocab_size,
-        )
-
         recipe = MtpGraphRecipe(
             draft_forward,
             draft_logits,
@@ -544,24 +506,12 @@ class ModelExecutor:
             target_activate=target_activate,
             draft_sampling=draft_sampling_plan,
             target_sampling=target_sampling_plan,
-            sampling_random_inputs=sampling_random_inputs,
             draft_greedy=getattr(draft_executor.model, "compute_greedy_tokens", None),
             target_greedy=getattr(self.model, "compute_greedy_tokens", None),
-            runtime_outputs_only=runtime_outputs_only
-            and os.environ.get("XLLM_MTP_KV_ORACLE", "0") != "1"
-            and os.environ.get("XLLM_MTP_STATE_ORACLE", "0") != "1",
+            runtime_outputs_only=runtime_outputs_only,
             position_storage=position_storage,
         )
-        kv_payload_oracle = None
-        if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1" or os.environ.get("XLLM_MTP_STATE_ORACLE", "0") == "1":
-            from xllm.python.model_executor.runners.mtp_kv_oracle import MtpKvPayloadOracle
-
-            if backend != "aclgraph" or prepare is not None:
-                raise ValueError("MTP KV oracle requires ACL graph role adapters without an external prepare hook")
-            kv_payload_oracle = MtpKvPayloadOracle(
-                recipe, draft_executor.eager_runner.layer_caches, self.eager_runner.layer_caches
-            )
-        return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare, kv_payload_oracle=kv_payload_oracle)
+        return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare)
 
     def create_mtp_graph_variant_registry(
         self,

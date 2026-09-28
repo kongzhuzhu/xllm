@@ -116,18 +116,6 @@ struct AcceptedTokenMetadata {
   torch::Tensor base_kv_seq_lens;
 };
 
-struct PhysicalKvCommitMetadata {
-  // All tensors use [batch, verify_width] layout, independent of the input
-  // row order used by the target backend.
-  torch::Tensor verify_positions;
-  torch::Tensor verify_slots;
-  torch::Tensor expected_slots;
-  torch::Tensor committed_slot_mask;
-  torch::Tensor rejected_slot_mask;
-  torch::Tensor next_write_slots;
-  torch::Tensor next_write_reuses_rejected_slot;
-};
-
 AcceptedTokenMetadata build_accepted_token_metadata(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& base_positions,
@@ -154,20 +142,5 @@ torch::Tensor make_repair_cache_positions(const AcceptedState& state);
 torch::Tensor map_positions_to_cache_slots(const torch::Tensor& block_tables,
                                            const torch::Tensor& positions,
                                            int32_t block_size);
-
-// Normalize target verify rows and validate the physical cache-slot contract.
-// A rejected suffix remains outside the committed mask; on rejection, the
-// next draft write must land on the first rejected slot before that slot can
-// participate in a later attention operation.
-PhysicalKvCommitMetadata build_physical_kv_commit_metadata(
-    const torch::Tensor& verify_positions,
-    const torch::Tensor& verify_slots,
-    const torch::Tensor& block_tables,
-    const torch::Tensor& accepted_count,
-    const torch::Tensor& base_positions,
-    int64_t batch_size,
-    int64_t verify_width,
-    int32_t block_size,
-    bool step_major_layout);
 
 }  // namespace xllm::mtp_async

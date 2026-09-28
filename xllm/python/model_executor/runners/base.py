@@ -87,14 +87,6 @@ class SpeculativeExecutionOutput:
     top_logprobs: torch.Tensor | None = None
     top_tokens: torch.Tensor | None = None
     target_probs: torch.Tensor | None = None
-    # Optional fixed-shape intermediate trace used by the MTP eager oracle.
-    # These remain ``None`` in the normal serving path to avoid retaining the
-    # full vocabulary logits for every draft step.
-    draft_hidden: torch.Tensor | None = None
-    draft_logits: torch.Tensor | None = None
-    draft_topk_indices: torch.Tensor | None = None
-    target_logits: torch.Tensor | None = None
-    target_topk_indices: torch.Tensor | None = None
 
 
 class BaseRunner(ABC):
