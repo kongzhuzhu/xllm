@@ -250,7 +250,6 @@ def test_sparse_mtp_page_crossing_updates_without_host_lengths_or_query_rebuild(
         ForwardContext,
         forward_context,
     )
-    from xllm.python.model_executor.runners.mtp_acl_graph import _metadata_signature
 
     backend = _mla_backend()
     cache = torch.empty(4, 128, 1, 512)
@@ -279,7 +278,10 @@ def test_sparse_mtp_page_crossing_updates_without_host_lengths_or_query_rebuild(
             assert backend._mla_actual_seq_kv.data_ptr() == metadata.kv_seq_lens.data_ptr()
         else:
             backend.prepare(metadata, graph_mode=True)
-        signature = _metadata_signature(metadata)
+        destinations = tuple(
+            (tensor.shape, tensor.dtype, tensor.device, tensor.data_ptr())
+            for tensor in (metadata.slot_mapping, metadata.block_table, metadata.kv_seq_lens)
+        )
         query_ptr = backend._mla_actual_seq_q.data_ptr()
         metadata.kv_seq_lens.fill_(129)
         metadata.slot_mapping.fill_(128)
@@ -292,7 +294,10 @@ def test_sparse_mtp_page_crossing_updates_without_host_lengths_or_query_rebuild(
             monkeypatch.setattr(torch.Tensor, "to", reject_readback)
         backend.update_graph_metadata(metadata)
     assert backend._causal_mask is None
-    assert _metadata_signature(metadata) == signature
+    assert destinations == tuple(
+        (tensor.shape, tensor.dtype, tensor.device, tensor.data_ptr())
+        for tensor in (metadata.slot_mapping, metadata.block_table, metadata.kv_seq_lens)
+    )
     assert backend._mla_actual_seq_q.data_ptr() == query_ptr
     assert backend._mla_actual_seq_q.tolist() == [1]
     assert backend._mla_actual_seq_kv.tolist() == [129]

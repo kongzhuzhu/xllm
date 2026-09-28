@@ -137,8 +137,7 @@ def test_penalty_padding_neither_penalizes_nor_overwrites_token_zero(with_length
     expanded = owned.expand_for_rows(4)
     assert sample_logits(logits.repeat_interleave(2, 0), expanded).tokens.tolist() == [0, 0, 1, 1]
     if with_lengths:
-        plan.unique_token_ids_lens.zero_()
-        owned.update_from(plan)
+        owned.unique_token_ids_lens.zero_()
         assert sample_logits(logits, owned).tokens.tolist() == [0, 0]
 
 

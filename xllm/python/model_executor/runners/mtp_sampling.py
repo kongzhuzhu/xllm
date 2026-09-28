@@ -213,62 +213,6 @@ class MtpSamplingPlan:
             max_top_logprobs=self.max_top_logprobs,
         )
 
-    def layout_signature(self) -> tuple[object, ...]:
-        def signature(value: torch.Tensor | None) -> tuple[object, ...] | None:
-            if value is None:
-                return None
-            return (tuple(value.shape), str(value.dtype), str(value.device))
-
-        return (
-            self.batch_size,
-            self.mode,
-            self.return_probs,
-            self.logprobs,
-            self.max_top_logprobs,
-            tuple(
-                signature(getattr(self, name))
-                for name in (
-                    "do_sample",
-                    "temperatures",
-                    "top_p",
-                    "top_k",
-                    "frequency_penalties",
-                    "presence_penalties",
-                    "repetition_penalties",
-                    "unique_token_ids",
-                    "unique_token_counts",
-                    "unique_token_ids_lens",
-                    "filter_mask",
-                    "filter_bitmask",
-                )
-            ),
-        )
-
-    def update_from(self, other: MtpSamplingPlan) -> None:
-        """Copy replay controls into stable graph-owned tensors."""
-        if self.batch_size != other.batch_size or self.layout_signature() != other.layout_signature():
-            raise RuntimeError("MTP sampling plan shape, mode, or output contract changed")
-
-        for name in (
-            "do_sample",
-            "temperatures",
-            "top_p",
-            "top_k",
-            "frequency_penalties",
-            "presence_penalties",
-            "repetition_penalties",
-            "unique_token_ids",
-            "unique_token_counts",
-            "unique_token_ids_lens",
-            "filter_mask",
-            "filter_bitmask",
-        ):
-            current = getattr(self, name)
-            incoming = getattr(other, name)
-            if current is not None:
-                assert incoming is not None
-                current.copy_(incoming)
-
 
 def coerce_sampling_plan(
     value: MtpSamplingPlan | Mapping[str, object] | None,

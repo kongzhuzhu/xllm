@@ -54,7 +54,6 @@ def test_sparse_registry_owns_final_destinations_and_reuses_capacity(monkeypatch
 
             self.recipe = SimpleNamespace(draft_forward=role(draft), target_forward=role(target))
             self.capture = Mock()
-            self.update_sampling_plans = Mock()
             self.closed = False
             self.draft_embedding_destination = None
 
@@ -114,13 +113,12 @@ def test_sparse_registry_owns_final_destinations_and_reuses_capacity(monkeypatch
     execute(65)
     assert runners[0].closed
     assert runners[1].closed
-    assert len(registry._sparse_bindings) == registry.variant_count == 1
+    assert registry.variant_count == 1
     assert first_output.item() == 3
     execute(1)
     assert len(runners) == 3
     assert factory.call_count == 12
     assert all(runner.capture.call_count == 1 for runner in runners)
-    assert all(runner.update_sampling_plans.call_count == 0 for runner in runners)
     assert not plans[-1][0].return_probs and not plans[-1][1].return_probs
     execute(1, logprobs=True, max_top_logprobs=3)
     assert len(runners) == 4

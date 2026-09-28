@@ -49,7 +49,6 @@ from xllm.python.model_executor.runners.base import (
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
-    coerce_sampling_plan,
     probabilistic_acceptance,
     sample_logits,
 )
@@ -137,73 +136,6 @@ def _pack_metadata_tensors(metadata_by_step: Sequence[object]) -> tuple[torch.Te
             offset += size
         arenas.append(arena)
     return tuple(arenas)
-
-
-def _tensor_signature(value: object) -> tuple[object, ...] | None:
-    if value is None:
-        return None
-    shape = getattr(value, "shape", None)
-    dtype = getattr(value, "dtype", None)
-    device = getattr(value, "device", None)
-    if shape is None or dtype is None or device is None:
-        return (type(value).__qualname__, repr(value))
-    return (tuple(shape), str(dtype), str(device))
-
-
-def _metadata_signature(metadata: AttentionMetadata) -> tuple[object, ...]:
-    fields = (
-        "slot_mapping",
-        "paged_kv_indptr",
-        "paged_kv_indices",
-        "paged_kv_last_page_len",
-        "q_cu_seq_lens",
-        "kv_cu_seq_lens",
-        "kv_seq_lens",
-        "q_seq_lens",
-        "block_table",
-    )
-    tensor_fields = tuple((name, _tensor_signature(getattr(metadata, name, None))) for name in fields)
-    host_fields = tuple(
-        (
-            name,
-            len(getattr(metadata, name, ())) if getattr(metadata, name, None) is not None else None,
-        )
-        for name in ("kv_seq_lens_host_values", "q_seq_lens_host")
-    )
-    tables = tuple(_tensor_signature(table) for table in getattr(metadata, "multi_block_tables", ()))
-    expanded = getattr(metadata, "expanded_decode_metadata", None)
-    expanded_fields = (
-        "kv_seq_lens",
-        "block_table",
-        "paged_kv_indptr",
-        "paged_kv_indices",
-        "paged_kv_last_page_len",
-        "paged_attention_tiling_data",
-        "kv_seq_lens_host",
-    )
-    expanded_signature = (
-        False,
-        (),
-        None,
-    )
-    if expanded is not None and bool(getattr(expanded, "enabled", False)):
-        expanded_signature = (
-            True,
-            tuple((name, _tensor_signature(getattr(expanded, name, None))) for name in expanded_fields),
-            len(getattr(expanded, "kv_seq_lens_host_values", ()))
-            if getattr(expanded, "kv_seq_lens_host_values", None) is not None
-            else None,
-        )
-    return (
-        bool(getattr(metadata, "is_prefill", False)),
-        bool(getattr(metadata, "is_chunked_prefill", False)),
-        bool(getattr(metadata, "is_mixed", False)),
-        bool(getattr(metadata, "is_spec_verify", False)),
-        tensor_fields,
-        host_fields,
-        tables,
-        expanded_signature,
-    )
 
 
 class MtpRoleAdapter:
@@ -326,29 +258,6 @@ class MtpRoleAdapter:
             if repair_token_ids.shape != self._repair_token_ids.shape:
                 raise RuntimeError("MTP repair-token shape changed after capture")
             self._repair_token_ids.copy_(repair_token_ids)
-
-    @torch.inference_mode()
-    def update_metadata(
-        self,
-        metadata_by_step: Sequence[AttentionMetadata],
-        repair_token_ids: torch.Tensor | None,
-    ) -> None:
-        """Copy a new invocation into the captured role's stable metadata."""
-        if not self._graph_prepared:
-            raise RuntimeError("MTP role metadata cannot update before graph warmup")
-        if len(metadata_by_step) != len(self._metadata_by_step):
-            raise RuntimeError("MTP role metadata step count changed")
-        self.update_repair_token_ids(repair_token_ids)
-        for old_metadata, new_metadata, backend in zip(
-            self._metadata_by_step,
-            metadata_by_step,
-            self._attention_backends,
-        ):
-            old_metadata.update_from(new_metadata)
-            update_backend = getattr(backend, "update_graph_metadata", None)
-            if update_backend is None:
-                raise RuntimeError("MTP graph attention backend does not support metadata replay updates")
-            update_backend(old_metadata)
 
     def __call__(
         self,
@@ -640,51 +549,6 @@ class MtpGraphRecipe(nn.Module):
             finish_warmup = getattr(forward, "finish_warmup", None)
             if finish_warmup is not None:
                 finish_warmup()
-
-    def can_update_sampling_plans(
-        self,
-        draft_sampling: MtpSamplingPlan | None,
-        target_sampling: MtpSamplingPlan | None,
-    ) -> bool:
-        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.batch_size)
-        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.batch_size)
-        if (self.draft_sampling is None) != (draft_sampling is None):
-            return False
-        if (self.target_sampling is None) != (target_sampling is None):
-            return False
-        if self.draft_sampling is None or self.target_sampling is None:
-            return True
-        assert draft_sampling is not None and target_sampling is not None
-        return (
-            self.draft_sampling.layout_signature() == draft_sampling.layout_signature()
-            and self.target_sampling.layout_signature() == target_sampling.layout_signature()
-        )
-
-    def update_sampling_plans(
-        self,
-        draft_sampling: MtpSamplingPlan | None,
-        target_sampling: MtpSamplingPlan | None,
-    ) -> None:
-        if not self.can_update_sampling_plans(draft_sampling, target_sampling):
-            raise RuntimeError("MTP sampling plan is incompatible with captured graph")
-        if self.draft_sampling is not None:
-            assert draft_sampling is not None and self.target_sampling is not None and target_sampling is not None
-            self.draft_sampling.update_from(draft_sampling)
-            self.target_sampling.update_from(target_sampling)
-
-    def update_metadata(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-        repair_token_ids: torch.Tensor,
-    ) -> None:
-        """Update both role metadata and the captured repair-token buffer."""
-        update_draft = getattr(self.draft_forward, "update_metadata", None)
-        update_target = getattr(self.target_forward, "update_metadata", None)
-        if update_draft is None or update_target is None:
-            raise RuntimeError("MTP graph recipe does not support metadata replay updates")
-        update_draft(draft_metadata, repair_token_ids)
-        update_target((target_metadata,), None)
 
     @torch.inference_mode()
     def forward(
@@ -1121,29 +985,6 @@ class MtpAclGraphRunner:
             target_top_tokens=clone(output.target_top_tokens),
         )
 
-    def update_metadata(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-        repair_token_ids: torch.Tensor,
-    ) -> None:
-        """Update role-local metadata before the next graph replay."""
-        if not self._captured:
-            raise RuntimeError("MTP ACL graph must be captured before metadata update")
-        self.recipe.update_metadata(draft_metadata, target_metadata, repair_token_ids)
-
-    def update_sampling_plans(
-        self,
-        draft_sampling: MtpSamplingPlan | None,
-        target_sampling: MtpSamplingPlan | None,
-    ) -> None:
-        """Copy request sampling controls into graph-owned stable buffers."""
-        if not self._captured:
-            raise RuntimeError("MTP ACL graph must be captured before sampling update")
-        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.recipe.batch_size)
-        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.recipe.batch_size)
-        self.recipe.update_sampling_plans(draft_sampling, target_sampling)
-
     def capture(
         self,
         seed_token_ids: torch.Tensor,
@@ -1273,14 +1114,17 @@ class MtpAclGraphRunner:
             task.event.record(stream)
 
 
+@dataclass
+class _SparseVariant:
+    runner: MtpAclGraphRunner
+    binding: MtpSparseMetadataBinding
+
+
 class MtpGraphVariantRegistry:
     """Own captured MTP recipes and their FIFO lifetime in Python.
 
-    The C++ worker only supplies metadata, input tensors, and sampling
-    controls.  Compatibility checks, capture, replay updates, and bounded
-    eviction stay with the Python objects that own the recipe and its graph
-    addresses.  Entries are intentionally FIFO: reusing an entry does not
-    change its eviction order, which keeps graph lifetime deterministic.
+    The C++ worker supplies sparse inputs and output options. Each FIFO entry
+    owns both its graph runner and the final metadata binding used by replay.
     """
 
     def __init__(
@@ -1307,8 +1151,7 @@ class MtpGraphVariantRegistry:
         self._capture_runner = capture_runner
         self._draft_metadata_factory = draft_metadata_factory
         self._target_metadata_factory = target_metadata_factory
-        self._variants: dict[tuple[object, ...], MtpAclGraphRunner] = {}
-        self._sparse_bindings: dict[tuple[object, ...], MtpSparseMetadataBinding] = {}
+        self._variants: dict[tuple[object, ...], _SparseVariant] = {}
         self.draft_embedding_destination: torch.Tensor | None = None
 
     @property
@@ -1324,9 +1167,8 @@ class MtpGraphVariantRegistry:
             self._retire_variant(oldest_key)
 
     def _retire_variant(self, key: tuple[object, ...]) -> None:
-        self._variants[key].close()
+        self._variants[key].runner.close()
         del self._variants[key]
-        self._sparse_bindings.pop(key, None)
 
     @torch.inference_mode()
     def execute_sparse(
@@ -1371,14 +1213,14 @@ class MtpGraphVariantRegistry:
             logprobs,
             max_top_logprobs,
         )
-        variant = self._variants.get(key)
-        if variant is not None and self._sparse_bindings[key].table_capacity < capacity:
+        entry = self._variants.get(key)
+        if entry is not None and entry.binding.table_capacity < capacity:
             # A single capacity per batch/output contract: grow before capture,
             # reuse it on shrink, and clear unused columns in the fused update.
             # Retirement waits for replay/snapshot consumers before allocation.
             self._retire_variant(key)
-            variant = None
-        if variant is None:
+            entry = None
+        if entry is None:
             self._evict_if_full()
             draft_factory = self._draft_metadata_factory
             target_factory = self._target_metadata_factory
@@ -1442,10 +1284,10 @@ class MtpGraphVariantRegistry:
                 self._capture_runner(variant, *inputs)
             draft_role.require_direct_metadata_update()
             target_role.require_direct_metadata_update()
-            self._variants[key] = variant
-            self._sparse_bindings[key] = binding
+            self._variants[key] = _SparseVariant(variant, binding)
         else:
-            self._sparse_bindings[key].update(block_table, base_positions, kv_seq_lens, first_kv_seq_lens, first_slots)
+            entry.binding.update(block_table, base_positions, kv_seq_lens, first_kv_seq_lens, first_slots)
+            variant = entry.runner
             variant.recipe.draft_forward.update_repair_token_ids(repair_token_ids)
             logger.debug("MTP Python graph variant replay: count=%d", len(self._variants))
         output = variant.execute(seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding)
@@ -1454,97 +1296,3 @@ class MtpGraphVariantRegistry:
         # and publishes its replacement destination after execution.
         self.draft_embedding_destination = variant.draft_embedding_destination
         return output
-
-    def execute(
-        self,
-        draft_metadata: Sequence[object],
-        target_metadata: object,
-        *,
-        repair_token_ids: torch.Tensor,
-        seed_token_ids: torch.Tensor,
-        base_positions: torch.Tensor,
-        kv_seq_lens: torch.Tensor,
-        draft_input_embedding: torch.Tensor,
-        draft_topk_indices: torch.Tensor | None = None,
-        batch_size: int,
-        speculative_tokens: int,
-        vocab_size: int,
-        target_step_major_layout: bool = False,
-        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
-        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
-    ) -> SpeculativeExecutionOutput | SpeculativeRuntimeOutput:
-        draft_sampling_plan = coerce_sampling_plan(draft_sampling, batch_size=batch_size)
-        target_sampling_plan = coerce_sampling_plan(target_sampling, batch_size=batch_size)
-        metadata_by_step = tuple(draft_metadata)
-        key = (
-            batch_size,
-            speculative_tokens,
-            vocab_size,
-            target_step_major_layout,
-            tuple(_metadata_signature(metadata) for metadata in metadata_by_step),
-            _metadata_signature(target_metadata),
-            tuple(
-                _tensor_signature(value)
-                for value in (
-                    repair_token_ids,
-                    seed_token_ids,
-                    base_positions,
-                    kv_seq_lens,
-                    draft_input_embedding,
-                    draft_topk_indices,
-                )
-            ),
-            None if draft_sampling_plan is None else draft_sampling_plan.layout_signature(),
-            None if target_sampling_plan is None else target_sampling_plan.layout_signature(),
-        )
-        variant = self._variants.get(key)
-        if variant is not None:
-            # update_* owns validation. Preflighting again here repeats the
-            # same metadata/signature walks on every hot replay.
-            variant.update_metadata(metadata_by_step, target_metadata, repair_token_ids)
-            variant.update_sampling_plans(draft_sampling_plan, target_sampling_plan)
-            logger.debug("MTP Python graph variant replay: count=%d", len(self._variants))
-            return variant.execute(
-                seed_token_ids,
-                base_positions,
-                kv_seq_lens,
-                draft_input_embedding,
-                draft_topk_indices,
-            )
-
-        self._evict_if_full()
-        logger.info("MTP Python graph variant capture: index=%d", len(self._variants))
-        variant = self._target_executor.create_mtp_graph_runner_from_metadata(
-            self._draft_executor,
-            metadata_by_step,
-            target_metadata,
-            repair_token_ids=repair_token_ids,
-            batch_size=batch_size,
-            speculative_tokens=speculative_tokens,
-            vocab_size=vocab_size,
-            kv_seq_lens=kv_seq_lens,
-            target_step_major_layout=target_step_major_layout,
-            draft_activate=self._draft_activate,
-            target_activate=self._target_activate,
-            draft_sampling=draft_sampling_plan,
-            target_sampling=target_sampling_plan,
-            runtime_outputs_only=True,
-        )
-        capture = (
-            variant.capture if self._capture_runner is None else lambda *args: self._capture_runner(variant, *args)
-        )
-        capture(
-            seed_token_ids,
-            base_positions,
-            kv_seq_lens,
-            draft_input_embedding,
-            draft_topk_indices,
-        )
-        self._variants[key] = variant
-        return variant.execute(
-            seed_token_ids,
-            base_positions,
-            kv_seq_lens,
-            draft_input_embedding,
-            draft_topk_indices,
-        )

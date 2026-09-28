@@ -49,6 +49,7 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
+    coerce_sampling_plan,
 )
 from xllm.python.model_executor.runners.mtp_sparse_metadata import (
     MtpSparseMetadataStorage,
@@ -483,15 +484,8 @@ class ModelExecutor:
         def target_logits(hidden: torch.Tensor) -> torch.Tensor:
             return self.model.compute_logits(hidden, None)
 
-        def coerce_sampling_plan(
-            value: MtpSamplingPlan | dict[str, object] | None,
-        ) -> MtpSamplingPlan | None:
-            if value is None or isinstance(value, MtpSamplingPlan):
-                return value
-            return MtpSamplingPlan.from_mapping(value, batch_size=batch_size)
-
-        draft_sampling_plan = coerce_sampling_plan(draft_sampling)
-        target_sampling_plan = coerce_sampling_plan(target_sampling)
+        draft_sampling_plan = coerce_sampling_plan(draft_sampling, batch_size=batch_size)
+        target_sampling_plan = coerce_sampling_plan(target_sampling, batch_size=batch_size)
         recipe = MtpGraphRecipe(
             draft_forward,
             draft_logits,
@@ -526,9 +520,8 @@ class ModelExecutor:
     ) -> MtpGraphVariantRegistry:
         """Create the Python owner for bounded MTP graph variants.
 
-        The registry keeps recipe construction, capture, compatibility
-        updates, and FIFO eviction in Python so the C++ worker remains an
-        input/output bridge.
+        The registry keeps sparse recipe construction, capture, fused replay
+        updates, and FIFO eviction in Python.
         """
         if not isinstance(draft_executor, ModelExecutor):
             raise TypeError("draft_executor must be a ModelExecutor")
