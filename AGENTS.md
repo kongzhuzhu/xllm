@@ -41,6 +41,26 @@
 * If [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md) specifies a rule, that rule takes precedence over the Google C++/Python Style Guide.
 * Use the Google C++/Python Style Guide only for cases not specified in [custom-code-style.md](.agents/skills/code-review/references/custom-code-style.md).
 
+## Remote NPU Build and Test Host
+
+* For this Python Unified MTP work, launch 16 ranks/devices with `--nnodes=16`. Pass only `--dp_size=1 --ep_size=1` as parallel topology options. Do not pass `--tp_size`, use EP16, or copy historical EP16 launch templates. This is the user-mandated configuration.
+
+* For work that compiles or runs xLLM on hosts 27 or 198, use the
+  `jindou-xllm-npu` Docker container. The host Python environment is not the
+  supported build environment.
+* Before any NPU run, inspect `docker top jindou-xllm-npu` and
+  `docker exec jindou-xllm-npu npu-smi info`. Do not stop or signal processes
+  belonging to another run; only clean a process group that this task started
+  and recorded.
+* Run builds from the container's source/build tree with `python setup.py
+  build`. Keep service launch, logs, and request artifacts under a task-specific
+  run directory so later comparisons can identify the exact binary and flags.
+* Do not add a `MAX_JOBS` override to build commands; use the repository's
+  default parallelism.
+* The user-mandated build command is exactly `python setup.py build` inside
+  `jindou-xllm-npu`. Do not substitute `--dev`, direct `cmake`, or
+  `bdist_wheel` for this build workflow.
+
 ## Review Instructions
 
 * For code review tasks, you **MUST** first read [code-review/SKILL.md](.agents/skills/code-review/SKILL.md).

@@ -20,8 +20,6 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
-#include <string>
-#include <vector>
 
 namespace xllm {
 
@@ -30,15 +28,11 @@ class PyExecutorImpl;
 namespace detail {
 
 struct MtpPyGraphOutput {
-  torch::Tensor accepted_ids;
-  torch::Tensor accepted_mask;
+  // Borrowed final graph input, not an output snapshot or API field.
+  torch::Tensor draft_embedding_destination;
+  torch::Tensor token_state;
   torch::Tensor accepted_count;
   torch::Tensor committed_tokens;
-  torch::Tensor next_token_ids;
-  torch::Tensor next_positions;
-  torch::Tensor next_kv_seq_lens;
-  torch::Tensor next_embeddings;
-  torch::Tensor next_topk_indices;
   torch::Tensor target_embeddings;
   torch::Tensor target_probs;
   torch::Tensor committed_log_probs;
@@ -46,59 +40,37 @@ struct MtpPyGraphOutput {
   torch::Tensor target_top_tokens;
 };
 
-class __attribute__((visibility("hidden"))) MtpPyExecutorPair final {
+class __attribute__((visibility("hidden"))) MtpPyGraphVariantRegistry final {
  public:
-  static std::unique_ptr<MtpPyExecutorPair> create(
+  static std::unique_ptr<MtpPyGraphVariantRegistry> create(
       PyExecutorImpl& target_executor,
       PyExecutorImpl& draft_executor,
-      const std::vector<pybind11::object>& draft_metadata,
-      const pybind11::object& target_metadata,
-      const torch::Tensor& repair_token_ids,
-      const torch::Tensor& kv_seq_lens,
-      int32_t batch_size,
-      int32_t speculative_tokens,
-      int64_t vocab_size,
-      const pybind11::object& draft_sampling_plan,
-      const pybind11::object& target_sampling_plan,
-      bool target_step_major_layout);
+      int32_t max_variants);
 
-  ~MtpPyExecutorPair();
+  ~MtpPyGraphVariantRegistry();
 
-  MtpPyGraphOutput capture_and_execute(
-      const torch::Tensor& seed_token_ids,
-      const torch::Tensor& base_positions,
-      const torch::Tensor& kv_seq_lens,
-      const torch::Tensor& draft_input_embedding,
-      const torch::Tensor& draft_topk_indices = torch::Tensor());
-
-  bool can_update_metadata(const std::vector<pybind11::object>& draft_metadata,
-                           const pybind11::object& target_metadata) const;
-
-  bool can_update_sampling_plans(
-      const pybind11::object& draft_sampling_plan,
-      const pybind11::object& target_sampling_plan) const;
-
-  std::string metadata_key(const std::vector<pybind11::object>& draft_metadata,
-                           const pybind11::object& target_metadata,
-                           const pybind11::object& draft_sampling_plan,
-                           const pybind11::object& target_sampling_plan) const;
-
-  MtpPyGraphOutput update_and_execute(
-      const std::vector<pybind11::object>& draft_metadata,
-      const pybind11::object& target_metadata,
-      const torch::Tensor& repair_token_ids,
-      const torch::Tensor& seed_token_ids,
-      const torch::Tensor& base_positions,
-      const torch::Tensor& kv_seq_lens,
-      const torch::Tensor& draft_input_embedding,
-      const torch::Tensor& draft_topk_indices,
-      const pybind11::object& draft_sampling_plan,
-      const pybind11::object& target_sampling_plan);
+  MtpPyGraphOutput execute_sparse(const torch::Tensor& block_table,
+                                  const torch::Tensor& first_kv_seq_lens,
+                                  const torch::Tensor& first_slots,
+                                  const torch::Tensor& repair_token_ids,
+                                  const torch::Tensor& seed_token_ids,
+                                  const torch::Tensor& base_positions,
+                                  const torch::Tensor& kv_seq_lens,
+                                  const torch::Tensor& draft_input_embedding,
+                                  int32_t batch_size,
+                                  int32_t speculative_tokens,
+                                  int64_t vocab_size,
+                                  int32_t block_size,
+                                  bool target_step_major_layout,
+                                  bool return_probs,
+                                  bool logprobs,
+                                  int32_t max_top_logprobs);
 
  private:
-  explicit MtpPyExecutorPair(pybind11::object runner);
+  explicit MtpPyGraphVariantRegistry(pybind11::object registry);
 
-  pybind11::object runner_;
+  pybind11::object registry_;
+  pybind11::object execute_sparse_;
 };
 
 }  // namespace detail

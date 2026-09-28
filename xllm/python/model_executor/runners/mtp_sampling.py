@@ -44,6 +44,7 @@ class MtpSamplingPlan:
     repetition_penalties: torch.Tensor | None = None
     unique_token_ids: torch.Tensor | None = None
     unique_token_counts: torch.Tensor | None = None
+    unique_token_ids_lens: torch.Tensor | None = None
     filter_mask: torch.Tensor | None = None
     filter_bitmask: torch.Tensor | None = None
     all_random_sample: bool = False
@@ -67,6 +68,7 @@ class MtpSamplingPlan:
                 "repetition_penalties",
                 "unique_token_ids",
                 "unique_token_counts",
+                "unique_token_ids_lens",
                 "filter_mask",
                 "filter_bitmask",
             )
@@ -104,6 +106,8 @@ class MtpSamplingPlan:
                 raise ValueError(f"{name} must have one row per MTP request")
             if value is not None and name not in ("filter_mask", "filter_bitmask") and value.ndim != 1:
                 raise ValueError(f"{name} must be a vector")
+        if self.unique_token_ids_lens is not None and self.unique_token_ids_lens.shape != (self.batch_size,):
+            raise ValueError("unique token lengths must have one value per request")
         if (self.unique_token_ids is None) != (self.unique_token_counts is None):
             raise ValueError("unique token ids and counts must be provided together")
         if self.unique_token_ids is not None:
@@ -117,6 +121,23 @@ class MtpSamplingPlan:
             value = getattr(self, name)
             if value is not None and value.ndim != 2:
                 raise ValueError(f"{name} must be a matrix")
+
+    @property
+    def plain_greedy(self) -> bool:
+        """Whether logits need no request-specific distribution transforms."""
+        return self.all_greedy_sample and all(
+            value is None
+            for value in (
+                self.temperatures,
+                self.top_k,
+                self.top_p,
+                self.frequency_penalties,
+                self.presence_penalties,
+                self.repetition_penalties,
+                self.filter_mask,
+                self.filter_bitmask,
+            )
+        )
 
     @property
     def mode(self) -> str:
@@ -155,6 +176,7 @@ class MtpSamplingPlan:
             repetition_penalties=repeat(self.repetition_penalties),
             unique_token_ids=repeat(self.unique_token_ids),
             unique_token_counts=repeat(self.unique_token_counts),
+            unique_token_ids_lens=repeat(self.unique_token_ids_lens),
             filter_mask=repeat(self.filter_mask),
             filter_bitmask=repeat(self.filter_bitmask),
             all_random_sample=self.all_random_sample,
@@ -181,6 +203,7 @@ class MtpSamplingPlan:
             repetition_penalties=clone(self.repetition_penalties),
             unique_token_ids=clone(self.unique_token_ids),
             unique_token_counts=clone(self.unique_token_counts),
+            unique_token_ids_lens=clone(self.unique_token_ids_lens),
             filter_mask=clone(self.filter_mask),
             filter_bitmask=clone(self.filter_bitmask),
             all_random_sample=self.all_random_sample,
@@ -214,6 +237,7 @@ class MtpSamplingPlan:
                     "repetition_penalties",
                     "unique_token_ids",
                     "unique_token_counts",
+                    "unique_token_ids_lens",
                     "filter_mask",
                     "filter_bitmask",
                 )
@@ -235,6 +259,7 @@ class MtpSamplingPlan:
             "repetition_penalties",
             "unique_token_ids",
             "unique_token_counts",
+            "unique_token_ids_lens",
             "filter_mask",
             "filter_bitmask",
         ):
@@ -325,8 +350,8 @@ def coerce_sampling_plan(
 @dataclass(frozen=True)
 class MtpSampledLogits:
     tokens: torch.Tensor
-    probs: torch.Tensor
-    log_probs: torch.Tensor
+    probs: torch.Tensor | None
+    log_probs: torch.Tensor | None
 
 
 def _apply_penalties(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
@@ -334,22 +359,30 @@ def _apply_penalties(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tenso
         return logits
     ids = plan.unique_token_ids.to(device=logits.device, dtype=torch.long)
     counts = plan.unique_token_counts.to(device=logits.device, dtype=logits.dtype)
-    scores = logits.gather(dim=-1, index=ids)
+    valid = counts > 0
+    if plan.unique_token_ids_lens is not None:
+        lengths = plan.unique_token_ids_lens.to(device=logits.device)
+        valid = valid & (torch.arange(ids.shape[1], device=logits.device) < lengths.unsqueeze(-1))
+    # Padding may repeat a real token (usually zero). A masked scatter of
+    # scores would still overwrite that real token with the padding value.
+    # Scatter additive deltas instead: invalid entries contribute exactly zero.
+    ids = torch.where(valid, ids, 0)
+    original = logits.gather(dim=-1, index=ids)
+    scores = original
     if plan.frequency_penalties is not None:
         penalties = plan.frequency_penalties.to(device=logits.device, dtype=logits.dtype)
         scores = scores - counts * penalties.unsqueeze(-1)
     if plan.presence_penalties is not None:
         penalties = plan.presence_penalties.to(device=logits.device, dtype=logits.dtype)
-        scores = scores - (counts > 0).to(logits.dtype) * penalties.unsqueeze(-1)
-    if plan.frequency_penalties is not None or plan.presence_penalties is not None:
-        logits = logits.scatter(dim=-1, index=ids, src=scores.to(logits.dtype))
+        scores = scores - valid.to(logits.dtype) * penalties.unsqueeze(-1)
     if plan.repetition_penalties is not None:
         penalties = plan.repetition_penalties.to(device=logits.device, dtype=logits.dtype)
-        scores = logits.gather(dim=-1, index=ids)
         penalties = penalties.unsqueeze(-1).clamp_min(torch.finfo(logits.dtype).tiny)
         scores = torch.where(scores < 0, scores * penalties, scores / penalties)
-        logits = logits.scatter(dim=-1, index=ids, src=scores.to(logits.dtype))
-    return logits
+    # Infinite logits remain infinite under finite penalties; subtracting
+    # them would otherwise introduce NaNs into the additive update.
+    delta = torch.where(valid & torch.isfinite(original), scores - original, 0)
+    return logits.scatter_add(dim=-1, index=ids, src=delta)
 
 
 def _apply_filter(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
@@ -368,11 +401,16 @@ def _apply_filter(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
     return logits
 
 
-def _apply_top_k_top_p(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
+def _apply_temperature(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
     if plan.temperatures is not None:
         temperatures = plan.temperatures.to(device=logits.device, dtype=logits.dtype)
         temperatures = torch.where(temperatures == 0, torch.ones_like(temperatures), temperatures)
         logits = logits / temperatures.unsqueeze(-1)
+    return logits
+
+
+def _apply_top_k_top_p(logits: torch.Tensor, plan: MtpSamplingPlan) -> torch.Tensor:
+    logits = _apply_temperature(logits, plan)
     if plan.top_k is None and plan.top_p is None:
         return logits
 
@@ -414,17 +452,38 @@ def _tp_consensus(value: torch.Tensor) -> torch.Tensor:
 
 
 def sample_logits(
-    logits: torch.Tensor, plan: MtpSamplingPlan, *, uniform: torch.Tensor | None = None
+    logits: torch.Tensor,
+    plan: MtpSamplingPlan,
+    *,
+    uniform: torch.Tensor | None = None,
+    require_probs: bool = False,
 ) -> MtpSampledLogits:
     """Apply all fixed-shape sampling controls and sample on Device."""
     if logits.ndim != 2 or logits.shape[0] != plan.batch_size:
         raise ValueError("sampling logits must have shape [plan.batch_size, vocab]")
+    needs_probs = require_probs or plan.return_probs or not plan.all_greedy_sample
+    needs_log_probs = needs_probs or plan.logprobs or plan.max_top_logprobs > 0
+    if (
+        not needs_log_probs
+        and plan.unique_token_ids is None
+        and plan.filter_mask is None
+        and plan.filter_bitmask is None
+        and plan.temperatures is None
+    ):
+        # Plain greedy preserves the logits' ordering and needs no FP32
+        # vocabulary-sized temporary. This is the production v1 contract.
+        return MtpSampledLogits(tokens=logits.argmax(dim=-1), probs=None, log_probs=None)
     processed = logits.to(torch.float32)
     processed = _apply_penalties(processed, plan)
     processed = _apply_filter(processed, plan)
+    if not needs_log_probs:
+        # Top-k/top-p retain the maximum. Without a requested distribution,
+        # greedy sampling needs neither a vocabulary sort nor normalization.
+        tokens = _apply_temperature(processed, plan).argmax(dim=-1)
+        return MtpSampledLogits(tokens=tokens, probs=None, log_probs=None)
     processed = _apply_top_k_top_p(processed, plan)
     log_probs = torch.log_softmax(processed, dim=-1)
-    probs = log_probs.exp()
+    probs = log_probs.exp() if needs_probs else None
     greedy_tokens = processed.argmax(dim=-1)
     if plan.all_greedy_sample:
         tokens = greedy_tokens

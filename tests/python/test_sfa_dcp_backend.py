@@ -51,6 +51,44 @@ def _cpu_context(execution_state: AclGraphExecutionState) -> ForwardContext:
     )
 
 
+def test_execute_mla_accepts_fused_preprocessed_cache() -> None:
+    backend = object.__new__(SfaDcpAttentionBackend)
+    backend._impl = MagicMock()
+    backend._kv_layout = object()
+    backend._sfa_metadata = SimpleNamespace(dcp_context=SimpleNamespace(gather_context=None))
+    backend._mla_actual_seq_q = torch.tensor([1], dtype=torch.int32)
+    backend._mla_actual_seq_kv = torch.tensor([8], dtype=torch.int32)
+    expected = torch.ones((1, 1, 1), dtype=torch.bfloat16)
+    backend._impl._execute_sparse_flash_attention_process.return_value = expected
+    layer = SimpleNamespace(layer_id=0)
+    context = ForwardContext(
+        attention_backend=MagicMock(),
+        device=torch.device("cpu"),
+        metadata=MagicMock(),
+        layer_caches=[
+            LayerCache(
+                key=torch.empty(4, 128, 1, 512),
+                value=torch.empty(4, 128, 1, 64),
+            )
+        ],
+        execution_state=AclGraphExecutionState({}),
+    )
+
+    with forward_context(context):
+        output = backend.execute_mla(
+            torch.ones((1, 1, 1), dtype=torch.bfloat16),
+            torch.ones((1, 1, 1), dtype=torch.bfloat16),
+            None,
+            None,
+            layer,
+            topk=torch.zeros((1, 1), dtype=torch.int32),
+            cache_is_preprocessed=True,
+        )
+
+    assert output is expected
+    backend._impl._store_parallel_kv.assert_called_once()
+
+
 def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes() -> None:
     backend = SfaDcpAttentionBackend(
         num_heads=8,
@@ -102,7 +140,8 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes() -> None:
 
 
 @pytest.mark.parametrize("first_kv_len", [3, 511])
-def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
+@pytest.mark.parametrize("owned_metadata", [False, True])
+def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int, owned_metadata: bool) -> None:
     backend = SfaDcpAttentionBackend(
         num_heads=8,
         num_kv_heads=1,
@@ -164,7 +203,10 @@ def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
     )
 
     with forward_context(_cpu_context(AclGraphExecutionState({}))):
-        backend.prepare(metadata, graph_mode=True)
+        if owned_metadata:
+            backend.prepare_owned_graph_metadata(metadata)
+        else:
+            backend.prepare(metadata, graph_mode=True)
 
     assert captured["num_reqs"] == 4
     assert captured["num_input_tokens"] == 4

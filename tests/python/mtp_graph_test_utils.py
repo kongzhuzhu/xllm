@@ -20,11 +20,18 @@ import torch
 
 from xllm.python.model_executor.runners.base import SpeculativeExecutionOutput
 from xllm.python.model_executor.runners.mtp_acl_graph import MtpGraphRecipe
+from xllm.python.model_executor.runners.mtp_sparse_metadata import MtpSparsePositionStorage
 
 VOCAB_SIZE = 37
 
 
-def make_recipe(rejection_steps: torch.Tensor, speculative_tokens: int) -> MtpGraphRecipe:
+def make_recipe(
+    rejection_steps: torch.Tensor,
+    speculative_tokens: int,
+    *,
+    logits_dtype: torch.dtype = torch.float32,
+    position_storage: MtpSparsePositionStorage | None = None,
+) -> MtpGraphRecipe:
     """Inject one mismatch per row; later draft/target tokens match again."""
     batch_size = rejection_steps.numel()
 
@@ -36,7 +43,7 @@ def make_recipe(rejection_steps: torch.Tensor, speculative_tokens: int) -> MtpGr
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         del step, input_embedding, topk_indices
-        return (ids + positions + 1).remainder(VOCAB_SIZE).unsqueeze(-1)
+        return (ids + positions + 1).remainder(VOCAB_SIZE).unsqueeze(-1).float()
 
     def target_body(
         ids: torch.Tensor,
@@ -49,11 +56,14 @@ def make_recipe(rejection_steps: torch.Tensor, speculative_tokens: int) -> MtpGr
         next_ids = (ids + positions + 1).reshape(batch_size, speculative_tokens + 1)
         offsets = torch.arange(speculative_tokens + 1, device=ids.device)
         mismatch = offsets.unsqueeze(0).eq(rejection_steps.unsqueeze(1)) & offsets.lt(speculative_tokens)
-        return (next_ids + mismatch.to(torch.long)).remainder(VOCAB_SIZE).reshape(-1, 1)
+        return (next_ids + mismatch.to(torch.long)).remainder(VOCAB_SIZE).reshape(-1, 1).float()
 
     def head(hidden: torch.Tensor) -> torch.Tensor:
-        logits = torch.full((hidden.shape[0], VOCAB_SIZE), -100.0, device=hidden.device)
-        return logits.scatter_(1, hidden, 1.0)
+        # Distinct scores keep top-k deterministic and logprobs nontrivial;
+        # the maximum still selects exactly the scalar oracle's hidden ID.
+        offsets = torch.arange(VOCAB_SIZE, device=hidden.device)
+        distances = (offsets.unsqueeze(0) - hidden).remainder(VOCAB_SIZE)
+        return (-distances.to(torch.float32) / 16).to(logits_dtype)
 
     return MtpGraphRecipe(
         draft_body,
@@ -65,6 +75,7 @@ def make_recipe(rejection_steps: torch.Tensor, speculative_tokens: int) -> MtpGr
         vocab_size=VOCAB_SIZE,
         device=rejection_steps.device,
         kv_seq_lens=torch.zeros(batch_size, dtype=torch.int32, device=rejection_steps.device),
+        position_storage=position_storage,
     )
 
 

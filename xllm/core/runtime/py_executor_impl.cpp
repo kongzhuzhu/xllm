@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/python.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -37,6 +38,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include "platform/npu/device_capture_lock.h"
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
@@ -182,54 +184,64 @@ py::object PyExecutorImpl::attention_metadata_view(
   return py::cast(PyAttentionMetadataView(attn_metadata, params));
 }
 
-py::object PyExecutorImpl::create_mtp_graph_runner(
-    PyExecutorImpl& draft_executor,
-    const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata,
-    const torch::Tensor& repair_token_ids,
+py::object PyExecutorImpl::mtp_sparse_attention_metadata_view(
+    const torch::Tensor& block_table,
     const torch::Tensor& kv_seq_lens,
-    int32_t batch_size,
-    int32_t speculative_tokens,
-    int64_t vocab_size,
-    const py::object& draft_sampling_plan,
-    const py::object& target_sampling_plan,
-    bool target_step_major_layout) {
-  CHECK(!draft_metadata.empty())
-      << "MTP graph requires draft metadata for every fixed K step";
-  CHECK_GT(batch_size, 0) << "MTP graph batch size must be positive";
-  CHECK_GT(speculative_tokens, 0)
-      << "MTP graph speculative token count must be positive";
-  CHECK_GT(vocab_size, 0) << "MTP graph vocabulary size must be positive";
+    const torch::Tensor& slots) const {
+  auto metadata = std::make_shared<layer::AttentionMetadata>(
+      layer::AttentionMetadataBuilder::build_mtp_sparse_decode(
+          block_table, kv_seq_lens, slots, options_.block_size()));
+  ModelInputParams params;
+  const int32_t rows = static_cast<int32_t>(kv_seq_lens.numel());
+  params.parallel.dp_global_token_nums = {rows};
+  params.parallel.dp_global_sequence_nums = {rows};
+  params.parallel.dp_is_decode = {true};
+  return py::cast(PyAttentionMetadataView(std::move(metadata), params));
+}
 
+py::object PyExecutorImpl::create_mtp_graph_variant_registry(
+    PyExecutorImpl& draft_executor,
+    int32_t max_variants) {
   py::gil_scoped_acquire gil;
-  py::list draft_metadata_list;
-  for (const py::object& metadata : draft_metadata) {
-    draft_metadata_list.append(metadata);
-  }
-
   py::cpp_function draft_activate = py::cpp_function([&draft_executor]() {
     active_py_causal_lm = draft_executor.py_causal_lm_;
   });
   py::cpp_function target_activate =
       py::cpp_function([this]() { active_py_causal_lm = py_causal_lm_; });
-  LOG(INFO) << "MTP Python pair graph runner begin";
-  py::object runner =
-      py_executor_.attr("create_mtp_graph_runner_from_metadata")(
-          draft_executor.py_executor_,
-          draft_metadata_list,
-          target_metadata,
-          py::arg("repair_token_ids") = repair_token_ids,
-          py::arg("batch_size") = batch_size,
-          py::arg("speculative_tokens") = speculative_tokens,
-          py::arg("vocab_size") = vocab_size,
-          py::arg("kv_seq_lens") = kv_seq_lens,
-          py::arg("target_step_major_layout") = target_step_major_layout,
-          py::arg("draft_sampling") = draft_sampling_plan,
-          py::arg("target_sampling") = target_sampling_plan,
-          py::arg("draft_activate") = draft_activate,
-          py::arg("target_activate") = target_activate);
-  LOG(INFO) << "MTP Python pair graph runner done";
-  return runner;
+  py::object capture_runner = py::none();
+#if defined(USE_NPU)
+  capture_runner =
+      py::cpp_function([device_index = device_.index()](
+                           const py::object& runner, const py::args& inputs) {
+        // Prepare may need the GIL while it holds this device lock. Never
+        // wait for the lock with the GIL held. Only cold capture takes it.
+        py::gil_scoped_release release;
+        auto& capture_lock =
+            npu::DeviceCaptureLock::get_instance().get_lock(device_index);
+        std::lock_guard<std::mutex> lock(capture_lock);
+        py::gil_scoped_acquire acquire;
+        runner.attr("capture")(*inputs);
+      });
+#endif
+  return py_executor_.attr("create_mtp_graph_variant_registry")(
+      draft_executor.py_executor_,
+      py::arg("max_variants") = max_variants,
+      py::arg("draft_activate") = draft_activate,
+      py::arg("target_activate") = target_activate,
+      py::arg("capture_runner") = capture_runner,
+      py::arg("draft_metadata_factory") =
+          py::cpp_function([&draft_executor](const torch::Tensor& table,
+                                             const torch::Tensor& lengths,
+                                             const torch::Tensor& slots) {
+            return draft_executor.mtp_sparse_attention_metadata_view(
+                table, lengths, slots);
+          }),
+      py::arg("target_metadata_factory") =
+          py::cpp_function([this](const torch::Tensor& table,
+                                  const torch::Tensor& lengths,
+                                  const torch::Tensor& slots) {
+            return mtp_sparse_attention_metadata_view(table, lengths, slots);
+          }));
 }
 
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {

@@ -46,12 +46,28 @@ class SpeculativeDeviceState:
 
 
 @dataclass(frozen=True)
+class SpeculativeRuntimeOutput:
+    """Owned snapshots consumed by the C++ MTP worker and API serialization."""
+
+    committed_tokens: torch.Tensor
+    accepted_count: torch.Tensor
+    # Compact [2 * batch, hidden], interleaved previous/current selected rows.
+    # At count=0 the previous row is ignored and prepare uses its placeholder.
+    target_embeddings: torch.Tensor
+    # int64 token matrix followed by int32 counts; views share this lease.
+    token_state: torch.Tensor | None = None
+    logprobs: torch.Tensor | None = None
+    top_logprobs: torch.Tensor | None = None
+    top_tokens: torch.Tensor | None = None
+    target_probs: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
 class SpeculativeExecutionOutput:
     """Device outputs of one complete speculative iteration.
 
-    The tensors are graph-entry-owned views. A caller must keep the entry
-    generation alive until every asynchronous consumer has finished; the
-    next graph replay may overwrite these views.
+    ACL graph runners return owned snapshots so a later replay cannot
+    overwrite tensors still consumed by schedule overlap or diagnostics.
     """
 
     accepted_ids: torch.Tensor
@@ -71,6 +87,14 @@ class SpeculativeExecutionOutput:
     top_logprobs: torch.Tensor | None = None
     top_tokens: torch.Tensor | None = None
     target_probs: torch.Tensor | None = None
+    # Optional fixed-shape intermediate trace used by the MTP eager oracle.
+    # These remain ``None`` in the normal serving path to avoid retaining the
+    # full vocabulary logits for every draft step.
+    draft_hidden: torch.Tensor | None = None
+    draft_logits: torch.Tensor | None = None
+    draft_topk_indices: torch.Tensor | None = None
+    target_logits: torch.Tensor | None = None
+    target_topk_indices: torch.Tensor | None = None
 
 
 class BaseRunner(ABC):

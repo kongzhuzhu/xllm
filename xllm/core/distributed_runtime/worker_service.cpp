@@ -927,10 +927,6 @@ void WorkerService::GetLastStepResult(
           std::vector<torch::Tensor> dit_images;
           std::vector<std::string> dit_text_output;
           auto copy_output_to_host = [&]() {
-            if (options_.enable_schedule_overlap() && !task_pipeline) {
-              CHECK(stream_->wait_event(forward_output.ready_event))
-                  << "failed to wait forward output ready event";
-            }
             expert_load_data = safe_to(forward_output.expert_load_data,
                                        torch::kCPU,
                                        /*non_blocking=*/true);
@@ -952,7 +948,9 @@ void WorkerService::GetLastStepResult(
                 forward_outputs.value().dit_forward_output.text_output;
 
             // [num_seq]
-            next_tokens = safe_to(sample_output.next_tokens,
+            next_tokens = safe_to(forward_output.next_tokens_host.defined()
+                                      ? forward_output.next_tokens_host
+                                      : sample_output.next_tokens,
                                   torch::kCPU,
                                   /*non_blocking=*/true);
             if (next_tokens.defined() ||

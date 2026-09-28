@@ -1085,7 +1085,7 @@ class Glm52Indexer(nn.Module):
         self._wk_weights_proj_ready = False
 
     def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wk_weights_proj_ready:
+        if getattr(self, "_wk_weights_proj_ready", False):
             projected = F.linear(hidden, self._wk_weights_proj_weight)
             return projected[..., : self.head_dim], projected[..., self.head_dim :].contiguous()
         return self.wk(hidden), self.weights_proj(hidden)
@@ -1496,6 +1496,10 @@ class Glm52ForCausalLM(PyModelBase):
             dtype=self.dtype,
             device=self.device,
         )
+
+    def compute_greedy_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        assert isinstance(self.lm_head, ColumnParallelLinear)
+        return self.lm_head.greedy_tokens(hidden)
 
     def load_weights(
         self,

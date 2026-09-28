@@ -40,6 +40,9 @@ TargetSpecVerifyMode classify_target_spec_verify_mode(
 int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
                                                 int64_t block_size);
 
+// Small initial reserve, then geometric growth instead of a graph per KV page.
+int64_t unified_mtp_block_table_capacity(int64_t required_columns);
+
 enum class CombinedDraftExecutionPath {
   UNSUPPORTED,
   QWEN3_5_PAGED_ATTENTION,
@@ -53,6 +56,27 @@ bool supports_combined_draft_configuration(
     CombinedDraftExecutionPath execution_path,
     std::string_view npu_backend,
     int32_t dp_size);
+
+struct DecodeRouteOptions {
+  bool unified_graph_capable = false;
+  bool schedule_overlap = false;
+  bool combined_draft_supported = false;
+  bool pending_target_matches = false;
+  bool device_context_ready = false;
+  bool prelaunched_draft_matches = false;
+  bool has_json_states = false;
+  bool adaptive = false;
+};
+
+struct DecodeRoute {
+  bool unified_graph = false;
+  bool prelaunched_draft = false;
+  bool device_target_context = false;
+};
+
+// Select before consuming any state. A legacy prelaunch must never displace
+// an admitted unified graph, and pending state is usable only by its batch.
+DecodeRoute select_decode_route(const DecodeRouteOptions& options);
 
 // Materialize proposer-owned token columns into the row-major target verify
 // input. Graph replay normally performs this copy internally; eager fallback

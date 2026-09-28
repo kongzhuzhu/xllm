@@ -64,18 +64,15 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   pybind11::object attention_metadata_view(
       const ModelInputParams& params) const;
 
-  pybind11::object create_mtp_graph_runner(
-      PyExecutorImpl& draft_executor,
-      const std::vector<pybind11::object>& draft_metadata,
-      const pybind11::object& target_metadata,
-      const torch::Tensor& repair_token_ids,
+  // GLM sparse MTP consumes one decode row per token and no Host KV/CSR data.
+  pybind11::object mtp_sparse_attention_metadata_view(
+      const torch::Tensor& block_table,
       const torch::Tensor& kv_seq_lens,
-      int32_t batch_size,
-      int32_t speculative_tokens,
-      int64_t vocab_size,
-      const pybind11::object& draft_sampling_plan,
-      const pybind11::object& target_sampling_plan,
-      bool target_step_major_layout);
+      const torch::Tensor& slots) const;
+
+  pybind11::object create_mtp_graph_variant_registry(
+      PyExecutorImpl& draft_executor,
+      int32_t max_variants);
 
  private:
   // Caller holds the GIL. First binding occurs on Prepare for pipeline input.

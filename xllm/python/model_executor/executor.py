@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -42,12 +43,18 @@ from xllm.python.model_executor.runners.mtp_acl_graph import (
     GraphBackend,
     MtpAclGraphRunner,
     MtpGraphRecipe,
+    MtpGraphVariantRegistry,
     MtpRoleAdapter,
     PrepareFn,
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
     MtpSamplingRandomInputs,
+)
+from xllm.python.model_executor.runners.mtp_sparse_metadata import (
+    MtpSparseMetadataStorage,
+    MtpSparsePositionStorage,
+    SparseMetadataFactory,
 )
 from xllm.python.platform import current_platform
 
@@ -426,7 +433,11 @@ class ModelExecutor:
         with forward_context(context):
             if not skip_prepare:
                 try:
-                    role_backend.prepare(metadata, graph_mode=execution_state is not None)
+                    prepare_owned = getattr(role_backend, "prepare_owned_graph_metadata", None)
+                    if execution_state is not None and prepare_owned is not None:
+                        prepare_owned(metadata)
+                    else:
+                        role_backend.prepare(metadata, graph_mode=execution_state is not None)
                 except Exception as exc:
                     raise RuntimeError(f"MTP role attention prepare failed: {exc}") from exc
             try:
@@ -473,6 +484,8 @@ class ModelExecutor:
         target_activate: ActivateFn | None = None,
         draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
         target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        runtime_outputs_only: bool = False,
+        position_storage: MtpSparsePositionStorage | None = None,
     ) -> MtpAclGraphRunner:
         """Create a paired MTP runner with explicit role adapters.
 
@@ -532,9 +545,15 @@ class ModelExecutor:
             draft_sampling=draft_sampling_plan,
             target_sampling=target_sampling_plan,
             sampling_random_inputs=sampling_random_inputs,
+            draft_greedy=getattr(draft_executor.model, "compute_greedy_tokens", None),
+            target_greedy=getattr(self.model, "compute_greedy_tokens", None),
+            runtime_outputs_only=runtime_outputs_only
+            and os.environ.get("XLLM_MTP_KV_ORACLE", "0") != "1"
+            and os.environ.get("XLLM_MTP_STATE_ORACLE", "0") != "1",
+            position_storage=position_storage,
         )
         kv_payload_oracle = None
-        if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1":
+        if os.environ.get("XLLM_MTP_KV_ORACLE", "0") == "1" or os.environ.get("XLLM_MTP_STATE_ORACLE", "0") == "1":
             from xllm.python.model_executor.runners.mtp_kv_oracle import MtpKvPayloadOracle
 
             if backend != "aclgraph" or prepare is not None:
@@ -543,6 +562,36 @@ class ModelExecutor:
                 recipe, draft_executor.eager_runner.layer_caches, self.eager_runner.layer_caches
             )
         return MtpAclGraphRunner(recipe, backend=backend, prepare=prepare, kv_payload_oracle=kv_payload_oracle)
+
+    def create_mtp_graph_variant_registry(
+        self,
+        draft_executor: ModelExecutor,
+        *,
+        max_variants: int = 8,
+        draft_activate: ActivateFn | None = None,
+        target_activate: ActivateFn | None = None,
+        capture_runner: Callable[..., None] | None = None,
+        draft_metadata_factory: SparseMetadataFactory | None = None,
+        target_metadata_factory: SparseMetadataFactory | None = None,
+    ) -> MtpGraphVariantRegistry:
+        """Create the Python owner for bounded MTP graph variants.
+
+        The registry keeps recipe construction, capture, compatibility
+        updates, and FIFO eviction in Python so the C++ worker remains an
+        input/output bridge.
+        """
+        if not isinstance(draft_executor, ModelExecutor):
+            raise TypeError("draft_executor must be a ModelExecutor")
+        return MtpGraphVariantRegistry(
+            self,
+            draft_executor,
+            max_variants=max_variants,
+            draft_activate=draft_activate,
+            target_activate=target_activate,
+            capture_runner=capture_runner,
+            draft_metadata_factory=draft_metadata_factory,
+            target_metadata_factory=target_metadata_factory,
+        )
 
     def create_mtp_graph_runner_from_metadata(
         self,
@@ -560,18 +609,25 @@ class ModelExecutor:
         target_step_major_layout: bool = False,
         draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
         target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        runtime_outputs_only: bool = False,
+        draft_metadata_storage: MtpSparseMetadataStorage | None = None,
+        target_metadata_storage: MtpSparseMetadataStorage | None = None,
+        position_storage: MtpSparsePositionStorage | None = None,
     ) -> MtpAclGraphRunner:
         """Construct both role adapters and their recipe in one Python call."""
         draft_forward = draft_executor.create_mtp_role_adapter(
             tuple(draft_metadata),
             speculative_tokens=speculative_tokens,
             repair_token_ids=repair_token_ids,
+            metadata_storage=draft_metadata_storage,
+            repair_positions=None if position_storage is None else position_storage.first_draft,
         )
         target_forward = self.create_mtp_role_adapter(
             (target_metadata,),
             speculative_tokens=speculative_tokens,
             target=True,
             step_major_layout=target_step_major_layout,
+            metadata_storage=target_metadata_storage,
         )
         return self.create_mtp_graph_runner(
             draft_executor,
@@ -585,6 +641,8 @@ class ModelExecutor:
             target_activate=target_activate,
             draft_sampling=draft_sampling,
             target_sampling=target_sampling,
+            runtime_outputs_only=runtime_outputs_only,
+            position_storage=position_storage,
         )
 
     def create_mtp_role_adapter(
@@ -596,6 +654,8 @@ class ModelExecutor:
         step_major_layout: bool = False,
         layer_synchronizer: LayerSynchronizer | None = None,
         repair_token_ids: torch.Tensor | None = None,
+        metadata_storage: MtpSparseMetadataStorage | None = None,
+        repair_positions: torch.Tensor | None = None,
     ) -> MtpRoleAdapter:
         """Bind fixed attention metadata to this executor's MTP role.
 
@@ -613,6 +673,8 @@ class ModelExecutor:
             step_major_layout=step_major_layout,
             layer_synchronizer=layer_synchronizer,
             repair_token_ids=repair_token_ids,
+            metadata_storage=metadata_storage,
+            repair_positions=repair_positions,
         )
 
     @staticmethod

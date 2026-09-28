@@ -611,7 +611,8 @@ void PyAttentionMetadataView::update_from(
   TORCH_CHECK(kv_seq_lens_host_values().size() ==
                   source.kv_seq_lens_host_values().size(),
               "MTP graph metadata host KV length count changed");
-  TORCH_CHECK(q_seq_lens_host_.numel() == source.q_seq_lens_host_.numel(),
+  TORCH_CHECK(metadata_->q_seq_lens_vec.size() ==
+                  source.metadata_->q_seq_lens_vec.size(),
               "MTP graph metadata host Q length count changed");
   std::copy(source.metadata_->kv_seq_lens_vec.begin(),
             source.metadata_->kv_seq_lens_vec.end(),

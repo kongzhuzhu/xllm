@@ -142,7 +142,11 @@ void apply_mtp_prepare_output(
   draft_input.token_ids = output.token_ids;
   draft_input.input_params.embedding.input_embedding = output.embeddings;
   draft_input.positions = output.positions;
-  if (use_chunked_prefill) {
+  const bool expanded_lengths = output.kv_seq_lens.numel() == token_count;
+  if (expanded_lengths && use_chunked_prefill) {
+    draft_input.input_params.attention.device.kv_seq_lens =
+        output.kv_seq_lens.view({-1, 2}).select(1, 1).contiguous();
+  } else if (use_chunked_prefill || expanded_lengths) {
     draft_input.input_params.attention.device.kv_seq_lens = output.kv_seq_lens;
   } else {
     draft_input.input_params.attention.device.kv_seq_lens =
@@ -152,8 +156,12 @@ void apply_mtp_prepare_output(
   draft_input.input_params.attention.device.new_cache_slots =
       output.cache_slots;
   if (!use_chunked_prefill && rebuild_expanded_decode_metadata) {
+    const torch::Tensor base_lengths =
+        expanded_lengths
+            ? output.kv_seq_lens.view({-1, 2}).select(1, 1).contiguous()
+            : output.kv_seq_lens;
     expand_decode_attention_metadata(
-        draft_input, block_table_source, output.kv_seq_lens, block_size);
+        draft_input, block_table_source, base_lengths, block_size);
     const auto& attention = draft_input.input_params.attention.device;
     CHECK_EQ(attention.kv_seq_lens.numel(), token_count);
     CHECK_EQ(attention.new_cache_slots.numel(), token_count);
@@ -310,7 +318,9 @@ void prepare_target_verify_from_accepted_state(
                     validate_width,
                     step_major_layout);
   shift_host_rows(validate_input.input_params.attention.host.kv_seq_lens,
-                  metadata.base_kv_seq_lens,
+                  use_chunked_prefill
+                      ? metadata.base_kv_seq_lens + (validate_width - 1)
+                      : metadata.base_kv_seq_lens,
                   batch_size,
                   validate_width,
                   step_major_layout);
@@ -371,9 +381,12 @@ void prepare_target_verify_from_accepted_state(
                  << expanded_block_tables.size(0) << " rows; expected "
                  << batch_size << " or " << batch_size * validate_width;
     }
-    validate_input.input_params.attention.device.new_cache_slots =
+    torch::Tensor slot_rows =
         map_positions_to_cache_slots(
-            sequence_block_tables, position_rows, block_size);
+            sequence_block_tables, position_rows, block_size)
+            .view({batch_size, validate_width});
+    validate_input.input_params.attention.device.new_cache_slots =
+        (step_major_layout ? slot_rows.transpose(0, 1) : slot_rows).flatten();
   } else {
     validate_input.input_params.attention.device.new_cache_slots =
         torch::zeros_like(position_rows,
@@ -430,6 +443,28 @@ void prepare_target_verify_from_accepted_state(
             .to(validate_input.input_params.attention.device.kv_seq_lens
                     .options());
   }
+
+#if defined(USE_NPU)
+  if (validate_input.input_params.graph.expanded_kv_seq_lens.defined()) {
+    auto& params = validate_input.input_params;
+    const torch::Tensor offsets =
+        torch::arange(validate_width, metadata.base_kv_seq_lens.options());
+    const torch::Tensor rows =
+        metadata.base_kv_seq_lens.unsqueeze(1) + offsets.unsqueeze(0);
+    const torch::Tensor expanded_kv_lens =
+        (step_major_layout ? rows.transpose(0, 1) : rows)
+            .flatten()
+            .to(params.graph.expanded_kv_seq_lens.options());
+    // The Python backend selects expanded_decode ahead of generic metadata.
+    // Refresh lengths and page lists together after acceptance crosses a page.
+    layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+        params,
+        expanded_kv_lens,
+        params.graph.expanded_block_tables,
+        params.graph.expanded_kv_seq_lens_vec,
+        block_size);
+  }
+#endif
 
   torch::Tensor token_rows;
   if (step_major_layout) {

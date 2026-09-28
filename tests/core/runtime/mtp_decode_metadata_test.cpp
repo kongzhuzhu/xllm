@@ -17,26 +17,128 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/platform/platform.h"
 #include "core/runtime/forward_params.h"
-#include "core/runtime/mtp_worker_impl.h"
+#include "core/runtime/mtp_legacy_executor.h"
 #include "core/runtime/options.h"
+#include "core/runtime/unified_mtp_executor.h"
+#include "core/runtime/unified_mtp_worker_impl.h"
+#include "core/runtime/worker_plugin.h"
 
 namespace xllm {
 namespace {
 
-class DecodeMetadataTestWorker final : public MTPWorkerImpl {
+TEST(MtpWorkerPluginTest, DefaultAndExplicitSelection) {
+  EXPECT_EQ(select_worker_plugin("", true, true, true), "unified_mtp");
+  EXPECT_TRUE(select_worker_plugin("", true, true, false).empty());
+  EXPECT_TRUE(select_worker_plugin("", false, true, true).empty());
+  EXPECT_TRUE(select_worker_plugin("", true, false, true).empty());
+  EXPECT_EQ(select_worker_plugin("legacy_mtp", true, true, true), "legacy_mtp");
+  EXPECT_EQ(select_worker_plugin("custom", true, true, true), "custom");
+}
+
+TEST(MtpWorkerPluginTest, RequestRoutingDoesNotRejectUnsupportedSampling) {
+  ForwardInput input;
+  input.sampling_params.all_greedy_sample = true;
+  EXPECT_TRUE(supports_unified_mtp_request(input, false));
+  input.sampling_params.logprobs = true;
+  input.sampling_params.max_top_logprobs = 5;
+  EXPECT_TRUE(supports_unified_mtp_request(input, false));
+  EXPECT_FALSE(supports_unified_mtp_request(input, true));
+  input.sampling_params.all_greedy_sample = false;
+  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  input.sampling_params.all_greedy_sample = true;
+  input.sampling_params.use_beam_search = true;
+  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  input.sampling_params.use_beam_search = false;
+  for (torch::Tensor* control : {&input.sampling_params.temperatures,
+                                 &input.sampling_params.top_k,
+                                 &input.sampling_params.top_p,
+                                 &input.sampling_params.frequency_penalties,
+                                 &input.sampling_params.presence_penalties,
+                                 &input.sampling_params.repetition_penalties,
+                                 &input.sampling_params.filter_mask,
+                                 &input.sampling_params.filter_bitmask}) {
+    *control = torch::ones({1});
+    EXPECT_FALSE(supports_unified_mtp_request(input, false));
+    *control = torch::Tensor();
+  }
+  input.json_object_states.emplace_back();
+  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  input.json_object_states.clear();
+  input.input_params.multi_block_tables.emplace_back(
+      torch::zeros({1, 1}, torch::kInt));
+  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+}
+
+class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
  public:
   DecodeMetadataTestWorker(const ParallelArgs& parallel_args,
                            const torch::Device& device,
                            const runtime::Options& options)
-      : MTPWorkerImpl(parallel_args, device, options, WorkerType::LLM) {
+      : UnifiedMtpWorkerImpl(parallel_args, device, options, WorkerType::LLM) {
     context_.set_model_impl("python");
     target_spec_verify_mode_ =
         mtp_async::TargetSpecVerifyMode::DEEPSEEK_V32_EXPANDED_VERIFY;
+  }
+
+  void initialize_target_cache() {
+    embedding_cache_ = std::make_shared<EmbeddingCache>(8);
+  }
+
+  void stage_tokens(const ForwardInput& input, int64_t token) {
+    c10::StreamGuard guard = compute_stream_->set_stream_guard();
+    const int64_t batch_size =
+        static_cast<int64_t>(input.input_params.embedding.embedding_ids.size());
+    // Queue arithmetic ahead of D2H, so the Host cannot assume the submitted
+    // copy has finished when snapshot_pending_target_tokens is called.
+    torch::Tensor work =
+        torch::ones({1024, 1024}, torch::dtype(torch::kFloat).device(device_));
+    for (int32_t i = 0; i < 8; ++i) {
+      work = torch::matmul(work, work) / 1024;
+    }
+    SampleOutput output;
+    output.next_tokens = torch::full(
+        {batch_size, 2}, token, torch::dtype(torch::kLong).device(device_));
+    output.embeddings = torch::ones(
+        {batch_size, 2, 4}, torch::dtype(torch::kFloat).device(device_));
+    torch::Tensor host = torch::full(
+        {batch_size, 2},
+        -777,
+        torch::dtype(torch::kLong).device(torch::kCPU).pinned_memory(true));
+    host.copy_(output.next_tokens, /*non_blocking=*/true);
+    stage_target_context_write(input,
+                               output,
+                               torch::zeros({batch_size}, torch::kInt),
+                               torch::ones({batch_size}, torch::kInt),
+                               compute_stream_->record_event(),
+                               std::move(host),
+                               torch::Tensor(),
+                               {});
+  }
+
+  bool matches_pending(const ForwardInput& input) const {
+    return pending_target_context_matches(input);
+  }
+
+  size_t pending_count() const { return pending_target_context_queue_.size(); }
+
+  torch::Tensor snapshot_tokens() { return snapshot_pending_target_tokens(); }
+
+  torch::Tensor lease_host_tokens(const torch::Tensor& tokens) {
+    return acquire_accepted_tokens_host_buffer(tokens);
+  }
+
+  const void* next_draft_workspace_identity(const ForwardInput& input) {
+    const torch::Tensor embeddings =
+        torch::empty({input.input_params.meta.num_sequences, 2, 4},
+                     torch::dtype(torch::kBFloat16).device(device_));
+    return &unified_executor().acquire_draft_workspace(
+        input.input_params.meta.num_sequences, embeddings);
   }
 
   void resolve_decode_context(ForwardInput& input) const {
@@ -47,9 +149,10 @@ class DecodeMetadataTestWorker final : public MTPWorkerImpl {
   ForwardInput build_verify(const ForwardInput& input, bool adaptive) {
     ForwardInput verify_input;
     if (adaptive) {
-      prepare_validate_inputs(input, verify_input, std::vector<int32_t>{2});
+      legacy_executor().prepare_validate_inputs(
+          input, verify_input, std::vector<int32_t>{2});
     } else {
-      prepare_validate_inputs(input, verify_input);
+      legacy_executor().prepare_validate_inputs(input, verify_input);
     }
     CHECK_EQ(prepare_stream_->synchronize(), 0);
     return verify_input;
@@ -58,11 +161,87 @@ class DecodeMetadataTestWorker final : public MTPWorkerImpl {
   ForwardInput build_verify(const ForwardInput& input,
                             const std::vector<int32_t>& verify_widths) {
     ForwardInput verify_input;
-    prepare_validate_inputs(input, verify_input, verify_widths);
+    legacy_executor().prepare_validate_inputs(
+        input, verify_input, verify_widths);
     CHECK_EQ(prepare_stream_->synchronize(), 0);
     return verify_input;
   }
 };
+
+class StateBoundaryTestWorker final : public UnifiedMtpWorkerImpl {
+ public:
+  using UnifiedMtpWorkerImpl::UnifiedMtpWorkerImpl;
+
+  void seed_state() {
+    unified_executor().remember({torch::tensor({41}, torch::kLong),
+                                 torch::ones({1, 2, 4}),
+                                 torch::tensor({10}, torch::kInt),
+                                 torch::tensor({11}, torch::kInt),
+                                 {0},
+                                 {"request-a"}});
+  }
+
+  std::optional<ForwardOutput> dispatch(const ForwardInput& input) {
+    return UnifiedMtpWorkerImpl::step(input);
+  }
+
+ protected:
+  std::optional<ForwardOutput> step_decode(const ForwardInput& input) override {
+    ForwardOutput output;
+    const auto* state = unified_executor().continuation_for(input);
+    if (state != nullptr) {
+      output.sample_output.next_tokens = state->accepted_tokens;
+    }
+    return output;
+  }
+
+  std::optional<ForwardOutput> step_prefill(
+      const ForwardInput& /*input*/) override {
+    return ForwardOutput();
+  }
+
+  std::optional<ForwardOutput> step_empty(
+      const ForwardInput& /*input*/) override {
+    return std::nullopt;
+  }
+};
+
+TEST(MtpDeviceStateTest,
+     NonDecodeDispatchInvalidatesContinuationBeforeSameRequestReturns) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An NPU is required to construct the worker.";
+  }
+  for (const bool overlap : {false, true}) {
+    runtime::Options options;
+    options.block_size(128).num_speculative_tokens(1).enable_schedule_overlap(
+        overlap);
+    ParallelArgs args(0, 1, nullptr);
+    StateBoundaryTestWorker worker(
+        args, torch::Device("npu:0"), options, WorkerType::LLM);
+    ForwardInput decode;
+    decode.token_ids = torch::tensor({41}, torch::kInt);
+    decode.input_params.meta.num_sequences = 1;
+    decode.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+    decode.input_params.embedding.request_ids = {"request-a"};
+    decode.input_params.embedding.embedding_ids = {0};
+    for (const BatchForwardType::Value type :
+         {BatchForwardType::PREFILL,
+          BatchForwardType::CHUNKED_PREFILL,
+          BatchForwardType::MIXED,
+          BatchForwardType::EMPTY}) {
+      worker.seed_state();
+      ASSERT_TRUE(worker.dispatch(decode)->sample_output.next_tokens.defined());
+      ForwardInput intervening = decode;
+      intervening.input_params.meta.batch_forward_type = type;
+      if (type == BatchForwardType::EMPTY) {
+        intervening.input_params.meta.num_sequences = 0;
+      }
+      worker.dispatch(intervening);
+      EXPECT_FALSE(
+          worker.dispatch(decode)->sample_output.next_tokens.defined());
+    }
+  }
+}
 
 class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
  protected:
@@ -198,6 +377,109 @@ TEST_P(MtpDecodeMetadataTest, ExpandsFixedVerifyLinearStateRows) {
 
 TEST_P(MtpDecodeMetadataTest, ExpandsVariableVerifyLinearStateRows) {
   check_linear_state_rows(/*adaptive=*/true);
+}
+
+TEST_P(MtpDecodeMetadataTest,
+       SnapshotsCompletedD2HAndBoundsPendingGenerations) {
+  DecodeMetadataTestWorker worker(
+      parallel_args(), torch::Device("npu:0"), options());
+  worker.initialize_target_cache();
+  ForwardInput input;
+  input.input_params.embedding.embedding_ids = {0};
+  input.input_params.embedding.request_ids = {"request-a"};
+  worker.stage_tokens(input, /*token=*/41);
+  ASSERT_TRUE(worker.matches_pending(input));
+  ForwardInput replaced = input;
+  replaced.input_params.embedding.request_ids = {"request-b"};
+  EXPECT_FALSE(worker.matches_pending(replaced));
+  ForwardInput changed_slot = input;
+  changed_slot.input_params.embedding.embedding_ids = {1};
+  EXPECT_FALSE(worker.matches_pending(changed_slot));
+  const torch::Tensor first = worker.snapshot_tokens();
+  EXPECT_TRUE(torch::equal(first, torch::full({1, 2}, 41, torch::kLong)));
+  for (int64_t token = 42; token <= 45; ++token) {
+    worker.stage_tokens(input, token);
+    EXPECT_LE(worker.pending_count(), 2u);
+  }
+  const torch::Tensor last = worker.snapshot_tokens();
+  EXPECT_TRUE(torch::equal(last, torch::full({1, 2}, 45, torch::kLong)));
+  EXPECT_TRUE(torch::equal(first, torch::full({1, 2}, 41, torch::kLong)));
+  EXPECT_EQ(worker.pending_count(), 0u);
+}
+
+TEST_P(MtpDecodeMetadataTest, RejectsPendingStateAfterBatchResizeOrReorder) {
+  DecodeMetadataTestWorker worker(
+      parallel_args(), torch::Device("npu:0"), options());
+  worker.initialize_target_cache();
+  ForwardInput input;
+  input.input_params.embedding.embedding_ids = {0, 1};
+  input.input_params.embedding.request_ids = {"request-a", "request-b"};
+  worker.stage_tokens(input, /*token=*/42);
+  ASSERT_TRUE(worker.matches_pending(input));
+  ForwardInput reordered = input;
+  reordered.input_params.embedding.embedding_ids = {1, 0};
+  reordered.input_params.embedding.request_ids = {"request-b", "request-a"};
+  EXPECT_FALSE(worker.matches_pending(reordered));
+  ForwardInput shrunk = input;
+  shrunk.input_params.embedding.embedding_ids = {0};
+  shrunk.input_params.embedding.request_ids = {"request-a"};
+  EXPECT_FALSE(worker.matches_pending(shrunk));
+  EXPECT_TRUE(torch::equal(worker.snapshot_tokens(),
+                           torch::full({2, 2}, 42, torch::kLong)));
+}
+
+TEST_P(MtpDecodeMetadataTest, NextDraftWorkspaceDoesNotFollowTableCapacity) {
+  DecodeMetadataTestWorker worker(
+      parallel_args(), torch::Device("npu:0"), options());
+  ForwardInput input;
+  input.input_params.meta.num_sequences = 1;
+  const void* first = nullptr;
+  for (const int64_t columns : {1, 32, 33, 64, 65, 1}) {
+    input.input_params.attention.device.block_tables =
+        torch::zeros({1, columns}, torch::kInt);
+    const void* identity = worker.next_draft_workspace_identity(input);
+    if (first == nullptr) {
+      first = identity;
+    }
+    EXPECT_EQ(identity, first);
+  }
+  input.input_params.meta.num_sequences = 2;
+  EXPECT_NE(worker.next_draft_workspace_identity(input), first);
+  input.input_params.meta.num_sequences = 1;
+  EXPECT_EQ(worker.next_draft_workspace_identity(input), first);
+}
+
+TEST_P(MtpDecodeMetadataTest, PinnedOutputPoolKeepsConsumerViewsIndependent) {
+  runtime::Options overlap_options = options();
+  overlap_options.enable_schedule_overlap(true);
+  DecodeMetadataTestWorker worker(
+      parallel_args(), torch::Device("npu:0"), overlap_options);
+  const torch::Tensor source = torch::ones({1, 2}, torch::kLong);
+  torch::Tensor first = worker.lease_host_tokens(source);
+  first.fill_(41);
+  const void* first_address = first.data_ptr();
+  torch::Tensor consumer = first.view({2});
+  first = torch::Tensor();
+  torch::Tensor second = worker.lease_host_tokens(source);
+  EXPECT_NE(second.data_ptr(), first_address);
+  second.fill_(42);
+  EXPECT_TRUE(torch::equal(consumer, torch::full({2}, 41, torch::kLong)));
+  consumer = torch::Tensor();
+  torch::Tensor reused = worker.lease_host_tokens(source);
+  EXPECT_EQ(reused.data_ptr(), first_address);
+
+  // Unified token/count views share a byte arena. A live count view must
+  // retain the lease even after its token sibling and parent are released.
+  const torch::Tensor packed_source = torch::empty({20}, torch::kUInt8);
+  torch::Tensor packed = worker.lease_host_tokens(packed_source);
+  const void* packed_address = packed.data_ptr();
+  torch::Tensor counts = packed.narrow(0, 16, 4).view(torch::kInt);
+  counts.fill_(3);
+  packed = torch::Tensor();
+  torch::Tensor newer = worker.lease_host_tokens(packed_source);
+  EXPECT_NE(newer.data_ptr(), packed_address);
+  newer.fill_(0);
+  EXPECT_EQ(counts.item<int32_t>(), 3);
 }
 
 INSTANTIATE_TEST_SUITE_P(KvSplit,

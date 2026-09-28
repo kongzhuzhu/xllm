@@ -86,6 +86,8 @@ struct MtpPrepareNextDraftWorkspace {
   uint64_t workspace_size = 0;
 };
 
+// Full [B,K+1,H] hidden returns B KV lengths. Compact [2B,H] hidden
+// contains previous/current rows and directly returns 2B KV lengths.
 std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& accepted_embeddings,

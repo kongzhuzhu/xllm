@@ -181,6 +181,11 @@ class Glm52MtpForCausalLM(Glm52ForCausalLM):
         assert self.lm_head is not None
         return self.lm_head(normalized)
 
+    def compute_greedy_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        normalized = self.model.norm(hidden)
+        assert isinstance(normalized, torch.Tensor)
+        return super().compute_greedy_tokens(normalized)
+
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         loader = W8A8WeightLoader(
             self,

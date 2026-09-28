@@ -120,6 +120,42 @@ def _ordinary_backend() -> NpuPagedAttentionBackend:
     return backend
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_prefill_allocates_mask_only_for_consumer(masked: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _ordinary_backend()
+    metadata = _ordinary_metadata(paged=False)
+    backend.prepare(metadata)
+    assert backend._causal_mask is None
+    masks: list[torch.Tensor | None] = []
+
+    def attention(q: torch.Tensor, *args: object, **kwargs: object) -> tuple[torch.Tensor, None]:
+        masks.append(kwargs["atten_mask"])
+        return q, None
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", attention, raising=False)
+    q = torch.zeros(2, 8, 64)
+    kv = torch.zeros(2, 2, 64)
+    cache = backend._kv_caches[0].key
+    layer = SimpleNamespace(
+        causal=masked,
+        fia_use_attention_mask=False,
+        fia_sparse_mode=None,
+        fia_pre_tokens=2147483647,
+        fia_next_tokens=0,
+    )
+    for _ in range(2):
+        backend._prefill(q, kv, kv, cache, cache, metadata, 2, layer)
+    if masked:
+        assert masks[0] is masks[1]
+        assert masks[0].dtype == torch.int8
+        assert masks[0].shape == (2048, 2048)
+        assert masks[0].sum().item() == 2048 * 2047 // 2
+        assert torch.equal(masks[0][:3, :3], torch.tensor([[0, 1, 1], [0, 0, 1], [0, 0, 0]], dtype=torch.int8))
+    else:
+        assert masks == [None, None]
+        assert backend._causal_mask is None
+
+
 @pytest.mark.parametrize("paged", [False, True])
 def test_private_metadata_preparation_preserves_active_slot(paged: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _ordinary_backend()
@@ -202,6 +238,99 @@ def _mla_metadata(*, prefill: bool = False, chunked: bool = False) -> SimpleName
     metadata.q_cu_seq_lens_host_values = [0, 3, 5] if prefill or chunked else [0, 1, 2]
     metadata.slot_mapping = torch.arange(5 if prefill or chunked else 2, dtype=torch.int32)
     return metadata
+
+
+@pytest.mark.parametrize("owned_metadata", [False, True])
+def test_sparse_mtp_page_crossing_updates_without_host_lengths_or_query_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+    owned_metadata: bool,
+) -> None:
+    from xllm.python.model_executor.forward_context import (
+        AclGraphExecutionState,
+        ForwardContext,
+        forward_context,
+    )
+    from xllm.python.model_executor.runners.mtp_acl_graph import _metadata_signature
+
+    backend = _mla_backend()
+    cache = torch.empty(4, 128, 1, 512)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache, index=cache)])
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([127], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([128], dtype=torch.int32),
+        q_cu_seq_lens=None,
+        q_seq_lens=None,
+        kv_seq_lens_host_values=[],
+        expanded_decode_metadata=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+    )
+
+    def reject_readback(*args: object, **kwargs: object) -> None:
+        raise AssertionError("sparse MTP metadata must stay on Device")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", reject_readback)
+    monkeypatch.setattr(torch.Tensor, "item", reject_readback)
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [], execution_state=AclGraphExecutionState({}))
+    with forward_context(context):
+        if owned_metadata:
+            backend.prepare_owned_graph_metadata(metadata)
+            assert backend._mla_actual_seq_kv.data_ptr() == metadata.kv_seq_lens.data_ptr()
+        else:
+            backend.prepare(metadata, graph_mode=True)
+        signature = _metadata_signature(metadata)
+        query_ptr = backend._mla_actual_seq_q.data_ptr()
+        metadata.kv_seq_lens.fill_(129)
+        metadata.slot_mapping.fill_(128)
+        metadata.block_table.copy_(torch.tensor([[2, 3]], dtype=torch.int32))
+        monkeypatch.setattr(torch, "arange", reject_readback)
+        if owned_metadata:
+            # Values have already reached the graph-owned storage. Replay
+            # update must not dispatch a second copy or conversion of them.
+            monkeypatch.setattr(torch.Tensor, "copy_", reject_readback)
+            monkeypatch.setattr(torch.Tensor, "to", reject_readback)
+        backend.update_graph_metadata(metadata)
+    assert backend._causal_mask is None
+    assert _metadata_signature(metadata) == signature
+    assert backend._mla_actual_seq_q.data_ptr() == query_ptr
+    assert backend._mla_actual_seq_q.tolist() == [1]
+    assert backend._mla_actual_seq_kv.tolist() == [129]
+    assert backend._block_table_i32.tolist() == [[2, 3]]
+
+
+@pytest.mark.parametrize("converted", [False, True])
+def test_owned_sparse_metadata_keeps_conversion_and_ownership_contract(converted: bool) -> None:
+    backend = _mla_backend()
+    cache = torch.empty(4, 128, 1, 512)
+    backend.bind_kv_caches([LayerCache(key=cache, value=cache, index=cache)])
+    dtype = torch.int64 if converted else torch.int32
+    metadata = SimpleNamespace(
+        slot_mapping=torch.tensor([127], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1]], dtype=dtype),
+        kv_seq_lens=torch.tensor([128], dtype=dtype),
+        q_cu_seq_lens=None,
+        q_seq_lens=None,
+        expanded_decode_metadata=None,
+        is_prefill=False,
+        is_chunked_prefill=False,
+    )
+    backend.prepare_owned_graph_metadata(metadata)
+    table_ptr = backend._block_table_i32.data_ptr()
+    lengths_ptr = backend._mla_actual_seq_kv.data_ptr()
+    metadata.block_table.fill_(3)
+    metadata.kv_seq_lens.fill_(129)
+    backend.update_graph_metadata(metadata)
+    assert backend._block_table_i32.tolist() == [[3, 3]]
+    assert backend._mla_actual_seq_kv.tolist() == [129]
+    assert backend._block_table_i32.data_ptr() == table_ptr
+    assert backend._mla_actual_seq_kv.data_ptr() == lengths_ptr
+    if not converted:
+        with pytest.raises(RuntimeError, match="updated in place"):
+            backend.update_graph_metadata(SimpleNamespace(**vars(metadata)))
+    # Reusing the backend outside this owned layout must reset the fast path.
+    backend.prepare(metadata)
+    assert not backend._graph_metadata_updated_in_place
 
 
 @pytest.mark.parametrize("prefill,chunked", [(True, False), (False, True), (False, False)])
@@ -435,3 +564,48 @@ def test_paged_graph_requires_an_execution_owner() -> None:
         pytest.raises(RuntimeError, match="execution entry"),
     ):
         backend.prepare(metadata, graph_mode=True)
+
+
+@pytest.mark.parametrize("share_workspace", [False, True])
+def test_paged_graph_keeps_metadata_private_when_workspace_is_shared(
+    share_workspace: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xllm.python.model_executor.forward_context import AclGraphExecutionState, ForwardContext, forward_context
+
+    backend = _ordinary_backend()
+    monkeypatch.setattr(backend, "_allocate_graph_workspace", lambda batch, table: torch.empty(4))
+    shared = {} if share_workspace else None
+    executions = [AclGraphExecutionState({}, shared_persistent_buffers=shared) for _ in range(2)]
+    metadata = [_mla_metadata(), _mla_metadata()]
+    contexts = [
+        ForwardContext(backend, torch.device("cpu"), view, [], execution_state=execution)
+        for view, execution in zip(metadata, executions)
+    ]
+    for context in contexts:
+        with forward_context(context):
+            backend.prepare(context.metadata, graph_mode=True)
+
+    first, second = [execution.paged_attention[2] for execution in executions]
+    assert first is not second
+    assert first.query is not second.query
+    assert first.kv is not second.kv
+    assert first.block_table.data_ptr() != second.block_table.data_ptr()
+    assert (first.workspace.data_ptr() == second.workspace.data_ptr()) == share_workspace
+    assert (first.output.data_ptr() == second.output.data_ptr()) == share_workspace
+
+    captured_query, captured_kv = first.query, first.kv
+    updated = _mla_metadata()
+    updated.kv_seq_lens_host_values = [7, 9]
+    updated.kv_seq_lens.copy_(torch.tensor([7, 9], dtype=torch.int32))
+    updated.block_table.fill_(2)
+    with forward_context(contexts[0]):
+        backend.prepare(metadata[0], graph_mode=True)
+        backend.update_graph_metadata(updated)
+
+    assert first.query is captured_query
+    assert first.kv is captured_kv
+    assert captured_query == [1, 2]
+    assert captured_kv == [7, 9]
+    assert second.kv == [6, 4]
+    assert first.block_table.tolist() == [[2], [2]]
+    assert second.block_table.tolist() == [[0], [1]]

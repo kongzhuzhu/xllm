@@ -654,6 +654,9 @@ struct ForwardOutput {
   // max number of top logprobs in the batch
   int64_t max_top_logprobs = 0;
   SampleOutput sample_output;
+  // Optional CPU token snapshot, valid after ready_event. Device next_tokens
+  // remains available for continuation; serializers can reuse this D2H copy.
+  torch::Tensor next_tokens_host;
   // The target sampler applies packed token masks in-place before returning
   // sampled tokens. MTP validation uses this local contract to avoid applying
   // the same mask to target logits a second time.

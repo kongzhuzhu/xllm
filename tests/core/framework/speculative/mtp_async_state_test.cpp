@@ -23,6 +23,46 @@ limitations under the License.
 namespace xllm::mtp_async {
 namespace {
 
+TEST(MtpAsyncStateTest, UnifiedDecodeKeepsDeviceContextAcrossOverlapTurns) {
+  DecodeRouteOptions options;
+  options.unified_graph_capable = true;
+  options.schedule_overlap = true;
+  options.combined_draft_supported = true;
+  // Bootstrap, first publication, steady replay, and batch transition.
+  for (const bool matches : {false, true}) {
+    for (const bool ready : {false, true}) {
+      options.pending_target_matches = matches;
+      options.device_context_ready = ready;
+      options.prelaunched_draft_matches = true;
+      const DecodeRoute route = select_decode_route(options);
+      EXPECT_TRUE(route.unified_graph);
+      EXPECT_FALSE(route.prelaunched_draft);
+      EXPECT_EQ(route.device_target_context, matches && ready);
+    }
+  }
+  options.combined_draft_supported = false;
+  EXPECT_TRUE(select_decode_route(options).device_target_context);
+  options.schedule_overlap = false;
+  EXPECT_FALSE(select_decode_route(options).device_target_context);
+}
+
+TEST(MtpAsyncStateTest, UnsupportedUnifiedRequestsKeepExplicitLegacyRoute) {
+  DecodeRouteOptions options;
+  options.unified_graph_capable = true;
+  options.schedule_overlap = true;
+  options.combined_draft_supported = true;
+  options.prelaunched_draft_matches = true;
+  options.has_json_states = true;
+  EXPECT_FALSE(select_decode_route(options).unified_graph);
+  EXPECT_TRUE(select_decode_route(options).prelaunched_draft);
+  options.has_json_states = false;
+  options.adaptive = true;
+  EXPECT_FALSE(select_decode_route(options).unified_graph);
+  options.adaptive = false;
+  options.unified_graph_capable = false;
+  EXPECT_FALSE(select_decode_route(options).unified_graph);
+}
+
 TEST(MtpAsyncStateTest, ClassifiesClosedTargetSpecVerifyPolicy) {
   const std::pair<std::string_view, TargetSpecVerifyMode> test_cases[] = {
       {"qwen3_5", TargetSpecVerifyMode::QWEN3_5_EXPANDED_VERIFY},

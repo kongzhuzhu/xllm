@@ -28,6 +28,7 @@ cc_library(
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
     mtp_py_executor_pair.h
+    unified_mtp_executor.h
     py_attention_metadata.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
@@ -43,6 +44,11 @@ cc_library(
     xservice_client.h
     speculative_worker_impl.h
     mtp_worker_impl.h
+    mtp_runtime.h
+    mtp_runtime_helpers.h
+    mtp_legacy_executor.h
+    unified_mtp_worker_impl.h
+    worker_plugin.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h
@@ -68,6 +74,7 @@ cc_library(
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
     mtp_py_executor_pair.cpp
+    unified_mtp_executor.cpp
     py_attention_metadata.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
@@ -85,6 +92,11 @@ cc_library(
     params_utils.cpp
     speculative_worker_impl.cpp
     mtp_worker_impl.cpp
+    mtp_runtime.cpp
+    mtp_runtime_helpers.cpp
+    mtp_legacy_executor.cpp
+    unified_mtp_worker_impl.cpp
+    worker_plugin.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
     dflash_worker_impl.cpp

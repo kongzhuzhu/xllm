@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/runtime/task_execution_pipeline.h"
+#include "core/runtime/worker_plugin.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -94,7 +95,25 @@ Worker::Worker(const ParallelArgs& parallel_args,
            "CP/KV/layerwise "
            "splits of one, without offload or disaggregation.";
   }
-  if (options.enable_speculative_decode()) {
+  bool python_npu = false;
+#if defined(USE_NPU)
+  python_npu = device.is_privateuseone() && worker_type == WorkerType::LLM &&
+               ModelConfig::is_python_model_impl(
+                   ModelConfig::get_instance().model_impl());
+#endif
+  const auto& execution = ExecutionConfig::get_instance();
+  const std::string plugin = select_worker_plugin(
+      execution.worker_plugin(),
+      options.enable_speculative_decode() &&
+          SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()),
+      python_npu,
+      execution.enable_unified_mtp_graph());
+  if (!plugin.empty()) {
+    LOG(INFO) << "Worker plugin: " << plugin;
+    impl_ = create_worker_plugin(
+                plugin, parallel_args, device, options, worker_type)
+                .release();
+  } else if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
     LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
     if (algorithm == "Eagle3") {

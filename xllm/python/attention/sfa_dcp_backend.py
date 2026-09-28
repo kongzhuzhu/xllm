@@ -132,8 +132,9 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
+        owned_metadata: bool = False,
     ) -> None:
-        super().prepare(metadata, graph_mode=graph_mode)
+        super().prepare(metadata, graph_mode=graph_mode, owned_metadata=owned_metadata)
         self._sfa_metadata = None
         if self._kv_layout is None or self._builder is None:
             return
@@ -221,11 +222,13 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         self,
         q_latent: torch.Tensor,
         q_pe: torch.Tensor,
-        k_latent_3d: torch.Tensor,
-        k_pe_3d: torch.Tensor,
+        k_latent_3d: torch.Tensor | None,
+        k_pe_3d: torch.Tensor | None,
         layer: Attention,
         topk: torch.Tensor | None = None,
+        cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
+        """Run sparse MLA, optionally reusing cache data prepared by the fused path."""
         if topk is None:
             raise NotImplementedError("dense MLA (topk=None) is not supported on SfaDcpAttentionBackend")
         if self._impl is None or self._kv_layout is None:
@@ -242,13 +245,16 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             raise RuntimeError(f"MLA latent cache is missing for layer {layer.layer_id}")
 
         attn_metadata.dcp_context.gather_context = None
-        torch.ops.xllm_ops.reshape_paged_cache(
-            attn_metadata.dcp_context.slot_mapping,
-            k_latent_3d,
-            k_pe_3d,
-            nope_cache,
-            rope_cache,
-        )
+        if not cache_is_preprocessed:
+            if k_latent_3d is None or k_pe_3d is None:
+                raise RuntimeError("SFA DCP MLA cache inputs are required unless cache_is_preprocessed=True")
+            torch.ops.xllm_ops.reshape_paged_cache(
+                attn_metadata.dcp_context.slot_mapping,
+                k_latent_3d,
+                k_pe_3d,
+                nope_cache,
+                rope_cache,
+            )
         kv_cache = (nope_cache, rope_cache)
         self._impl._store_parallel_kv(k_pe_3d, k_latent_3d, None, kv_cache, attn_metadata)
         self._impl._record_query_gather_context(q_latent, q_pe, attn_metadata)

@@ -193,6 +193,10 @@ class CsaIndexContext:
 
 
 class AttentionBackend(ABC):
+    def prepare_owned_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        """Prepare metadata whose storage is owned by this graph entry."""
+        self.prepare(metadata, graph_mode=True)
+
     @property
     def supports_prepared_metadata(self) -> bool:
         return False

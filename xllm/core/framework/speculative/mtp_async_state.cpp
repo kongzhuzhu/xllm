@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <bit>
 #include <vector>
 
 #include "core/framework/model/model_args.h"
@@ -67,6 +69,13 @@ int64_t speculative_verify_block_table_capacity(int64_t max_position_embeddings,
   return (max_position_embeddings + block_size - 1) / block_size + 1;
 }
 
+int64_t unified_mtp_block_table_capacity(int64_t required_columns) {
+  CHECK_GT(required_columns, 0);
+  constexpr uint64_t kMinColumns = 32;
+  return static_cast<int64_t>(std::bit_ceil(
+      std::max(kMinColumns, static_cast<uint64_t>(required_columns))));
+}
+
 CombinedDraftExecutionPath classify_combined_draft_execution_path(
     std::string_view model_type) {
   if (model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp") {
@@ -91,6 +100,20 @@ bool supports_combined_draft_configuration(
       return false;
   }
   return false;
+}
+
+DecodeRoute select_decode_route(const DecodeRouteOptions& options) {
+  DecodeRoute route;
+  route.unified_graph = options.unified_graph_capable &&
+                        !options.has_json_states && !options.adaptive;
+  route.prelaunched_draft = !route.unified_graph && options.schedule_overlap &&
+                            options.combined_draft_supported &&
+                            options.prelaunched_draft_matches;
+  route.device_target_context =
+      options.schedule_overlap &&
+      (route.unified_graph || options.combined_draft_supported) &&
+      options.pending_target_matches && options.device_context_ready;
+  return route;
 }
 
 torch::Tensor materialize_speculative_verify_tokens(
@@ -151,9 +174,14 @@ AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
                                    const torch::Tensor& base_kv_seq_lens) {
   AcceptedTokenMetadata token_metadata = build_accepted_token_metadata(
       accepted_tokens, base_positions, base_kv_seq_lens);
-  CHECK_EQ(accepted_embeddings.dim(), 3);
+  const bool compact = accepted_embeddings.dim() == 2;
+  CHECK(compact || accepted_embeddings.dim() == 3);
   const int64_t batch_size = accepted_tokens.size(0);
-  CHECK_EQ(accepted_embeddings.size(0), batch_size);
+  CHECK_EQ(accepted_embeddings.size(0), compact ? batch_size * 2 : batch_size);
+  const torch::Tensor embedding_rows =
+      compact ? accepted_embeddings.view(
+                    {batch_size, 2, accepted_embeddings.size(-1)})
+              : accepted_embeddings;
 
   AcceptedState state;
   state.accepted_lengths = token_metadata.accepted_lengths;
@@ -171,9 +199,11 @@ AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
       torch::where(has_previous, gathered_previous_tokens, state.last_tokens);
   torch::Tensor last_indices = (state.accepted_lengths - 1).clamp_min(0);
   state.last_embeddings =
-      gather_sequence_rows(accepted_embeddings, last_indices);
+      compact ? embedding_rows.select(1, 1)
+              : gather_sequence_rows(embedding_rows, last_indices);
   torch::Tensor gathered_previous_embeddings =
-      gather_sequence_rows(accepted_embeddings, previous_indices);
+      compact ? embedding_rows.select(1, 0)
+              : gather_sequence_rows(embedding_rows, previous_indices);
   torch::Tensor placeholder = embedding_placeholder;
   if (placeholder.dim() == 1) {
     placeholder = placeholder.unsqueeze(0);

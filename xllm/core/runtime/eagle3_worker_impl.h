@@ -27,7 +27,7 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
                    const runtime::Options& options,
                    WorkerType worker_type);
 
-  ~Eagle3WorkerImpl() override = default;
+  ~Eagle3WorkerImpl() override;
 
   // Override init_model to load hot_token_id_ for EAGLE-3
   bool init_model(const std::string& model_weights_path,

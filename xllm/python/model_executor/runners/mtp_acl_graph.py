@@ -29,6 +29,7 @@ only uses fixed-shape tensors and device operations, so it can be captured by
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence, Sized
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Literal
@@ -36,13 +37,16 @@ from typing import TYPE_CHECKING, Callable, Literal
 import torch
 import torch.nn as nn
 
+from scripts.logger import logger
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
+    AclGraphTask,
 )
 from xllm.python.model_executor.runners.base import (
     SpeculativeDeviceState,
     SpeculativeExecutionOutput,
+    SpeculativeRuntimeOutput,
 )
 from xllm.python.model_executor.runners.mtp_sampling import (
     MtpSamplingPlan,
@@ -50,6 +54,12 @@ from xllm.python.model_executor.runners.mtp_sampling import (
     coerce_sampling_plan,
     probabilistic_acceptance,
     sample_logits,
+)
+from xllm.python.model_executor.runners.mtp_sparse_metadata import (
+    MtpSparseMetadataBinding,
+    MtpSparseMetadataStorage,
+    MtpSparsePositionStorage,
+    SparseMetadataFactory,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +75,71 @@ ForwardFn = Callable[
 LogitsFn = Callable[[torch.Tensor], torch.Tensor]
 PrepareFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor | None], None]
 ActivateFn = Callable[[], None]
+
+
+@torch.inference_mode()
+def _pack_metadata_tensors(metadata_by_step: Sequence[object]) -> tuple[torch.Tensor, ...]:
+    """Pack owned metadata into aligned arenas before any backend captures it.
+
+    Rebind the tensor objects themselves, so read-only native metadata views
+    and their update_from implementation continue to use the same TensorImpl.
+    Each field/step gets its own slice; no replay reads a sibling step's value.
+    """
+    fields = (
+        "slot_mapping",
+        "local_slot_mapping",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+        "qo_indptr",
+        "q_cu_seq_lens",
+        "kv_cu_seq_lens",
+        "kv_seq_lens",
+        "q_seq_lens",
+        "block_table",
+        "kv_seq_lens_host",
+        "q_seq_lens_host",
+        "linear_state_indices",
+        "has_initial_state",
+        "paged_attention_tiling_data",
+        "dsa_positions",
+        "dsa_cos_sin",
+        "dsa_c4_cos_sin",
+        "dsa_c128_cos_sin",
+    )
+    groups: dict[tuple[torch.device, torch.dtype, bool], list[torch.Tensor]] = {}
+    seen: set[int] = set()
+    for metadata in metadata_by_step:
+        expanded = getattr(metadata, "expanded_decode_metadata", None)
+        for view in (metadata, expanded):
+            if view is None:
+                continue
+            values = [getattr(view, name, None) for name in fields]
+            values.extend(getattr(view, "multi_block_tables", ()))
+            for value in values:
+                if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                    continue
+                # Native getters may create different Python wrappers for the
+                # same TensorImpl. Rebinding that object twice would orphan a slice.
+                identity = value._cdata
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                pinned = value.device.type == "cpu" and value.is_pinned()
+                groups.setdefault((value.device, value.dtype, pinned), []).append(value)
+    arenas: list[torch.Tensor] = []
+    for (device, dtype, pinned), tensors in groups.items():
+        alignment = max(1, 512 // tensors[0].element_size())
+        sizes = [((value.numel() + alignment - 1) // alignment) * alignment for value in tensors]
+        arena = torch.empty(sum(sizes), dtype=dtype, device=device, pin_memory=pinned)
+        offset = 0
+        for value, size in zip(tensors, sizes):
+            destination = arena.narrow(0, offset, value.numel()).view(value.shape)
+            destination.copy_(value)
+            value.set_(destination)
+            offset += size
+        arenas.append(arena)
+    return tuple(arenas)
 
 
 def _tensor_signature(value: object) -> tuple[object, ...] | None:
@@ -181,6 +256,8 @@ class MtpRoleAdapter:
         step_major_layout: bool = False,
         layer_synchronizer: LayerSynchronizer | None = None,
         repair_token_ids: torch.Tensor | None = None,
+        metadata_storage: MtpSparseMetadataStorage | None = None,
+        repair_positions: torch.Tensor | None = None,
     ) -> None:
         if not metadata_by_step:
             raise ValueError("MTP role adapter requires at least one metadata plan")
@@ -194,14 +271,32 @@ class MtpRoleAdapter:
             raise ValueError("target metadata plan must contain one K+1-row entry")
         self._executor = executor
         clone_metadata = getattr(metadata_by_step[0], "clone_for_graph", None)
-        if clone_metadata is None:
+        if metadata_storage is not None:
+            if len(metadata_by_step) != len(metadata_storage.metadata) or any(
+                actual is not owned for actual, owned in zip(metadata_by_step, metadata_storage.metadata)
+            ):
+                raise ValueError("sparse MTP role metadata must belong to the supplied storage")
+            self._metadata_by_step = metadata_storage.metadata
+            self._metadata_arenas = (metadata_storage.arena,)
+        elif clone_metadata is None:
             self._metadata_by_step = tuple(metadata_by_step)
+            self._metadata_arenas = ()
         else:
             self._metadata_by_step = tuple(item.clone_for_graph() for item in metadata_by_step)
+            # Only clones may be rebound. Sparse storage already owns final
+            # slices; generic caller metadata retains its original TensorImpl.
+            self._metadata_arenas = _pack_metadata_tensors(self._metadata_by_step)
         self._target = target
         self._step_major_layout = step_major_layout
         self._layer_synchronizer = layer_synchronizer
-        self._repair_token_ids = torch.empty_like(repair_token_ids) if repair_token_ids is not None else None
+        self._repair_positions = repair_positions
+        # Worker may supply a strided int32 view of its two-row fused output.
+        # Cast while copying into the final graph-owned int64 destination.
+        self._repair_token_ids = (
+            torch.empty(repair_token_ids.shape, dtype=torch.long, device=repair_token_ids.device)
+            if repair_token_ids is not None
+            else None
+        )
         if self._repair_token_ids is not None:
             self._repair_token_ids.copy_(repair_token_ids)
         self._acl_graph: AclGraphCaptureContext | None = None
@@ -214,6 +309,7 @@ class MtpRoleAdapter:
             raise RuntimeError("MTP role backend count does not match metadata plan")
         self._graph_prepared = False
         self._step_execution_states: tuple[AclGraphExecutionState | None, ...] = ()
+        self._shared_execution_buffers: dict[tuple[object, ...], object] | None = None
 
     def create_eager_reference(self) -> MtpRoleAdapter:
         """Create an independent backend/metadata context for diagnostics."""
@@ -322,11 +418,15 @@ class MtpRoleAdapter:
         if execution_state is None:
             self._step_execution_states = tuple(None for _ in self._metadata_by_step)
         elif not self._step_execution_states:
-            # Each fixed invocation owns its graph workspace namespace. The
-            # attention backends use generic execution-buffer keys such as
-            # FIA_OUTPUT; sharing one map across K steps would alias draft
-            # and target workspaces when their shapes happen to match.
-            self._step_execution_states = tuple(AclGraphExecutionState({}) for _ in self._metadata_by_step)
+            # Keep outputs and graph-visible metadata private to each step,
+            # but share the role-owned temporary attention workspace. Draft
+            # steps execute serially on the capture stream, so a workspace is
+            # dead before the next step consumes the same slice.
+            self._shared_execution_buffers = {}
+            self._step_execution_states = tuple(
+                AclGraphExecutionState({}, shared_persistent_buffers=self._shared_execution_buffers)
+                for _ in self._metadata_by_step
+            )
         elif len(self._step_execution_states) != len(self._metadata_by_step):
             raise RuntimeError("MTP role execution-state plan changed after warmup")
 
@@ -335,95 +435,21 @@ class MtpRoleAdapter:
         if self._attention_backends:
             self._graph_prepared = True
 
-    def can_update_metadata(self, metadata_by_step: Sequence[AttentionMetadata]) -> bool:
-        """Return whether a new invocation fits this captured role variant."""
-        if len(metadata_by_step) != len(self._metadata_by_step):
-            return False
-        can_update = all(hasattr(old_metadata, "update_from") for old_metadata in self._metadata_by_step)
-        if not can_update or not self._attention_backends:
-            return False
-        if not all(hasattr(backend, "update_graph_metadata") for backend in self._attention_backends):
-            return False
-        for old_metadata, new_metadata in zip(self._metadata_by_step, metadata_by_step):
-            if getattr(old_metadata, "is_prefill", None) != getattr(new_metadata, "is_prefill", None):
-                return False
-            if getattr(old_metadata, "is_chunked_prefill", None) != getattr(new_metadata, "is_chunked_prefill", None):
-                return False
-            for name in (
-                "slot_mapping",
-                "paged_kv_indptr",
-                "paged_kv_indices",
-                "paged_kv_last_page_len",
-                "q_cu_seq_lens",
-                "kv_cu_seq_lens",
-                "kv_seq_lens",
-                "q_seq_lens",
-                "block_table",
-            ):
-                old_value = getattr(old_metadata, name, None)
-                new_value = getattr(new_metadata, name, None)
-                if (old_value is None) != (new_value is None):
-                    return False
-                if old_value is not None and (
-                    old_value.shape != new_value.shape
-                    or old_value.dtype != new_value.dtype
-                    or old_value.device != new_value.device
-                ):
-                    return False
-            for name in ("kv_seq_lens_host_values", "q_seq_lens_host"):
-                old_value = getattr(old_metadata, name, None)
-                new_value = getattr(new_metadata, name, None)
-                if old_value is None or new_value is None:
-                    if old_value is not new_value:
-                        return False
-                elif len(old_value) != len(new_value):
-                    return False
-            old_tables = getattr(old_metadata, "multi_block_tables", ())
-            new_tables = getattr(new_metadata, "multi_block_tables", ())
-            if len(old_tables) != len(new_tables):
-                return False
-            for old_table, new_table in zip(old_tables, new_tables):
-                if (old_table is None) != (new_table is None):
-                    return False
-                if old_table is not None and (
-                    old_table.shape != new_table.shape
-                    or old_table.dtype != new_table.dtype
-                    or old_table.device != new_table.device
-                ):
-                    return False
-            old_expanded = getattr(old_metadata, "expanded_decode_metadata", None)
-            new_expanded = getattr(new_metadata, "expanded_decode_metadata", None)
-            old_enabled = bool(getattr(old_expanded, "enabled", False)) if old_expanded is not None else False
-            new_enabled = bool(getattr(new_expanded, "enabled", False)) if new_expanded is not None else False
-            if old_enabled != new_enabled:
-                return False
-            if old_enabled:
-                for name in (
-                    "kv_seq_lens",
-                    "block_table",
-                    "paged_kv_indptr",
-                    "paged_kv_indices",
-                    "paged_kv_last_page_len",
-                    "paged_attention_tiling_data",
-                    "kv_seq_lens_host",
-                ):
-                    old_value = getattr(old_expanded, name, None)
-                    new_value = getattr(new_expanded, name, None)
-                    if (old_value is None) != (new_value is None):
-                        return False
-                    if old_value is not None and (
-                        old_value.shape != new_value.shape
-                        or old_value.dtype != new_value.dtype
-                        or old_value.device != new_value.device
-                    ):
-                        return False
-                old_host_values = getattr(old_expanded, "kv_seq_lens_host_values", None)
-                new_host_values = getattr(new_expanded, "kv_seq_lens_host_values", None)
-                if (old_host_values is None) != (new_host_values is None):
-                    return False
-                if old_host_values is not None and len(old_host_values) != len(new_host_values):
-                    return False
-        return True
+    def require_direct_metadata_update(self) -> None:
+        """Check once that every captured consumer borrows the owned tensors."""
+        if not self._graph_prepared or not self._attention_backends:
+            raise RuntimeError("sparse MTP binding requires prepared attention backends")
+        if not all(getattr(backend, "graph_metadata_updated_in_place", False) for backend in self._attention_backends):
+            raise RuntimeError("sparse MTP binding requires in-place graph metadata consumers")
+
+    def update_repair_token_ids(self, repair_token_ids: torch.Tensor | None) -> None:
+        if (self._repair_token_ids is None) != (repair_token_ids is None):
+            raise RuntimeError("MTP repair-token presence changed after capture")
+        if self._repair_token_ids is not None:
+            assert repair_token_ids is not None
+            if repair_token_ids.shape != self._repair_token_ids.shape:
+                raise RuntimeError("MTP repair-token shape changed after capture")
+            self._repair_token_ids.copy_(repair_token_ids)
 
     @torch.inference_mode()
     def update_metadata(
@@ -434,15 +460,9 @@ class MtpRoleAdapter:
         """Copy a new invocation into the captured role's stable metadata."""
         if not self._graph_prepared:
             raise RuntimeError("MTP role metadata cannot update before graph warmup")
-        if not self.can_update_metadata(metadata_by_step):
-            raise RuntimeError("MTP role metadata is not compatible with captured graph variant")
-        if (self._repair_token_ids is None) != (repair_token_ids is None):
-            raise RuntimeError("MTP repair-token presence changed after capture")
-        if self._repair_token_ids is not None:
-            assert repair_token_ids is not None
-            if repair_token_ids.shape != self._repair_token_ids.shape:
-                raise RuntimeError("MTP repair-token shape changed after capture")
-            self._repair_token_ids.copy_(repair_token_ids)
+        if len(metadata_by_step) != len(self._metadata_by_step):
+            raise RuntimeError("MTP role metadata step count changed")
+        self.update_repair_token_ids(repair_token_ids)
         for old_metadata, new_metadata, backend in zip(
             self._metadata_by_step,
             metadata_by_step,
@@ -475,7 +495,11 @@ class MtpRoleAdapter:
             if input_embedding is None or input_embedding.shape[0] != token_ids.numel() * 2:
                 raise ValueError("MTP first draft repair layout requires 2B embeddings")
             call_token_ids = torch.stack((self._repair_token_ids, token_ids), dim=1).reshape(-1)
-            call_positions = torch.stack((positions - 1, positions), dim=1).reshape(-1)
+            call_positions = (
+                self._repair_positions
+                if self._repair_positions is not None
+                else torch.stack((positions - 1, positions), dim=1).reshape(-1)
+            )
             selected_rows = torch.arange(
                 1,
                 token_ids.numel() * 2,
@@ -570,12 +594,17 @@ class MtpGraphOutput:
     next_embeddings: torch.Tensor | None
     next_topk_indices: torch.Tensor | None
     target_embeddings: torch.Tensor
-    draft_probs: torch.Tensor | None = None
     target_probs: torch.Tensor | None = None
-    target_log_probs: torch.Tensor | None = None
     committed_log_probs: torch.Tensor | None = None
     target_top_log_probs: torch.Tensor | None = None
     target_top_tokens: torch.Tensor | None = None
+    # Optional diagnostic tensors. ``draft_hidden`` is also the recurrent
+    # embedding passed into the following draft step.
+    draft_hidden: torch.Tensor | None = None
+    draft_logits: torch.Tensor | None = None
+    draft_topk_indices: torch.Tensor | None = None
+    target_logits: torch.Tensor | None = None
+    target_topk_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -619,14 +648,8 @@ def greedy_acceptance(
     accepted_mask = torch.cumprod(matches.to(torch.int32), dim=1).to(torch.bool)
     accepted_count = accepted_mask.sum(dim=1, dtype=torch.int32)
 
-    rejected = ~accepted_mask
-    # For an all-accepted row argmax returns zero; select the final bonus in
-    # that case.  The gather remains fixed-shape and does not read host state.
-    first_rejection = rejected.to(torch.int32).argmax(dim=1)
-    replacement = target_tokens[:, :speculative_tokens].gather(1, first_rejection.unsqueeze(1)).squeeze(1)
-    all_accepted = accepted_count.eq(speculative_tokens)
-    bonus = target_tokens[:, speculative_tokens]
-    next_tokens = torch.where(all_accepted, bonus, replacement)
+    # The prefix length is the rejection index, or K for the bonus row.
+    next_tokens = target_tokens.gather(1, accepted_count.to(torch.long).unsqueeze(1)).squeeze(1)
     accepted_ids = torch.where(
         accepted_mask,
         draft_tokens,
@@ -639,29 +662,41 @@ def _committed_tokens(
     accepted_ids: torch.Tensor,
     accepted_count: torch.Tensor,
     next_tokens: torch.Tensor,
-    speculative_tokens: int,
 ) -> torch.Tensor:
     """Materialize the runtime's fixed-width accepted/replacement layout."""
 
-    all_accepted = accepted_count.eq(speculative_tokens)
-    positions = torch.arange(
-        speculative_tokens,
-        dtype=accepted_count.dtype,
-        device=accepted_count.device,
-    ).unsqueeze(0)
-    first_rejection = accepted_count.unsqueeze(1)
-    replacement_mask = positions.eq(first_rejection) & ~all_accepted.unsqueeze(1)
-    draft_rows = torch.where(
-        replacement_mask,
-        next_tokens.unsqueeze(1),
-        accepted_ids,
+    committed = torch.cat((accepted_ids, torch.full_like(next_tokens.unsqueeze(1), -1)), dim=1)
+    committed.scatter_(1, accepted_count.to(torch.long).unsqueeze(1), next_tokens.unsqueeze(1))
+    return committed
+
+
+def _runtime_token_views(token_state: torch.Tensor, batch: int, steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    token_bytes = batch * (steps + 1) * 8
+    tokens = token_state[:token_bytes].view(torch.int64).view(batch, steps + 1)
+    counts = token_state[token_bytes:].view(torch.int32)
+    return tokens, counts
+
+
+def _compact_target_hidden(hidden: torch.Tensor, counts: torch.Tensor, steps: int) -> torch.Tensor:
+    rows = torch.arange(counts.numel(), device=counts.device) * (steps + 1)
+    current = rows + counts.to(torch.long)
+    previous = rows + (counts.to(torch.long) - 1).clamp_min(0)
+    return hidden.index_select(0, torch.stack((previous, current), dim=1).flatten())
+
+
+def _greedy_runtime_commit(
+    draft: torch.Tensor, target: torch.Tensor, hidden: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if draft.device.type == "npu":
+        return torch.ops.xllm_ops.mtp_greedy_commit(draft, target, hidden)
+    # The explicit eager/CPU oracle keeps the same storage contract. Online
+    # NPU execution always uses the fused operator; errors propagate.
+    accepted_ids, _, counts, next_tokens = greedy_acceptance(draft, target)
+    tokens = _committed_tokens(accepted_ids, counts, next_tokens)
+    return (
+        torch.cat((tokens.flatten().view(torch.uint8), counts.view(torch.uint8))),
+        _compact_target_hidden(hidden, counts, draft.shape[1]),
     )
-    bonus = torch.where(
-        all_accepted,
-        next_tokens,
-        torch.full_like(next_tokens, -1),
-    )
-    return torch.cat((draft_rows, bonus.unsqueeze(1)), dim=1)
 
 
 class MtpGraphRecipe(nn.Module):
@@ -684,6 +719,11 @@ class MtpGraphRecipe(nn.Module):
         draft_sampling: MtpSamplingPlan | None = None,
         target_sampling: MtpSamplingPlan | None = None,
         sampling_random_inputs: MtpSamplingRandomInputs | None = None,
+        trace_intermediates: bool | None = None,
+        draft_greedy: LogitsFn | None = None,
+        target_greedy: LogitsFn | None = None,
+        runtime_outputs_only: bool = False,
+        position_storage: MtpSparsePositionStorage | None = None,
     ) -> None:
         super().__init__()
         if batch_size <= 0:
@@ -702,8 +742,15 @@ class MtpGraphRecipe(nn.Module):
         self.draft_logits = draft_logits
         self.target_forward = target_forward
         self.target_logits = target_logits
+        self.draft_greedy = draft_greedy
+        self.target_greedy = target_greedy
         self.draft_activate = draft_activate
         self.target_activate = target_activate
+        self.trace_intermediates = (
+            os.environ.get("XLLM_MTP_STATE_ORACLE", "0") == "1" if trace_intermediates is None else trace_intermediates
+        )
+        self.runtime_outputs_only = runtime_outputs_only and not self.trace_intermediates
+        self._position_storage = position_storage
         if draft_sampling is not None and draft_sampling.batch_size != batch_size:
             raise ValueError("draft sampling plan batch does not match MTP graph batch")
         if target_sampling is not None and target_sampling.batch_size != batch_size:
@@ -721,6 +768,20 @@ class MtpGraphRecipe(nn.Module):
             kv_seq_lens.to(device=device, dtype=torch.int32).contiguous()
             if kv_seq_lens is not None
             else torch.empty(0, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_position_arena",
+            position_storage.positions
+            if position_storage is not None
+            else torch.empty((2 * speculative_tokens + 1) * batch_size, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_target_position_offsets",
+            torch.arange(speculative_tokens + 1, dtype=torch.long, device=device).unsqueeze(0)
+            if position_storage is None
+            else torch.empty(0, dtype=torch.long, device=device),
             persistent=False,
         )
 
@@ -745,40 +806,6 @@ class MtpGraphRecipe(nn.Module):
             finish_warmup = getattr(forward, "finish_warmup", None)
             if finish_warmup is not None:
                 finish_warmup()
-
-    def can_update_metadata(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-    ) -> bool:
-        """Check whether both role adapters can consume a new invocation."""
-        draft_check = getattr(self.draft_forward, "can_update_metadata", None)
-        target_check = getattr(self.target_forward, "can_update_metadata", None)
-        if draft_check is None or target_check is None:
-            return False
-        return bool(draft_check(draft_metadata)) and bool(target_check((target_metadata,)))
-
-    def metadata_key(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-        draft_sampling: MtpSamplingPlan | None = None,
-        target_sampling: MtpSamplingPlan | None = None,
-    ) -> tuple[object, ...]:
-        """Return the fixed graph-layout key before compatibility validation."""
-        if draft_sampling is None:
-            draft_sampling = self.draft_sampling
-        if target_sampling is None:
-            target_sampling = self.target_sampling
-        draft_sampling = coerce_sampling_plan(draft_sampling, batch_size=self.batch_size)
-        target_sampling = coerce_sampling_plan(target_sampling, batch_size=self.batch_size)
-        return (
-            tuple(_metadata_signature(metadata) for metadata in draft_metadata),
-            _metadata_signature(target_metadata),
-            None if draft_sampling is None else draft_sampling.layout_signature(),
-            None if target_sampling is None else target_sampling.layout_signature(),
-            None if self.sampling_random_inputs is None else self.sampling_random_inputs.layout_signature(),
-        )
 
     def _validate_sampling_random_inputs(self) -> None:
         self._validate_sampling_random_inputs_for(self.sampling_random_inputs)
@@ -872,7 +899,7 @@ class MtpGraphRecipe(nn.Module):
         kv_seq_lens: torch.Tensor | None = None,
         draft_input_embedding: torch.Tensor | None = None,
         draft_topk_indices: torch.Tensor | None = None,
-    ) -> MtpGraphOutput:
+    ) -> MtpGraphOutput | SpeculativeRuntimeOutput:
         if seed_token_ids.shape != (self.batch_size,):
             raise ValueError("seed_token_ids shape does not match the captured batch")
         if base_positions.shape != (self.batch_size,):
@@ -882,13 +909,25 @@ class MtpGraphRecipe(nn.Module):
 
         draft_tokens: list[torch.Tensor] = []
         draft_probs: list[torch.Tensor] = []
+        draft_hidden_rows: list[torch.Tensor] = []
+        draft_logits_rows: list[torch.Tensor] = []
+        draft_topk_rows: list[torch.Tensor | None] = []
         current_ids = seed_token_ids
         current_embedding = draft_input_embedding
         current_topk_indices = draft_topk_indices
+        needs_acceptance_probs = self.target_sampling is not None and not self.target_sampling.all_greedy_sample
+        use_draft_greedy = (
+            self.draft_greedy is not None
+            and not self.trace_intermediates
+            and not needs_acceptance_probs
+            and (self.draft_sampling is None or self.draft_sampling.plain_greedy)
+        )
         for step in range(self.speculative_tokens):
             if self.draft_activate is not None:
                 self.draft_activate()
-            step_positions = base_positions + step
+            step_positions = self._position_arena[step * self.batch_size : (step + 1) * self.batch_size]
+            if self._position_storage is None:
+                torch.add(base_positions, step, out=step_positions)
             try:
                 draft_output = _body_output(
                     self.draft_forward(
@@ -902,10 +941,14 @@ class MtpGraphRecipe(nn.Module):
             except Exception as exc:
                 raise RuntimeError(f"MTP draft body step {step} failed: {exc}") from exc
             draft_hidden = draft_output.hidden
-            step_logits = self.draft_logits(draft_hidden)
-            if step_logits.shape != (self.batch_size, self.vocab_size):
+            step_logits = None if use_draft_greedy else self.draft_logits(draft_hidden)
+            if use_draft_greedy:
+                current_ids = self.draft_greedy(draft_hidden)
+            elif step_logits.shape != (self.batch_size, self.vocab_size):
                 raise ValueError("draft logits must have shape [batch, vocab]")
-            if self.draft_sampling is None:
+            elif self.draft_sampling is None or (self.draft_sampling.plain_greedy and not needs_acceptance_probs):
+                # Draft distributions and logprobs have no output consumer;
+                # only probability acceptance needs them as intermediates.
                 current_ids = step_logits.argmax(dim=-1)
             else:
                 draft_uniform = None
@@ -913,29 +956,42 @@ class MtpGraphRecipe(nn.Module):
                     draft_uniform = self.sampling_random_inputs.draft_uniform
                     if draft_uniform is not None:
                         draft_uniform = draft_uniform[:, step, :]
-                sampled = sample_logits(step_logits, self.draft_sampling, uniform=draft_uniform)
+                sampled = sample_logits(
+                    step_logits,
+                    self.draft_sampling,
+                    uniform=draft_uniform,
+                    require_probs=needs_acceptance_probs,
+                )
                 current_ids = sampled.tokens
-                if self.draft_sampling.all_greedy_sample:
+                if needs_acceptance_probs and sampled.probs is not None and self.draft_sampling.all_greedy_sample:
                     draft_probs.append(torch.zeros_like(sampled.probs).scatter_(-1, current_ids.unsqueeze(-1), 1.0))
-                else:
+                elif needs_acceptance_probs and sampled.probs is not None:
                     draft_probs.append(sampled.probs)
+                del sampled
+            if self.trace_intermediates:
+                draft_hidden_rows.append(draft_hidden)
+                draft_logits_rows.append(step_logits)
+                draft_topk_rows.append(draft_output.topk_indices)
             # GLM MTP consumes the preceding body hidden as the next-step
             # embedding and optionally reuses the preceding DSA top-k state.
             current_embedding = draft_hidden
             current_topk_indices = draft_output.topk_indices
             draft_tokens.append(current_ids)
+            # Release non-traced logits before the next body allocates its
+            # workspace. The capture pool can reuse storage once it is dead.
+            del step_logits, draft_hidden, draft_output
+        del current_embedding, current_topk_indices
         draft_matrix = torch.stack(draft_tokens, dim=1)
 
         target_token_matrix = torch.cat((seed_token_ids.unsqueeze(1), draft_matrix), dim=1)
         target_ids = target_token_matrix.reshape(-1)
-        target_positions = (
-            base_positions.unsqueeze(1)
-            + torch.arange(
-                self.speculative_tokens + 1,
-                dtype=base_positions.dtype,
-                device=base_positions.device,
-            ).unsqueeze(0)
-        ).reshape(-1)
+        target_positions = self._position_arena[self.speculative_tokens * self.batch_size :]
+        if self._position_storage is None:
+            torch.add(
+                base_positions.unsqueeze(1),
+                self._target_position_offsets,
+                out=target_positions.view(self.batch_size, self.speculative_tokens + 1),
+            )
         if self.target_activate is not None:
             self.target_activate()
         try:
@@ -945,16 +1001,41 @@ class MtpGraphRecipe(nn.Module):
         target_hidden = target_output.hidden
         if target_hidden.ndim != 2 or target_hidden.shape[0] != self.batch_size * (self.speculative_tokens + 1):
             raise ValueError("target hidden must have one row per target verification token")
-        target_logits = self.target_logits(target_hidden)
-        if target_logits.shape != (
+        use_target_greedy = (
+            self.target_greedy is not None
+            and not self.trace_intermediates
+            and (
+                self.target_sampling is None
+                or (
+                    self.target_sampling.plain_greedy
+                    and not self.target_sampling.return_probs
+                    and not self.target_sampling.logprobs
+                    and self.target_sampling.max_top_logprobs == 0
+                )
+            )
+        )
+        target_logits = None if use_target_greedy else self.target_logits(target_hidden)
+        if target_logits is not None and target_logits.shape != (
             self.batch_size * (self.speculative_tokens + 1),
             self.vocab_size,
         ):
             raise ValueError("target logits must have shape [batch*(K+1), vocab]")
         target_probs = None
         target_log_probs = None
-        if self.target_sampling is None:
+        target_log_normalizer = None
+        plain_greedy = self.target_sampling is not None and self.target_sampling.plain_greedy
+        if use_target_greedy:
+            target_tokens = self.target_greedy(target_hidden).reshape(self.batch_size, self.speculative_tokens + 1)
+        elif self.target_sampling is None or (plain_greedy and not self.target_sampling.return_probs):
             target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
+            if self.target_sampling is not None and (
+                self.target_sampling.logprobs or self.target_sampling.max_top_logprobs > 0
+            ):
+                # Only committed and top-k scores leave the graph. A scalar
+                # normalizer per row avoids a full-vocabulary log-prob tensor.
+                target_log_normalizer = torch.logsumexp(target_logits.float(), dim=-1).reshape(
+                    self.batch_size, self.speculative_tokens + 1, 1
+                )
         else:
             target_uniform = None
             if self.sampling_random_inputs is not None:
@@ -969,12 +1050,24 @@ class MtpGraphRecipe(nn.Module):
                 uniform=target_uniform,
             )
             target_tokens = sampled_target.tokens.reshape(self.batch_size, self.speculative_tokens + 1)
-            target_probs = sampled_target.probs.reshape(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
-            target_log_probs = sampled_target.log_probs.reshape(
-                self.batch_size, self.speculative_tokens + 1, self.vocab_size
-            )
+            if sampled_target.probs is not None:
+                target_probs = sampled_target.probs.reshape(
+                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
+                )
+            if sampled_target.log_probs is not None:
+                target_log_probs = sampled_target.log_probs.reshape(
+                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
+                )
 
-        if self.target_sampling is None or self.target_sampling.all_greedy_sample:
+        token_state = None
+        compact_hidden = None
+        greedy = self.target_sampling is None or self.target_sampling.all_greedy_sample
+        if self.runtime_outputs_only and greedy:
+            token_state, compact_hidden = _greedy_runtime_commit(draft_matrix, target_tokens, target_hidden)
+            committed_tokens, accepted_count = _runtime_token_views(
+                token_state, self.batch_size, self.speculative_tokens
+            )
+        elif greedy:
             (
                 accepted_ids,
                 accepted_mask,
@@ -1003,24 +1096,73 @@ class MtpGraphRecipe(nn.Module):
                 acceptance_uniform=acceptance_uniform,
                 recovery_uniform=recovery_uniform,
             )
-        committed_tokens = _committed_tokens(
-            accepted_ids,
-            accepted_count,
-            next_tokens,
-            self.speculative_tokens,
-        )
+        if token_state is None:
+            committed_tokens = _committed_tokens(
+                accepted_ids,
+                accepted_count,
+                next_tokens,
+            )
         committed_log_probs = None
         target_top_log_probs = None
         target_top_tokens = None
-        if target_log_probs is not None and self.target_sampling is not None and self.target_sampling.logprobs:
+        score_rows = target_log_probs
+        if target_log_normalizer is not None:
+            score_rows = target_logits.view(self.batch_size, self.speculative_tokens + 1, self.vocab_size)
+        if score_rows is not None and self.target_sampling is not None and self.target_sampling.logprobs:
             committed_indices = committed_tokens.clamp_min(0).unsqueeze(-1)
-            committed_log_probs = target_log_probs.gather(-1, committed_indices).squeeze(-1)
+            selected_scores = score_rows.gather(-1, committed_indices).float()
+            if target_log_normalizer is not None:
+                selected_scores = selected_scores - target_log_normalizer
+            committed_log_probs = selected_scores.squeeze(-1)
             committed_log_probs = torch.where(
                 committed_tokens.ge(0), committed_log_probs, torch.zeros_like(committed_log_probs)
             )
-            if self.target_sampling is not None and self.target_sampling.max_top_logprobs > 0:
-                top_width = min(self.target_sampling.max_top_logprobs, self.vocab_size)
-                target_top_log_probs, target_top_tokens = target_log_probs.topk(top_width, dim=-1)
+        if score_rows is not None and self.target_sampling is not None and self.target_sampling.max_top_logprobs > 0:
+            top_width = min(self.target_sampling.max_top_logprobs, self.vocab_size)
+            target_top_log_probs, target_top_tokens = score_rows.topk(top_width, dim=-1)
+            if target_log_normalizer is not None:
+                target_top_log_probs = target_top_log_probs.float() - target_log_normalizer
+        if self.runtime_outputs_only:
+            if compact_hidden is None:
+                compact_hidden = _compact_target_hidden(target_hidden, accepted_count, self.speculative_tokens)
+            return SpeculativeRuntimeOutput(
+                committed_tokens=committed_tokens,
+                accepted_count=accepted_count,
+                target_embeddings=compact_hidden,
+                token_state=token_state,
+                logprobs=committed_log_probs,
+                top_logprobs=target_top_log_probs,
+                top_tokens=target_top_tokens,
+                target_probs=(
+                    target_probs if self.target_sampling is not None and self.target_sampling.return_probs else None
+                ),
+            )
+        draft_hidden_matrix = None
+        draft_logits_matrix = None
+        draft_topk_matrix = None
+        target_logits_matrix = None
+        target_topk_trace_matrix = None
+        if self.trace_intermediates:
+            draft_hidden_matrix = torch.stack(draft_hidden_rows, dim=1)
+            draft_logits_matrix = torch.stack(draft_logits_rows, dim=1)
+            if any(value is not None for value in draft_topk_rows):
+                if any(value is None for value in draft_topk_rows):
+                    raise RuntimeError("MTP draft top-k state changed presence across fixed steps")
+                draft_topk_matrix = torch.stack([value for value in draft_topk_rows if value is not None], dim=1)
+            target_logits_matrix = target_logits.reshape(
+                self.batch_size,
+                self.speculative_tokens + 1,
+                self.vocab_size,
+            )
+            if target_output.topk_indices is not None:
+                target_topk = target_output.topk_indices
+                if target_topk.shape[0] != self.batch_size * (self.speculative_tokens + 1):
+                    raise ValueError("target top-k state must have one row per target verification token")
+                target_topk_trace_matrix = target_topk.reshape(
+                    self.batch_size,
+                    self.speculative_tokens + 1,
+                    *target_topk.shape[1:],
+                )
         # ``next_tokens`` is the replacement token after a rejection or the
         # bonus token after an all-accepted verify.  It is emitted in addition
         # to the accepted draft prefix, so the next decode position advances
@@ -1065,18 +1207,17 @@ class MtpGraphRecipe(nn.Module):
             next_embeddings=next_embeddings,
             next_topk_indices=next_topk_indices,
             target_embeddings=target_hidden_matrix,
-            draft_probs=(torch.stack(draft_probs, dim=1) if draft_probs and self.draft_sampling.return_probs else None)
-            if self.draft_sampling is not None
-            else None,
             target_probs=(
                 target_probs if self.target_sampling is not None and self.target_sampling.return_probs else None
-            ),
-            target_log_probs=(
-                target_log_probs if self.target_sampling is not None and self.target_sampling.logprobs else None
             ),
             committed_log_probs=committed_log_probs,
             target_top_log_probs=target_top_log_probs,
             target_top_tokens=target_top_tokens,
+            draft_hidden=draft_hidden_matrix,
+            draft_logits=draft_logits_matrix,
+            draft_topk_indices=draft_topk_matrix,
+            target_logits=target_logits_matrix,
+            target_topk_indices=target_topk_trace_matrix,
         )
 
 
@@ -1106,9 +1247,11 @@ class MtpAclGraphRunner:
         self.warmup_steps = warmup_steps
         self.prepare = prepare
         self.kv_payload_oracle = kv_payload_oracle
+        self._closed = False
         self._captured = False
         self._graph = None
         self._capture_stream = None
+        self._graph_tasks: list[AclGraphTask] = []
         self._execution_states = (
             (AclGraphExecutionState({}), AclGraphExecutionState({})) if backend == "aclgraph" else (None, None)
         )
@@ -1131,7 +1274,7 @@ class MtpAclGraphRunner:
         )
         self._static_draft_input_embedding: torch.Tensor | None = None
         self._static_draft_topk_indices: torch.Tensor | None = None
-        self._static_output: MtpGraphOutput | None = None
+        self._static_output: MtpGraphOutput | SpeculativeRuntimeOutput | None = None
 
     def _prepare_static_inputs(self) -> None:
         if self.prepare is not None:
@@ -1140,6 +1283,28 @@ class MtpAclGraphRunner:
                 self._static_base_positions,
                 self._static_kv_seq_lens,
             )
+
+    def close(self) -> None:
+        """Drain replay and output copies before releasing graph storage."""
+        if self._closed:
+            return
+        if self._capture_stream is not None:
+            self._capture_stream.synchronize()
+            # Output snapshots are enqueued on the caller stream after it
+            # waits for replay. They must finish before graph.reset frees it.
+            torch.npu.current_stream(self.recipe.device).synchronize()
+        if self._graph is not None:
+            self._graph.reset()
+        self._graph = None
+        self._entry.graph = None
+        self._entry.captured = False
+        self._captured = False
+        self._static_output = None
+        self._graph_tasks.clear()
+        self.recipe.bind_graph_contexts(None, None, None)
+        self._execution_states = (None, None)
+        self._capture_stream = None
+        self._closed = True
 
     @property
     def capability(self) -> MtpGraphCapability:
@@ -1153,6 +1318,11 @@ class MtpAclGraphRunner:
     def captured(self) -> bool:
         return self._captured
 
+    @property
+    def draft_embedding_destination(self) -> torch.Tensor | None:
+        """Borrow the final input buffer; producer must follow replay's read event."""
+        return self._static_draft_input_embedding
+
     def _validate_inputs(
         self,
         seed_token_ids: torch.Tensor,
@@ -1163,8 +1333,9 @@ class MtpAclGraphRunner:
         for name, tensor in (("seed_token_ids", seed_token_ids), ("base_positions", base_positions)):
             if tensor.device != expected_device or tensor.shape != (self.recipe.batch_size,):
                 raise ValueError(f"{name} must be a [{self.recipe.batch_size}] tensor on {expected_device}")
-        if seed_token_ids.dtype != torch.long or base_positions.dtype != torch.long:
-            raise ValueError("MTP token ids and positions must use int64 tensors")
+        token_dtypes = (torch.int32, torch.int64) if self.backend == "aclgraph" else (torch.int64,)
+        if seed_token_ids.dtype not in token_dtypes or base_positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("MTP graph inputs require integer ids/positions; eager token ids must be int64")
         if self._static_kv_seq_lens is not None:
             if kv_seq_lens is None or kv_seq_lens.device != expected_device:
                 raise ValueError("kv_seq_lens is required for this graph variant")
@@ -1194,7 +1365,7 @@ class MtpAclGraphRunner:
             if value.device != expected_device or value.shape != static.shape or value.dtype != static.dtype:
                 raise ValueError(f"{name} shape, dtype, or device changed after graph capture")
 
-    def _run_static(self) -> MtpGraphOutput:
+    def _run_static(self) -> MtpGraphOutput | SpeculativeRuntimeOutput:
         return self.recipe(
             self._static_seed_token_ids,
             self._static_base_positions,
@@ -1204,7 +1375,9 @@ class MtpAclGraphRunner:
         )
 
     @staticmethod
-    def _clone_graph_output(output: MtpGraphOutput) -> MtpGraphOutput:
+    def _clone_graph_output(
+        output: MtpGraphOutput | SpeculativeRuntimeOutput,
+    ) -> MtpGraphOutput | SpeculativeRuntimeOutput:
         """Detach one replay result from the persistent ACL graph buffers.
 
         ACL graph replay writes the same output allocations on every call.
@@ -1216,6 +1389,23 @@ class MtpAclGraphRunner:
         def clone(value: torch.Tensor | None) -> torch.Tensor | None:
             return None if value is None else value.clone()
 
+        if isinstance(output, SpeculativeRuntimeOutput):
+            token_state = clone(output.token_state)
+            if token_state is None:
+                tokens, counts = output.committed_tokens.clone(), output.accepted_count.clone()
+            else:
+                batch, width = output.committed_tokens.shape
+                tokens, counts = _runtime_token_views(token_state, batch, width - 1)
+            return SpeculativeRuntimeOutput(
+                committed_tokens=tokens,
+                accepted_count=counts,
+                target_embeddings=output.target_embeddings.clone(),
+                token_state=token_state,
+                logprobs=clone(output.logprobs),
+                top_logprobs=clone(output.top_logprobs),
+                top_tokens=clone(output.top_tokens),
+                target_probs=clone(output.target_probs),
+            )
         return MtpGraphOutput(
             accepted_ids=output.accepted_ids.clone(),
             accepted_mask=output.accepted_mask.clone(),
@@ -1229,33 +1419,16 @@ class MtpAclGraphRunner:
             next_embeddings=clone(output.next_embeddings),
             next_topk_indices=clone(output.next_topk_indices),
             target_embeddings=output.target_embeddings.clone(),
-            draft_probs=clone(output.draft_probs),
             target_probs=clone(output.target_probs),
-            target_log_probs=clone(output.target_log_probs),
             committed_log_probs=clone(output.committed_log_probs),
             target_top_log_probs=clone(output.target_top_log_probs),
             target_top_tokens=clone(output.target_top_tokens),
+            draft_hidden=clone(output.draft_hidden),
+            draft_logits=clone(output.draft_logits),
+            draft_topk_indices=clone(output.draft_topk_indices),
+            target_logits=clone(output.target_logits),
+            target_topk_indices=clone(output.target_topk_indices),
         )
-
-    def can_update_metadata(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-    ) -> bool:
-        """Return whether the captured graph can reuse stable metadata storage."""
-        if not self._captured:
-            return False
-        return self.recipe.can_update_metadata(draft_metadata, target_metadata)
-
-    def metadata_key(
-        self,
-        draft_metadata: Sequence[AttentionMetadata],
-        target_metadata: AttentionMetadata,
-        draft_sampling: MtpSamplingPlan | None = None,
-        target_sampling: MtpSamplingPlan | None = None,
-    ) -> tuple[object, ...]:
-        """Return the fixed metadata/layout key used by the C++ registry."""
-        return self.recipe.metadata_key(draft_metadata, target_metadata, draft_sampling, target_sampling)
 
     def update_metadata(
         self,
@@ -1267,16 +1440,6 @@ class MtpAclGraphRunner:
         if not self._captured:
             raise RuntimeError("MTP ACL graph must be captured before metadata update")
         self.recipe.update_metadata(draft_metadata, target_metadata, repair_token_ids)
-
-    def can_update_sampling_plans(
-        self,
-        draft_sampling: MtpSamplingPlan | None,
-        target_sampling: MtpSamplingPlan | None,
-    ) -> bool:
-        """Check whether replay controls fit the captured graph variant."""
-        if not self._captured:
-            return False
-        return self.recipe.can_update_sampling_plans(draft_sampling, target_sampling)
 
     def update_sampling_plans(
         self,
@@ -1313,6 +1476,8 @@ class MtpAclGraphRunner:
         draft_input_embedding: torch.Tensor | None = None,
         draft_topk_indices: torch.Tensor | None = None,
     ) -> None:
+        if self._closed:
+            raise RuntimeError("MTP graph runner is closed")
         self.capability.require_aclgraph()
         self._validate_inputs(seed_token_ids, base_positions, kv_seq_lens)
         if draft_input_embedding is not None:
@@ -1351,7 +1516,6 @@ class MtpAclGraphRunner:
             stage = "warmup synchronize"
             self._capture_stream.synchronize()
             torch.npu.current_stream().wait_stream(self._capture_stream)
-            torch.npu.synchronize()
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 stage = "warmup collective barrier"
                 torch.distributed.barrier()
@@ -1362,6 +1526,7 @@ class MtpAclGraphRunner:
             self.recipe.bind_graph_contexts(capture_context, *self._execution_states)
             with torch.npu.stream(self._capture_stream), torch.npu.graph(self._graph, stream=self._capture_stream):
                 self._static_output = self._run_static()
+            self._graph_tasks = capture_context.tasks
         except Exception as exc:
             capture_error = RuntimeError(f"MTP ACL graph capture failed during {stage}: {exc}")
         finally:
@@ -1389,14 +1554,16 @@ class MtpAclGraphRunner:
         kv_seq_lens: torch.Tensor | None = None,
         draft_input_embedding: torch.Tensor | None = None,
         draft_topk_indices: torch.Tensor | None = None,
-    ) -> SpeculativeExecutionOutput:
+    ) -> SpeculativeExecutionOutput | SpeculativeRuntimeOutput:
+        if self._closed:
+            raise RuntimeError("MTP graph runner is closed")
         self._validate_inputs(seed_token_ids, base_positions, kv_seq_lens)
         self._validate_recurrent_inputs(draft_input_embedding, draft_topk_indices)
         reference = None
         if self.kv_payload_oracle is not None:
             self.kv_payload_oracle.observe_next_attention_read_set(base_positions)
             reference = self.kv_payload_oracle.run_reference(
-                seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding, draft_topk_indices
+                seed_token_ids.to(torch.long), base_positions, kv_seq_lens, draft_input_embedding, draft_topk_indices
             )
         if self.backend == "eager":
             if self.prepare is not None:
@@ -1418,18 +1585,25 @@ class MtpAclGraphRunner:
                 self._static_kv_seq_lens.copy_(kv_seq_lens)
             if self._static_draft_input_embedding is not None:
                 assert draft_input_embedding is not None
-                self._static_draft_input_embedding.copy_(draft_input_embedding)
+                if (
+                    draft_input_embedding.data_ptr() != self._static_draft_input_embedding.data_ptr()
+                    or draft_input_embedding.stride() != self._static_draft_input_embedding.stride()
+                ):
+                    self._static_draft_input_embedding.copy_(draft_input_embedding)
             if self._static_draft_topk_indices is not None:
                 assert draft_topk_indices is not None
                 self._static_draft_topk_indices.copy_(draft_topk_indices)
             self._prepare_static_inputs()
             self._capture_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self._capture_stream):
+                self._update_graph_tasks(self._capture_stream)
                 self._graph.replay()
             torch.npu.current_stream().wait_stream(self._capture_stream)
             assert self._static_output is not None
             output = self._clone_graph_output(self._static_output)
 
+        if isinstance(output, SpeculativeRuntimeOutput):
+            return output
         next_state = SpeculativeDeviceState(
             token_ids=output.next_tokens,
             positions=output.next_positions,
@@ -1452,9 +1626,299 @@ class MtpAclGraphRunner:
             top_logprobs=output.target_top_log_probs,
             top_tokens=output.target_top_tokens,
             target_probs=output.target_probs,
+            draft_hidden=output.draft_hidden,
+            draft_logits=output.draft_logits,
+            draft_topk_indices=output.draft_topk_indices,
+            target_logits=output.target_logits,
+            target_topk_indices=output.target_topk_indices,
         )
         if self.kv_payload_oracle is not None:
             assert reference is not None
             self.kv_payload_oracle.compare(result, reference)
             self.kv_payload_oracle.record_rejected_target_slots(result)
         return result
+
+    def _update_graph_tasks(self, stream: object) -> None:
+        """Refresh captured attention arguments before serial replay."""
+        for task in self._graph_tasks:
+            torch.npu.graph_task_update_begin(stream, task.handle)
+            task.update()
+            torch.npu.graph_task_update_end(stream)
+            task.event.record(stream)
+
+
+class MtpGraphVariantRegistry:
+    """Own captured MTP recipes and their FIFO lifetime in Python.
+
+    The C++ worker only supplies metadata, input tensors, and sampling
+    controls.  Compatibility checks, capture, replay updates, and bounded
+    eviction stay with the Python objects that own the recipe and its graph
+    addresses.  Entries are intentionally FIFO: reusing an entry does not
+    change its eviction order, which keeps graph lifetime deterministic.
+    """
+
+    def __init__(
+        self,
+        target_executor: object,
+        draft_executor: object,
+        *,
+        max_variants: int = 8,
+        draft_activate: ActivateFn | None = None,
+        target_activate: ActivateFn | None = None,
+        capture_runner: Callable[..., None] | None = None,
+        draft_metadata_factory: SparseMetadataFactory | None = None,
+        target_metadata_factory: SparseMetadataFactory | None = None,
+    ) -> None:
+        if max_variants <= 0:
+            raise ValueError("MTP graph variant capacity must be positive")
+        if not hasattr(target_executor, "create_mtp_graph_runner_from_metadata"):
+            raise TypeError("target executor cannot create MTP graph runners")
+        self._target_executor = target_executor
+        self._draft_executor = draft_executor
+        self._max_variants = max_variants
+        self._draft_activate = draft_activate
+        self._target_activate = target_activate
+        self._capture_runner = capture_runner
+        self._draft_metadata_factory = draft_metadata_factory
+        self._target_metadata_factory = target_metadata_factory
+        self._variants: dict[tuple[object, ...], MtpAclGraphRunner] = {}
+        self._sparse_bindings: dict[tuple[object, ...], MtpSparseMetadataBinding] = {}
+        self.draft_embedding_destination: torch.Tensor | None = None
+
+    @property
+    def variant_count(self) -> int:
+        return len(self._variants)
+
+    def _evict_if_full(self) -> None:
+        if len(self._variants) >= self._max_variants:
+            logger.warning(
+                "MTP Python graph variant capacity reached; evicting oldest: capacity=%d", self._max_variants
+            )
+            oldest_key = next(iter(self._variants))
+            self._retire_variant(oldest_key)
+
+    def _retire_variant(self, key: tuple[object, ...]) -> None:
+        self._variants[key].close()
+        del self._variants[key]
+        self._sparse_bindings.pop(key, None)
+
+    @torch.inference_mode()
+    def execute_sparse(
+        self,
+        block_table: torch.Tensor,
+        first_kv_seq_lens: torch.Tensor,
+        first_slots: torch.Tensor,
+        repair_token_ids: torch.Tensor,
+        seed_token_ids: torch.Tensor,
+        base_positions: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
+        draft_input_embedding: torch.Tensor,
+        batch_size: int,
+        speculative_tokens: int,
+        vocab_size: int,
+        block_size: int,
+        target_step_major_layout: bool = False,
+        return_probs: bool = False,
+        logprobs: bool = False,
+        max_top_logprobs: int = 0,
+    ) -> SpeculativeExecutionOutput | SpeculativeRuntimeOutput:
+        """Execute the admitted sparse/greedy path using final graph storage.
+
+        Sampling flags are immutable for a variant. The Worker has already
+        rejected per-request distribution transforms before this entry point.
+        """
+        capacity = 1 << (max(32, block_table.shape[1]) - 1).bit_length()
+        key = (
+            "sparse",
+            batch_size,
+            speculative_tokens,
+            vocab_size,
+            block_size,
+            target_step_major_layout,
+            # Token/position destinations have fixed integer dtypes; their
+            # caller dtype/stride does not change the captured graph. Reuse
+            # the same variant across bootstrap and fused continuation.
+            draft_input_embedding.shape,
+            draft_input_embedding.dtype,
+            draft_input_embedding.device,
+            return_probs,
+            logprobs,
+            max_top_logprobs,
+        )
+        variant = self._variants.get(key)
+        if variant is not None and self._sparse_bindings[key].table_capacity < capacity:
+            # A single capacity per batch/output contract: grow before capture,
+            # reuse it on shrink, and clear unused columns in the fused update.
+            # Retirement waits for replay/snapshot consumers before allocation.
+            self._retire_variant(key)
+            variant = None
+        if variant is None:
+            self._evict_if_full()
+            draft_factory = self._draft_metadata_factory
+            target_factory = self._target_metadata_factory
+            if draft_factory is None or target_factory is None:
+                raise RuntimeError("sparse MTP registry requires native metadata factories")
+            draft_plan = MtpSamplingPlan(batch_size=batch_size, return_probs=False)
+            target_plan = MtpSamplingPlan(
+                batch_size=batch_size, return_probs=return_probs, logprobs=logprobs, max_top_logprobs=max_top_logprobs
+            )
+
+            draft_storage = MtpSparseMetadataStorage(
+                draft_factory,
+                [batch_size * (2 if step == 0 else 1) for step in range(speculative_tokens)],
+                capacity,
+                block_table.device,
+                share_block_tables=True,
+            )
+            target_storage = MtpSparseMetadataStorage(
+                target_factory, [batch_size * (speculative_tokens + 1)], capacity, block_table.device
+            )
+            position_storage = MtpSparsePositionStorage(batch_size, speculative_tokens, block_table.device)
+            variant = self._target_executor.create_mtp_graph_runner_from_metadata(
+                self._draft_executor,
+                draft_storage.metadata,
+                target_storage.metadata[0],
+                repair_token_ids=repair_token_ids,
+                batch_size=batch_size,
+                speculative_tokens=speculative_tokens,
+                vocab_size=vocab_size,
+                kv_seq_lens=kv_seq_lens,
+                target_step_major_layout=target_step_major_layout,
+                draft_activate=self._draft_activate,
+                target_activate=self._target_activate,
+                draft_sampling=draft_plan,
+                target_sampling=target_plan,
+                runtime_outputs_only=True,
+                draft_metadata_storage=draft_storage,
+                target_metadata_storage=target_storage,
+                position_storage=position_storage,
+            )
+            draft_role = variant.recipe.draft_forward
+            target_role = variant.recipe.target_forward
+            binding = MtpSparseMetadataBinding(
+                draft_role._metadata_by_step,
+                draft_role._metadata_arenas,
+                target_role._metadata_by_step,
+                target_role._metadata_arenas,
+                position_storage=position_storage,
+                batch_size=batch_size,
+                speculative_tokens=speculative_tokens,
+                table_capacity=capacity,
+                block_size=block_size,
+                target_step_major=target_step_major_layout,
+            )
+            binding.update(block_table, base_positions, kv_seq_lens, first_kv_seq_lens, first_slots)
+            logger.info("MTP Python graph variant capture: index=%d", len(self._variants))
+            inputs = (seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding, None)
+            if self._capture_runner is None:
+                variant.capture(*inputs)
+            else:
+                self._capture_runner(variant, *inputs)
+            draft_role.require_direct_metadata_update()
+            target_role.require_direct_metadata_update()
+            self._variants[key] = variant
+            self._sparse_bindings[key] = binding
+        else:
+            self._sparse_bindings[key].update(block_table, base_positions, kv_seq_lens, first_kv_seq_lens, first_slots)
+            variant.recipe.draft_forward.update_repair_token_ids(repair_token_ids)
+            logger.debug("MTP Python graph variant replay: count=%d", len(self._variants))
+        output = variant.execute(seed_token_ids, base_positions, kv_seq_lens, draft_input_embedding)
+        # Export the destination for the next C++ fused prepare. A capacity or
+        # output-layout transition copies once into the newly resolved variant
+        # and publishes its replacement destination after execution.
+        self.draft_embedding_destination = variant.draft_embedding_destination
+        return output
+
+    def execute(
+        self,
+        draft_metadata: Sequence[object],
+        target_metadata: object,
+        *,
+        repair_token_ids: torch.Tensor,
+        seed_token_ids: torch.Tensor,
+        base_positions: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
+        draft_input_embedding: torch.Tensor,
+        draft_topk_indices: torch.Tensor | None = None,
+        batch_size: int,
+        speculative_tokens: int,
+        vocab_size: int,
+        target_step_major_layout: bool = False,
+        draft_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+        target_sampling: MtpSamplingPlan | dict[str, object] | None = None,
+    ) -> SpeculativeExecutionOutput | SpeculativeRuntimeOutput:
+        draft_sampling_plan = coerce_sampling_plan(draft_sampling, batch_size=batch_size)
+        target_sampling_plan = coerce_sampling_plan(target_sampling, batch_size=batch_size)
+        metadata_by_step = tuple(draft_metadata)
+        key = (
+            batch_size,
+            speculative_tokens,
+            vocab_size,
+            target_step_major_layout,
+            tuple(_metadata_signature(metadata) for metadata in metadata_by_step),
+            _metadata_signature(target_metadata),
+            tuple(
+                _tensor_signature(value)
+                for value in (
+                    repair_token_ids,
+                    seed_token_ids,
+                    base_positions,
+                    kv_seq_lens,
+                    draft_input_embedding,
+                    draft_topk_indices,
+                )
+            ),
+            None if draft_sampling_plan is None else draft_sampling_plan.layout_signature(),
+            None if target_sampling_plan is None else target_sampling_plan.layout_signature(),
+        )
+        variant = self._variants.get(key)
+        if variant is not None:
+            # update_* owns validation. Preflighting again here repeats the
+            # same metadata/signature walks on every hot replay.
+            variant.update_metadata(metadata_by_step, target_metadata, repair_token_ids)
+            variant.update_sampling_plans(draft_sampling_plan, target_sampling_plan)
+            logger.debug("MTP Python graph variant replay: count=%d", len(self._variants))
+            return variant.execute(
+                seed_token_ids,
+                base_positions,
+                kv_seq_lens,
+                draft_input_embedding,
+                draft_topk_indices,
+            )
+
+        self._evict_if_full()
+        logger.info("MTP Python graph variant capture: index=%d", len(self._variants))
+        variant = self._target_executor.create_mtp_graph_runner_from_metadata(
+            self._draft_executor,
+            metadata_by_step,
+            target_metadata,
+            repair_token_ids=repair_token_ids,
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            vocab_size=vocab_size,
+            kv_seq_lens=kv_seq_lens,
+            target_step_major_layout=target_step_major_layout,
+            draft_activate=self._draft_activate,
+            target_activate=self._target_activate,
+            draft_sampling=draft_sampling_plan,
+            target_sampling=target_sampling_plan,
+            runtime_outputs_only=True,
+        )
+        capture = (
+            variant.capture if self._capture_runner is None else lambda *args: self._capture_runner(variant, *args)
+        )
+        capture(
+            seed_token_ids,
+            base_positions,
+            kv_seq_lens,
+            draft_input_embedding,
+            draft_topk_indices,
+        )
+        self._variants[key] = variant
+        return variant.execute(
+            seed_token_ids,
+            base_positions,
+            kv_seq_lens,
+            draft_input_embedding,
+            draft_topk_indices,
+        )

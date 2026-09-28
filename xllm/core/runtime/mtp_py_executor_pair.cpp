@@ -29,19 +29,12 @@ namespace xllm::detail {
 namespace {
 
 MtpPyGraphOutput parse_graph_output(const py::object& output) {
-  py::object next_state = output.attr("next_state");
   MtpPyGraphOutput result;
-  result.accepted_ids = output.attr("accepted_ids").cast<torch::Tensor>();
-  result.accepted_mask = output.attr("accepted_mask").cast<torch::Tensor>();
+  result.token_state =
+      tensor_from_python(py::getattr(output, "token_state", py::none()));
   result.accepted_count = output.attr("accepted_count").cast<torch::Tensor>();
   result.committed_tokens =
       output.attr("committed_tokens").cast<torch::Tensor>();
-  result.next_token_ids = next_state.attr("token_ids").cast<torch::Tensor>();
-  result.next_positions = next_state.attr("positions").cast<torch::Tensor>();
-  result.next_kv_seq_lens = tensor_from_python(next_state.attr("kv_seq_lens"));
-  result.next_embeddings = tensor_from_python(next_state.attr("embeddings"));
-  result.next_topk_indices =
-      tensor_from_python(next_state.attr("topk_indices"));
   result.target_embeddings =
       tensor_from_python(output.attr("target_embeddings"));
   result.target_probs = tensor_from_python(output.attr("target_probs"));
@@ -51,157 +44,73 @@ MtpPyGraphOutput parse_graph_output(const py::object& output) {
   return result;
 }
 
-py::list metadata_list(const std::vector<py::object>& metadata) {
-  py::list result;
-  for (const py::object& item : metadata) {
-    result.append(item);
-  }
-  return result;
-}
-
 }  // namespace
 
-std::unique_ptr<MtpPyExecutorPair> MtpPyExecutorPair::create(
+std::unique_ptr<MtpPyGraphVariantRegistry> MtpPyGraphVariantRegistry::create(
     PyExecutorImpl& target_executor,
     PyExecutorImpl& draft_executor,
-    const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata,
+    int32_t max_variants) {
+  py::gil_scoped_acquire gil;
+  py::object registry = target_executor.create_mtp_graph_variant_registry(
+      draft_executor, max_variants);
+  return std::unique_ptr<MtpPyGraphVariantRegistry>(
+      new MtpPyGraphVariantRegistry(std::move(registry)));
+}
+
+MtpPyGraphVariantRegistry::MtpPyGraphVariantRegistry(py::object registry)
+    : registry_(std::move(registry)),
+      execute_sparse_(registry_.attr("execute_sparse")) {}
+
+MtpPyGraphVariantRegistry::~MtpPyGraphVariantRegistry() {
+  clear_python_object(execute_sparse_);
+  clear_python_object(registry_);
+}
+
+MtpPyGraphOutput MtpPyGraphVariantRegistry::execute_sparse(
+    const torch::Tensor& block_table,
+    const torch::Tensor& first_kv_seq_lens,
+    const torch::Tensor& first_slots,
     const torch::Tensor& repair_token_ids,
+    const torch::Tensor& seed_token_ids,
+    const torch::Tensor& base_positions,
     const torch::Tensor& kv_seq_lens,
+    const torch::Tensor& draft_input_embedding,
     int32_t batch_size,
     int32_t speculative_tokens,
     int64_t vocab_size,
-    const py::object& draft_sampling_plan,
-    const py::object& target_sampling_plan,
-    bool target_step_major_layout) {
+    int32_t block_size,
+    bool target_step_major_layout,
+    bool return_probs,
+    bool logprobs,
+    int32_t max_top_logprobs) {
+  CHECK(registry_);
   py::gil_scoped_acquire gil;
-  py::object runner =
-      target_executor.create_mtp_graph_runner(draft_executor,
-                                              draft_metadata,
-                                              target_metadata,
-                                              repair_token_ids,
-                                              kv_seq_lens,
-                                              batch_size,
-                                              speculative_tokens,
-                                              vocab_size,
-                                              draft_sampling_plan,
-                                              target_sampling_plan,
-                                              target_step_major_layout);
-  return std::unique_ptr<MtpPyExecutorPair>(
-      new MtpPyExecutorPair(std::move(runner)));
-}
-
-MtpPyExecutorPair::MtpPyExecutorPair(py::object runner)
-    : runner_(std::move(runner)) {}
-
-MtpPyExecutorPair::~MtpPyExecutorPair() { clear_python_object(runner_); }
-
-MtpPyGraphOutput MtpPyExecutorPair::capture_and_execute(
-    const torch::Tensor& seed_token_ids,
-    const torch::Tensor& base_positions,
-    const torch::Tensor& kv_seq_lens,
-    const torch::Tensor& draft_input_embedding,
-    const torch::Tensor& draft_topk_indices) {
-  CHECK(runner_);
-  py::gil_scoped_acquire gil;
-  py::object optional_topk =
-      draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
-  LOG(INFO) << "MTP unified pair capture begin";
   try {
-    runner_.attr("capture")(seed_token_ids,
-                            base_positions,
-                            kv_seq_lens,
-                            draft_input_embedding,
-                            optional_topk);
+    py::object output = execute_sparse_(block_table,
+                                        first_kv_seq_lens,
+                                        first_slots,
+                                        repair_token_ids,
+                                        seed_token_ids,
+                                        base_positions,
+                                        kv_seq_lens,
+                                        draft_input_embedding,
+                                        batch_size,
+                                        speculative_tokens,
+                                        vocab_size,
+                                        block_size,
+                                        target_step_major_layout,
+                                        return_probs,
+                                        logprobs,
+                                        max_top_logprobs);
+    MtpPyGraphOutput parsed = parse_graph_output(output);
+    parsed.draft_embedding_destination =
+        tensor_from_python(registry_.attr("draft_embedding_destination"));
+    return parsed;
   } catch (const py::error_already_set& error) {
-    LOG(ERROR) << "MTP unified pair capture failed: " << error.what();
+    LOG(ERROR) << "MTP Python graph variant registry execution failed: "
+               << error.what();
     throw;
   }
-  LOG(INFO) << "MTP unified pair capture done; replay begin";
-  py::object output;
-  try {
-    output = runner_.attr("execute")(seed_token_ids,
-                                     base_positions,
-                                     kv_seq_lens,
-                                     draft_input_embedding,
-                                     optional_topk);
-  } catch (const py::error_already_set& error) {
-    LOG(ERROR) << "MTP unified pair replay failed: " << error.what();
-    throw;
-  }
-  LOG(INFO) << "MTP unified pair replay done";
-  return parse_graph_output(output);
-}
-
-bool MtpPyExecutorPair::can_update_metadata(
-    const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata) const {
-  CHECK(runner_);
-  py::gil_scoped_acquire gil;
-  return runner_
-      .attr("can_update_metadata")(metadata_list(draft_metadata),
-                                   target_metadata)
-      .cast<bool>();
-}
-
-bool MtpPyExecutorPair::can_update_sampling_plans(
-    const py::object& draft_sampling_plan,
-    const py::object& target_sampling_plan) const {
-  CHECK(runner_);
-  py::gil_scoped_acquire gil;
-  return runner_
-      .attr("can_update_sampling_plans")(draft_sampling_plan,
-                                         target_sampling_plan)
-      .cast<bool>();
-}
-
-std::string MtpPyExecutorPair::metadata_key(
-    const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata,
-    const py::object& draft_sampling_plan,
-    const py::object& target_sampling_plan) const {
-  CHECK(runner_);
-  py::gil_scoped_acquire gil;
-  py::object key = runner_.attr("metadata_key")(metadata_list(draft_metadata),
-                                                target_metadata,
-                                                draft_sampling_plan,
-                                                target_sampling_plan);
-  return py::repr(key).cast<std::string>();
-}
-
-MtpPyGraphOutput MtpPyExecutorPair::update_and_execute(
-    const std::vector<py::object>& draft_metadata,
-    const py::object& target_metadata,
-    const torch::Tensor& repair_token_ids,
-    const torch::Tensor& seed_token_ids,
-    const torch::Tensor& base_positions,
-    const torch::Tensor& kv_seq_lens,
-    const torch::Tensor& draft_input_embedding,
-    const torch::Tensor& draft_topk_indices,
-    const py::object& draft_sampling_plan,
-    const py::object& target_sampling_plan) {
-  CHECK(runner_);
-  py::gil_scoped_acquire gil;
-  py::object optional_topk =
-      draft_topk_indices.defined() ? py::cast(draft_topk_indices) : py::none();
-  runner_.attr("update_metadata")(
-      metadata_list(draft_metadata), target_metadata, repair_token_ids);
-  runner_.attr("update_sampling_plans")(draft_sampling_plan,
-                                        target_sampling_plan);
-  LOG(INFO) << "MTP unified pair replay begin (reused graph)";
-  py::object output;
-  try {
-    output = runner_.attr("execute")(seed_token_ids,
-                                     base_positions,
-                                     kv_seq_lens,
-                                     draft_input_embedding,
-                                     optional_topk);
-  } catch (const py::error_already_set& error) {
-    LOG(ERROR) << "MTP unified pair replay failed: " << error.what();
-    throw;
-  }
-  LOG(INFO) << "MTP unified pair replay done (reused graph)";
-  return parse_graph_output(output);
 }
 
 }  // namespace xllm::detail

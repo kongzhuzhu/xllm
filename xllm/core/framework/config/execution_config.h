@@ -41,8 +41,10 @@ class ExecutionConfig final {
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
-        {"enable_task_pipeline",
+        {"worker_plugin",
+         "enable_task_pipeline",
          "enable_graph",
+         "enable_unified_mtp_graph",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -61,10 +63,18 @@ class ExecutionConfig final {
     return kOptionCategory;
   }
 
+  // Empty selects the default plugin for the model/backend.
+  PROPERTY(std::string, worker_plugin) = "";
+
   // Enable the task pipeline; scheduler overlap determines the slot count.
   PROPERTY(bool, enable_task_pipeline) = false;
 
   PROPERTY(bool, enable_graph) = false;
+
+  // Route supported NPU MTP requests through the unified Python graph path.
+  // Disabling this keeps the legacy ACL graph/decode route available for
+  // comparison and fallback without disabling ordinary graph execution.
+  PROPERTY(bool, enable_unified_mtp_graph) = true;
 
   PROPERTY(bool, disable_graph_warmup) = false;
 

@@ -81,6 +81,38 @@ TEST_F(MtpPrepareNextDraftTest, ProducesExpectedOutputsForMixedAcceptance) {
   EXPECT_TRUE(torch::equal(output->positions.cpu(), expected_positions));
   EXPECT_TRUE(torch::equal(output->kv_seq_lens.cpu(), expected_kv_seq_lens));
   EXPECT_TRUE(torch::equal(output->cache_slots.cpu(), expected_slots));
+
+  // Compact rank-2 inputs carry only previous/current hidden rows. The
+  // rejected-first previous row must still use the placeholder, not row 0.
+  const torch::Tensor compact = torch::stack({accepted_embeddings_cpu[0][2],
+                                              accepted_embeddings_cpu[0][3],
+                                              accepted_embeddings_cpu[1][0],
+                                              accepted_embeddings_cpu[1][1],
+                                              accepted_embeddings_cpu[2][0],
+                                              accepted_embeddings_cpu[2][0]});
+  MtpPrepareNextDraftWorkspace workspace;
+  for (const torch::ScalarType dtype : {torch::kBFloat16, torch::kFloat16}) {
+    const auto compact_output =
+        try_mtp_prepare_next_draft(accepted_tokens_cpu.to(npu_device),
+                                   compact.to(dtype).to(npu_device),
+                                   placeholder_cpu.to(dtype).to(npu_device),
+                                   base_positions_cpu.to(npu_device),
+                                   base_kv_seq_lens_cpu.to(npu_device),
+                                   block_tables_cpu.to(npu_device),
+                                   kBlockSize,
+                                   &workspace);
+    ASSERT_TRUE(compact_output.has_value());
+    EXPECT_TRUE(torch::equal(compact_output->token_ids.cpu(), expected_tokens));
+    EXPECT_TRUE(torch::equal(compact_output->embeddings.cpu(),
+                             expected_embeddings.to(dtype)));
+    EXPECT_TRUE(
+        torch::equal(compact_output->positions.cpu(), expected_positions));
+    EXPECT_TRUE(
+        torch::equal(compact_output->cache_slots.cpu(), expected_slots));
+    EXPECT_TRUE(
+        torch::equal(compact_output->kv_seq_lens.cpu(),
+                     torch::tensor({8, 9, 10, 11, 13, 14}, torch::kInt)));
+  }
 }
 
 TEST_F(MtpPrepareNextDraftTest, RejectsUnsupportedHostInputs) {

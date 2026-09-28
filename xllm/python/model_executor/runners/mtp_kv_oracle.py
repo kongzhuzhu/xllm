@@ -274,6 +274,7 @@ class MtpKvPayloadOracle:
             draft_sampling=recipe.draft_sampling,
             target_sampling=recipe.target_sampling,
             sampling_random_inputs=recipe.sampling_random_inputs,
+            trace_intermediates=recipe.trace_intermediates,
         )
         # Preserve caller-owned input views, including previous graph outputs.
         inputs = tuple(
@@ -302,10 +303,20 @@ class MtpKvPayloadOracle:
                 msg=f"MTP eager/graph output mismatch at {name}",
             )
         self._checks += 1
+        trace_fields = (
+            "draft_hidden",
+            "draft_logits",
+            "draft_topk_indices",
+            "target_logits",
+            "target_topk_indices",
+        )
+        trace_enabled = all(name in actual_output for name in trace_fields)
         logger.info(
-            "MTP KV payload oracle passed: pid=%s iteration=%s tensors=%s accepted_count=%s exact=true",
+            "MTP KV payload oracle passed: pid=%s iteration=%s tensors=%s accepted_count=%s "
+            "intermediates=%s exact=true",
             os.getpid(),
             self._checks,
             actual_payload.tensor_count,
             reference.output["accepted_count"].tolist(),
+            trace_enabled,
         )

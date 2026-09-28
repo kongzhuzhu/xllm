@@ -65,6 +65,11 @@ Eagle3WorkerImpl::Eagle3WorkerImpl(const ParallelArgs& parallel_args,
          "(cp_size > 1).";
 }
 
+Eagle3WorkerImpl::~Eagle3WorkerImpl() {
+  // Draft token mappings must outlive any queued legacy decode.
+  drain_pending_execution();
+}
+
 bool Eagle3WorkerImpl::init_model(const std::string& model_weights_path,
                                   int32_t random_seed,
                                   MasterStatus master_status) {

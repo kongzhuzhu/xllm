@@ -18,6 +18,11 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
+DEFINE_string(worker_plugin,
+              "",
+              "Worker plugin name. Empty selects automatically; built-ins: "
+              "unified_mtp (Python NPU MTP), legacy_mtp (compatibility). ");
+
 DEFINE_bool(enable_task_pipeline,
             false,
             "Enable the task execution pipeline. Uses two slots with "
@@ -32,6 +37,13 @@ DEFINE_bool(
     "the engine uses graph mode (CUDA Graph for GPU, ACL Graph for NPU, "
     "MLU Graph, or DCU Graph) to optimize decode performance by reducing "
     "kernel launch overhead and device idle time.");
+
+DEFINE_bool(
+    enable_unified_mtp_graph,
+    true,
+    "Whether to route supported NPU MTP decode requests through the unified "
+    "Python graph path. When disabled, MTP uses the legacy ACL graph/decode "
+    "route while ordinary graph execution remains enabled.");
 
 DEFINE_bool(disable_graph_warmup,
             false,
@@ -116,8 +128,10 @@ DEFINE_bool(enable_dsa_multi_stream,
 namespace xllm {
 
 void ExecutionConfig::from_flags() {
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(worker_plugin);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_unified_mtp_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_mode_decode_no_padding);
@@ -136,8 +150,10 @@ void ExecutionConfig::from_flags() {
 }
 
 void ExecutionConfig::from_json(const JsonReader& json) {
+  XLLM_CONFIG_ASSIGN_FROM_JSON(worker_plugin);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_unified_mtp_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_mode_decode_no_padding);
@@ -159,9 +175,13 @@ void ExecutionConfig::append_config_json(
     nlohmann::ordered_json& config_json) const {
   const ExecutionConfig default_config;
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, worker_plugin);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_task_pipeline);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_unified_mtp_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, disable_graph_warmup);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

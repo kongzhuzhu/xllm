@@ -131,8 +131,10 @@ void EmbeddingCache::write_target_context(
       << "accepted target embeddings are undefined";
   CHECK_EQ(accepted_tokens.dim(), 2)
       << "accepted target tokens should be [batch, width]";
-  CHECK_EQ(accepted_embeddings.dim(), 3)
-      << "accepted target embeddings should be [batch, width, hidden]";
+  const bool compact = accepted_embeddings.dim() == 2;
+  CHECK(compact || accepted_embeddings.dim() == 3)
+      << "target embeddings must be compact [2*batch, hidden] or full [batch, "
+         "width, hidden]";
   CHECK_EQ(accepted_tokens.size(0), static_cast<int64_t>(ids.size()))
       << "accepted token batch mismatch";
   CHECK(request_ids.empty() || request_ids.size() == ids.size())
@@ -146,10 +148,18 @@ void EmbeddingCache::write_target_context(
           accepted_count.scalar_type() == torch::kLong)
         << "accepted count must be int32 or int64";
   }
-  CHECK_EQ(accepted_embeddings.size(0), static_cast<int64_t>(ids.size()))
+  CHECK_EQ(accepted_embeddings.size(0),
+           static_cast<int64_t>(ids.size()) * (compact ? 2 : 1))
       << "accepted embedding batch mismatch";
-  CHECK_EQ(accepted_tokens.size(1), accepted_embeddings.size(1))
-      << "accepted token/embedding width mismatch";
+  if (!compact) {
+    CHECK_EQ(accepted_tokens.size(1), accepted_embeddings.size(1))
+        << "accepted token/embedding width mismatch";
+  }
+  const torch::Tensor embedding_rows =
+      compact ? accepted_embeddings.view({static_cast<int64_t>(ids.size()),
+                                          2,
+                                          accepted_embeddings.size(-1)})
+              : accepted_embeddings;
   CHECK_GE(num_speculative_tokens, 0) << "invalid speculative token count";
 
   torch::Tensor accepted_tokens_cpu = to_cpu_int64_contiguous(accepted_tokens);
@@ -207,15 +217,20 @@ void EmbeddingCache::write_target_context(
     state.position_offset = last_idx;
     state.correction_token_id = correction_token;
     state.correction_position_offset = correction_offset;
-    state.embedding = clone_contiguous_detached_tensor(
-        accepted_embeddings.select(/*dim=*/0, i).select(/*dim=*/0, last_idx));
+    const torch::Tensor row = embedding_rows.select(/*dim=*/0, i);
     if (last_idx > 0) {
-      const int64_t prev_token =
+      const int64_t previous_token =
           accepted_tokens_data[row_offset + last_idx - 1];
-      state.prev_token_id = static_cast<int32_t>(prev_token);
-      state.prev_embedding = clone_contiguous_detached_tensor(
-          accepted_embeddings.select(/*dim=*/0, i)
-              .select(/*dim=*/0, last_idx - 1));
+      state.prev_token_id = static_cast<int32_t>(previous_token);
+      // One request-sized snapshot keeps both rows alive without pinning a
+      // whole batch output. Subsequent replay may overwrite its source.
+      const torch::Tensor pair = clone_contiguous_detached_tensor(row.narrow(
+          /*dim=*/0, /*start=*/compact ? 0 : last_idx - 1, /*length=*/2));
+      state.prev_embedding = pair.select(/*dim=*/0, /*index=*/0);
+      state.embedding = pair.select(/*dim=*/0, /*index=*/1);
+    } else {
+      state.embedding = clone_contiguous_detached_tensor(
+          row.select(/*dim=*/0, /*index=*/compact ? 1 : 0));
     }
 
     DecodeState& tail = mutable_tail(ids[i]);
