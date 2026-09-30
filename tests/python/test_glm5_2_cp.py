@@ -105,7 +105,7 @@ def _make_model(events: list[str]) -> tuple[glm5_2.Glm52Model, list[_DecoderLaye
     model = glm5_2.Glm52Model.__new__(glm5_2.Glm52Model)
     nn.Module.__init__(model)
     layers = [_DecoderLayer(layer_id, events) for layer_id in range(2)]
-    model.cfg = SimpleNamespace(indexer_rope_interleave=True)
+    model.cfg = SimpleNamespace(indexer_rope_interleave=True, enable_attn_dp_weight_sharding=False)
     model.embed_tokens = _Embedding(events)
     model.layers = nn.ModuleList(layers)
     model.norm = _Norm(events)
@@ -246,6 +246,7 @@ def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
     moe.ep_size = 4
+    moe.cfg = SimpleNamespace(enable_attn_dp_weight_sharding=False)
     cp_context = object()
     local_hidden = torch.tensor([[30.0], [10.0]])
     global_hidden = torch.tensor([[10.0], [20.0], [30.0], [40.0]])

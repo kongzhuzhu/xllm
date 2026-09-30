@@ -60,13 +60,18 @@ def mla_head_split(n_heads: int, tp_size: int) -> tuple[int, int]:
 
 
 def effective_moe_tp(cfg: MoeParallelConfig) -> int:
-    """TP degree for MoE weights: ``moe_tp_size`` under EP, otherwise attention ``tp_size``."""
-    return cfg.moe_tp_size if cfg.ep_size > 1 else cfg.tp_size
+    """Use the independent MoE group when supplied by the parallel bridge."""
+    if cfg.ep_size > 1 or getattr(cfg, "enable_attn_dp_weight_sharding", False):
+        return cfg.moe_tp_size
+    return cfg.tp_size
 
 
 def moe_shard(cfg: MoeParallelConfig) -> tuple[int, int]:
     """(world, rank) for sharding routed-expert / shared-expert weights."""
-    rank = cfg.moe_tp_rank if cfg.ep_size > 1 else cfg.tp_rank
+    if cfg.ep_size > 1 or getattr(cfg, "enable_attn_dp_weight_sharding", False):
+        rank = cfg.moe_tp_rank
+    else:
+        rank = cfg.tp_rank
     return effective_moe_tp(cfg), rank
 
 
@@ -204,6 +209,9 @@ class W8A8WeightLoader(WeightLoader):
         proj: str,
         shard_dims: Optional[dict[str, int]] = None,
         dynamic_activation: Optional[bool] = None,
+        *,
+        world: Optional[int] = None,
+        rank: Optional[int] = None,
     ) -> bool:
         """Load a static- or dynamic-activation W8A8 projection.
 
@@ -225,7 +233,7 @@ class W8A8WeightLoader(WeightLoader):
             tensor = self.load_tensor(prefix + proj + "." + suffix)
             dim = dims.get(suffix)
             if dim is not None:
-                tensor = self.shard(tensor, dim=dim)
+                tensor = self.shard(tensor, dim=dim, world=world, rank=rank)
             self.copy_in(prefix + proj + "." + suffix, tensor)
         return dynamic_activation
 

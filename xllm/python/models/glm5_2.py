@@ -39,6 +39,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
+from xllm.python.attention.attn_dp_collectives import (
+    attention_latent_all_to_all_dp_tp,
+    o_all_reduce_dp_tp,
+    q_head_all_to_all_dp_tp,
+    quantized_value_all_to_all_dp_tp,
+)
+from xllm.python.attention.attn_dp_layout import AttnDpLayout
 from xllm.python.attention.backend import AttentionBackend, MlaIndexContext
 from xllm.python.device_stream import get_device_stream
 from xllm.python.layers import ColumnParallelLinear
@@ -61,6 +68,7 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekV3Model,
     DeepseekV3MoE,
     W8A8AttentionLinear,
+    _interleave_rope_with,
     _tp_rank_from_device,
     _validate_rope_cos_sin,
 )
@@ -87,6 +95,9 @@ def _load_w8a8_attention_projection(
     prefix: str,
     proj: str,
     shard_dims: dict[str, int] | None = None,
+    *,
+    world: int | None = None,
+    rank: int | None = None,
 ) -> None:
     dynamic_activation = loader.w8a8_projection_uses_dynamic_activation(prefix, proj)
     module._set_dynamic_activation(dynamic_activation)
@@ -95,6 +106,8 @@ def _load_w8a8_attention_projection(
         proj,
         shard_dims,
         dynamic_activation=dynamic_activation,
+        world=world,
+        rank=rank,
     )
 
 
@@ -162,6 +175,7 @@ class Glm52Config:
     num_nextn_predict_layers: int = 0
     index_share_for_mtp_iteration: bool = False
     enable_mlapo: bool = True
+    enable_attn_dp_weight_sharding: bool = False
     layers_to_capture: tuple[int, ...] = ()
 
     @classmethod
@@ -267,6 +281,7 @@ class Glm52Config:
             num_nextn_predict_layers=int(pick("num_nextn_predict_layers", default=0)),
             index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
             enable_mlapo=bool(pick("enable_mlapo", default=True)),
+            enable_attn_dp_weight_sharding=bool(pick("enable_attn_dp_weight_sharding", default=False)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
         cfg._resolve_indexer_types()
@@ -304,6 +319,19 @@ class Glm52Config:
             raise ValueError("layerwise_split_rank must be in [0, layerwise_split_size)")
         if self.layerwise_split_size > 1 and self.cp_size > 1:
             raise ValueError("GLM5.2 Python does not support CP and layerwise split together")
+        if self.enable_attn_dp_weight_sharding:
+            if self.cp_size != 1 or self.layerwise_split_size != 1:
+                raise ValueError("attention DP sharding requires cp_size=1 and layerwise_split_size=1")
+            if self.dp_size <= 1:
+                raise ValueError("attention DP sharding requires dp_size > 1")
+            if self.n_heads % (self.tp_size * self.dp_size):
+                raise ValueError("attention heads must be divisible by tp_size * dp_size")
+
+    def attention_weight_shard(self) -> tuple[int, int]:
+        """Keep each TP owner's head range contiguous across its DP peers."""
+        if self.enable_attn_dp_weight_sharding:
+            return self.tp_size * self.dp_size, self.tp_rank * self.dp_size + self.dp_rank
+        return self.tp_size, self.tp_rank
 
     def _resolve_indexer_types(self) -> None:
         """Derive per-layer indexer mode (full/shared)."""
@@ -338,10 +366,115 @@ class Glm52Config:
         return mla_head_split(self.n_heads, self.tp_size)
 
 
+def _attn_dp_execution_counts(cfg: Glm52Config) -> tuple[int, ...]:
+    counts = tuple(get_forward_context().metadata.dp_execution_token_counts)
+    if len(counts) != cfg.dp_size or any(count <= 0 for count in counts):
+        raise ValueError("attention DP requires positive execution token counts for every DP rank")
+    return counts
+
+
+def _attn_dp_owner_rows(value: torch.Tensor, cfg: Glm52Config) -> torch.Tensor:
+    counts = _attn_dp_execution_counts(cfg)
+    padded_tokens = max(counts)
+    if value.shape[0] != cfg.dp_size * padded_tokens:
+        raise ValueError("attention DP output must contain all padded DP rows")
+    return value.narrow(0, cfg.dp_rank * padded_tokens, counts[cfg.dp_rank])
+
+
+def _attn_dp_gather_inputs(
+    hidden: torch.Tensor, positions: torch.Tensor, cfg: Glm52Config
+) -> tuple[torch.Tensor, torch.Tensor]:
+    counts = _attn_dp_execution_counts(cfg)
+    local_tokens = counts[cfg.dp_rank]
+    if hidden.shape[0] != local_tokens or positions.shape[0] != local_tokens:
+        raise ValueError("attention DP execution counts must match local hidden and positions")
+    pad = max(counts) - local_tokens
+    hidden = F.pad(hidden, (0, 0, 0, pad))
+    positions = F.pad(positions.to(torch.int64), (0, pad))
+    hidden = distributed.all_gather(hidden, dim=0, world_size=cfg.dp_size, group_name="dp")
+    positions = distributed.all_gather(positions, dim=0, world_size=cfg.dp_size, group_name="dp")
+    return hidden, positions
+
+
 class Glm52MLAAttention(DeepseekV3MLAAttention):
     """Checkpoint, index-sharing and CP/layerwise adapters for common MLA."""
 
     _linear_type = W8A8AttentionLinear
+
+    def __init__(self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__(cfg, layer_id, dtype, device)
+        self._attn_dp_layout: AttnDpLayout | None = None
+        self.register_buffer("W_UV_owner", torch.empty(0, dtype=dtype, device=device), persistent=False)
+        if not cfg.enable_attn_dp_weight_sharding:
+            return
+        world, _ = cfg.attention_weight_shard()
+        self.weight_heads_local = cfg.n_heads // world
+        self._attn_dp_layout = AttnDpLayout(
+            world_size=world,
+            num_heads=cfg.n_heads,
+            q_head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+            kv_lora_rank=cfg.kv_lora_rank,
+            hidden_size=cfg.hidden_size,
+            owner_heads=self.num_heads_local,
+        )
+        # Backend/cache metadata still describes TP-local owner heads. Only
+        # the head-dependent projection weights are sharded over TP * DP.
+        heads = self.weight_heads_local
+        self.q_b_proj = W8A8AttentionLinear(
+            cfg.q_lora_rank, heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), device
+        )
+        self.kv_b_proj = ColumnParallelLinear(
+            cfg.kv_lora_rank,
+            heads * (cfg.qk_nope_head_dim + cfg.v_head_dim),
+            world,
+            dtype=dtype,
+            device=device,
+        )
+        self.o_proj = W8A8AttentionLinear(heads * cfg.v_head_dim, cfg.hidden_size, device, row_parallel=True)
+        self.W_UK = torch.empty(heads, cfg.qk_nope_head_dim, cfg.kv_lora_rank, dtype=dtype, device=device)
+        self.W_UV = torch.empty(heads, cfg.kv_lora_rank, cfg.v_head_dim, dtype=dtype, device=device)
+        self._use_fused_mla_decode = False
+        self._use_mlapo_v2 = False
+
+    def process_weights_after_loading(self, owner_kv_b_proj: torch.Tensor | None = None) -> None:
+        if getattr(self, "_attn_dp_layout", None) is None:
+            super().process_weights_after_loading()
+            return
+        if self.o_proj._dynamic_activation and owner_kv_b_proj is None:
+            raise ValueError("dynamic attention DP requires the owner TP shard of kv_b_proj")
+        self._prepare_separate_a_projections()
+        self.q_b_proj.process_weights_after_loading()
+        self.o_proj.process_weights_after_loading()
+        if not self.o_proj._dynamic_activation and self.cfg.dp_rank != 0:
+            # The inherited row-parallel linear adds bias only on tp_rank=0.
+            # C4 spans DP as well, so only DP0 may contribute that bias.
+            self.o_proj.quant_bias.zero_()
+        weight = self.kv_b_proj.weight.data.view(
+            self.weight_heads_local,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        w_uk, w_uv = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.W_UK.copy_(w_uk.contiguous())
+        if self.o_proj._dynamic_activation:
+            owner_weight = owner_kv_b_proj.view(
+                self.num_heads_local,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
+            )
+            self.W_UV_owner = (
+                owner_weight[:, self.qk_nope_head_dim :]
+                .transpose(1, 2)
+                .to(device=self.W_UV.device, dtype=self.W_UV.dtype)
+                .contiguous()
+            )
+            self.W_UV = self.W_UV.new_empty(0)
+        else:
+            self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
+        # Preserve the parameter identity held by the checkpoint loader while
+        # releasing the staging storage after absorbing UK/UV.
+        self.kv_b_proj.weight.data = self.kv_b_proj.weight.new_empty(0)
+        self._prepare_indexer_weights()
 
     def _mlapo_enabled(self, cfg: Glm52Config, device: torch.device) -> bool:
         return _can_use_mlapo_v2(cfg, device)
@@ -504,6 +637,104 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
             attn_out = backend.execute_mla(q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk)
         return attn_out
 
+    def _forward_with_topk(
+        self,
+        hidden: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        query_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prev_topk: torch.Tensor | None = None,
+        reuse_topk: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if getattr(self, "_attn_dp_layout", None) is None:
+            return super()._forward_with_topk(
+                hidden, half_rope_cos, half_rope_sin, rope_cos, rope_sin, query_cos_sin, prev_topk, reuse_topk
+            )
+        layout = self._attn_dp_layout
+        counts = _attn_dp_execution_counts(self.cfg)
+        local_tokens = counts[self.cfg.dp_rank]
+        padded_tokens = max(counts)
+        if hidden.shape[0] != self.cfg.dp_size * padded_tokens:
+            raise ValueError("attention DP hidden must contain all padded DP rows")
+        offset = self.cfg.dp_rank * padded_tokens
+        local_hidden = hidden.narrow(0, offset, local_tokens)
+        local_rope = tuple(
+            value.narrow(0, offset, local_tokens) for value in (half_rope_cos, half_rope_sin, rope_cos, rope_sin)
+        )
+        if query_cos_sin is None:
+            raise ValueError("attention DP requires indexer RoPE coefficients")
+        local_query_cos_sin = tuple(value.narrow(0, offset, local_tokens) for value in query_cos_sin)
+        backend = get_forward_context().attention_backend
+
+        q_c, q = self._normalize_and_project_query(self.q_a_proj(hidden))
+        local_q_c = (
+            tuple(value.narrow(0, offset, local_tokens) for value in q_c)
+            if isinstance(q_c, tuple)
+            else q_c.narrow(0, offset, local_tokens)
+        )
+        q = q.view(hidden.shape[0], self.weight_heads_local, self.qk_nope_head_dim + self.qk_rope_head_dim)
+        q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_latent = kernels.atb_matmul_ein_sum(q_nope, self.W_UK)
+        owner_query = q_head_all_to_all_dp_tp(
+            torch.cat((q_latent, q_rope), dim=-1),
+            layout,
+            local_tokens,
+            padded_tokens,
+            self.cfg.tp_size,
+            self.cfg.dp_size,
+            self.cfg.tp_rank,
+            self.cfg.dp_rank,
+        )
+        q_latent, q_rope = owner_query.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        q_pe = _interleave_rope_with(q_rope, local_rope[2], local_rope[3])
+        kv = self.kv_a_proj_with_mqa(local_hidden)
+        k_latent_raw, k_rope = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_latent = self.kv_a_layernorm(k_latent_raw).unsqueeze(1)
+        k_pe = _interleave_rope_with(k_rope.unsqueeze(1), local_rope[2], local_rope[3])
+        topk = self._select_topk(
+            local_hidden, local_q_c, backend, *local_rope, local_query_cos_sin, prev_topk, reuse_topk
+        )
+        attn_out = backend.execute_mla(q_latent.contiguous(), q_pe, k_latent, k_pe, self, topk=topk)
+        if self.o_proj._dynamic_activation:
+            if self.W_UV_owner.numel() == 0:
+                raise RuntimeError("dynamic attention DP requires full owner-local W_UV weights")
+            owner_value = kernels.atb_matmul_ein_sum(attn_out, self.W_UV_owner)
+            owner_value = owner_value.reshape(local_tokens, self.num_heads_local * self.v_head_dim)
+            value_i8, scale = kernels.dynamic_quant(owner_value)
+            weight_value, weight_scale = quantized_value_all_to_all_dp_tp(
+                value_i8,
+                scale,
+                layout,
+                self.v_head_dim,
+                local_tokens,
+                padded_tokens,
+                self.cfg.tp_size,
+                self.cfg.dp_size,
+                self.cfg.tp_rank,
+                self.cfg.dp_rank,
+            )
+            output = self.o_proj.forward_quantized(
+                weight_value.reshape(hidden.shape[0], self.weight_heads_local * self.v_head_dim), weight_scale
+            )
+        else:
+            weight_latent = attention_latent_all_to_all_dp_tp(
+                attn_out,
+                layout,
+                local_tokens,
+                padded_tokens,
+                self.cfg.tp_size,
+                self.cfg.dp_size,
+                self.cfg.tp_rank,
+                self.cfg.dp_rank,
+            )
+            value = kernels.atb_matmul_ein_sum(weight_latent, self.W_UV)
+            output = self.o_proj(value.reshape(hidden.shape[0], self.weight_heads_local * self.v_head_dim))
+        output_dtype = output.dtype
+        output = o_all_reduce_dp_tp(output.float(), layout, padded_tokens, self.cfg.dp_size)
+        return output.to(output_dtype), topk
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -615,11 +846,22 @@ class Glm52MoE(DeepseekV3MoE):
             return super()._combine_expert_outputs(routed, shared)
 
         final = routed + shared
+        if getattr(self.cfg, "enable_attn_dp_weight_sharding", False):
+            if self.moe_tp_size > 1:
+                distributed.all_reduce_(final, "moe_tp")
+            return final
         if self.cfg.tp_size > 1:
             distributed.all_reduce_(final, "tp")
         return final
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.cfg.enable_attn_dp_weight_sharding:
+            # The model already materialized padded DP rows for all layers.
+            if self._fine_overlap_enabled:
+                return self._forward_fine_grained_parallel(hidden)
+            if self._expert_parallel_enabled:
+                return self._forward_parallel(hidden)
+            return self._combine_expert_outputs(self._run_routed_experts(hidden), self._run_shared_experts(hidden))
         cp_context = get_forward_context().cp_context
         if cp_context is None or self.ep_size == 1:
             return super().forward(hidden)
@@ -690,6 +932,25 @@ class Glm52Model(DeepseekV3Model):
     def _indexer_interleaved(self) -> bool:
         return self.cfg.indexer_rope_interleave
 
+    def _prepare_layer_inputs(
+        self, hidden: torch.Tensor, positions: torch.Tensor, cp_context: CpContext | None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, torch.Tensor]]:
+        if self.cfg.enable_attn_dp_weight_sharding:
+            if cp_context is not None:
+                raise ValueError("attention DP sharding does not support CP")
+            hidden, positions = _attn_dp_gather_inputs(hidden, positions, self.cfg)
+        return super()._prepare_layer_inputs(hidden, positions, cp_context)
+
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        output = super().forward(input_ids, positions)
+        if not self.cfg.enable_attn_dp_weight_sharding:
+            return output
+        if isinstance(output, tuple):
+            return tuple(_attn_dp_owner_rows(value, self.cfg) for value in output)
+        return _attn_dp_owner_rows(output, self.cfg)
+
 
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
@@ -758,6 +1019,7 @@ class Glm52ForCausalLM(PyModelBase):
             loader.copy_replicated(p + "post_attention_layernorm.weight")
             attn = p + "self_attn."
             attention = self.model.layers[i].self_attn
+            attn_world, attn_rank = cfg.attention_weight_shard()
             _load_w8a8_attention_projection(loader, attention.q_a_proj, attn, "q_a_proj")
             loader.copy_replicated(attn + "q_a_layernorm.weight")
             _load_w8a8_attention_projection(
@@ -772,6 +1034,8 @@ class Glm52ForCausalLM(PyModelBase):
                     "weight_scale": 0,
                     "weight_offset": 0,
                 },
+                world=attn_world,
+                rank=attn_rank,
             )
             _load_w8a8_attention_projection(
                 loader,
@@ -780,8 +1044,13 @@ class Glm52ForCausalLM(PyModelBase):
                 "kv_a_proj_with_mqa",
             )
             loader.copy_replicated(attn + "kv_a_layernorm.weight")
-            loader.copy_shard(attn + "kv_b_proj.weight", dim=0)
-            _load_w8a8_attention_projection(loader, attention.o_proj, attn, "o_proj", {"weight": 1})
+            loader.copy_in(
+                attn + "kv_b_proj.weight",
+                loader.load_shard(attn + "kv_b_proj.weight", dim=0, world=attn_world, rank=attn_rank),
+            )
+            _load_w8a8_attention_projection(
+                loader, attention.o_proj, attn, "o_proj", {"weight": 1}, world=attn_world, rank=attn_rank
+            )
             if not attention.is_shared:
                 idx = attn + "indexer."
                 assert attention.indexer is not None
@@ -790,7 +1059,14 @@ class Glm52ForCausalLM(PyModelBase):
                 loader.copy_replicated(idx + "k_norm.weight")
                 loader.copy_replicated(idx + "k_norm.bias")
                 loader.copy_replicated(idx + "weights_proj.weight")
-            attention.process_weights_after_loading()
+            if cfg.enable_attn_dp_weight_sharding and attention.o_proj._dynamic_activation:
+                # Quantize the complete owner TP row before splitting its V
+                # features; shard-local scales would change W8A8 numerics.
+                owner_kv_b = loader.load_shard(attn + "kv_b_proj.weight", dim=0, world=cfg.tp_size, rank=cfg.tp_rank)
+                attention.process_weights_after_loading(owner_kv_b)
+                del owner_kv_b
+            else:
+                attention.process_weights_after_loading()
 
             self.model.layers[i].mlp.load_from_checkpoint(loader, p + "mlp.")
 

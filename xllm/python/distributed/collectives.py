@@ -52,7 +52,7 @@ else:
     _cuda_collectives = None
     _all_reduce = dist.all_reduce
 
-_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp"))
+_GROUP_NAMES = frozenset(("tp", "dp", "moe_tp", "moe_ep", "cp", "layerwise", "dcp", "attn_dp"))
 # ``tp`` and ``moe_tp`` own a contiguous block of global ranks, while ``dp``,
 # ``moe_ep``, ``cp`` and ``dcp`` stride across those blocks. Both layouts follow
 # from how the caller derives a rank within each group, so a group's full
@@ -136,6 +136,13 @@ def _ensure_world(
         world_size=global_world_size,
         timeout=timedelta(minutes=5),
     )
+    # Attention-DP weight shards use one full-world group for the final
+    # reduction.  It is the default process group, so no second communicator
+    # is created and the group is available even when no explicit subgroup is
+    # initialized by the runtime bridge.
+    world_key = ("attn_dp", str(device))
+    _groups[world_key] = dist.group.WORLD
+    _group_ranks[world_key] = tuple(range(global_world_size))
     _world_topology = _exchange_world_topology(store, device, global_rank, global_world_size)
     _world_initialized = True
 
@@ -148,6 +155,10 @@ def _group_memberships(group_name: str, world_size: int, global_world_size: int)
     """
     if world_size <= 0 or global_world_size % world_size:
         raise ValueError(f"{group_name} size {world_size} does not divide the world size {global_world_size}")
+    if group_name == "attn_dp":
+        if world_size != global_world_size:
+            raise ValueError("attn_dp must cover the full process world")
+        return [list(range(global_world_size))]
     count = global_world_size // world_size
     if group_name in _CONTIGUOUS_GROUPS:
         return [[index * world_size + offset for offset in range(world_size)] for index in range(count)]
@@ -167,6 +178,10 @@ def init_process_group(
 ) -> ProcessGroup:
     if group_name not in _GROUP_NAMES:
         raise ValueError(f"unsupported parallel group: {group_name}")
+    if group_name == "attn_dp" and (
+        world_size <= 0 or world_size != global_world_size or rank != global_rank or group_index != 0
+    ):
+        raise ValueError("attn_dp must use the full process world and global rank")
     device_obj = torch.device(device)
     group_key = (group_name, str(device_obj))
     group = _groups.get(group_key)
@@ -180,6 +195,8 @@ def init_process_group(
         return group
 
     _ensure_world(host, port, device_obj, global_rank, global_world_size)
+    if group_name == "attn_dp":
+        return _groups[group_key]
     backend = _backend_for(device_obj)
 
     own = None
@@ -406,6 +423,35 @@ def _(
     return x.new_empty(shape)
 
 
+def _check_collective_buffers(output: torch.Tensor, input: torch.Tensor) -> None:
+    if output.device != input.device or output.dtype != input.dtype:
+        raise ValueError("collective buffers must have the same device and dtype")
+    if not output.is_contiguous() or not input.is_contiguous():
+        raise ValueError("collective buffers must be contiguous")
+
+
+@torch.library.custom_op("xllm_ops::all_to_all_single", mutates_args={"output"})
+def all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group_name: str = "tp",
+) -> None:
+    """Exchange equal first-dimension chunks among ranks in ``group_name``."""
+    group = _require_group(input, group_name)
+    if input.ndim == 0 or output.shape != input.shape or input.shape[0] % group.size():
+        raise ValueError(
+            f"{group_name} all-to-all requires equal shapes and a divisible first dimension, "
+            f"got input={tuple(input.shape)}, output={tuple(output.shape)}, world_size={group.size()}"
+        )
+    _check_collective_buffers(output, input)
+    dist.all_to_all_single(output, input, group=group)
+
+
+@all_to_all_single.register_fake
+def _(output: torch.Tensor, input: torch.Tensor, group_name: str = "tp") -> None:
+    del output, input, group_name
+
+
 def gather_dp_execution_tokens(
     x: torch.Tensor,
     execution_token_counts: Sequence[int],
@@ -450,5 +496,6 @@ __all__ = [
     "broadcast_",
     "all_gather",
     "all_gather_variable",
+    "all_to_all_single",
     "gather_dp_execution_tokens",
 ]

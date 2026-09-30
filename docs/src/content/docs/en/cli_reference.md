@@ -224,6 +224,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | `output_shm_size` | `uint64` | `128` | Output shared-memory size. Default is 128MB. |
 | `random_seed` | `int32` | `-1` | Random seed for the random number generator. `-1` means no fixed seed. |
 | `enable_dsa_multi_stream` | `bool` | `false` | Local overlap in the Python GLM indexer: K/weights projections run on a side stream and stay fused when query/cache rows match; the main stream joins before updating the index cache. Non-interleaved RoPE additionally overlaps Q projection/RoPE with cache preparation. Main attention preparation finishes before the indexer. Requires a supported model backend and stream-capable device. |
+| `enable_attn_dp_weight_sharding` | `bool` | `false` | Shard Python GLM MLA head-dependent attention weights across TP and DP. Requires DP > 1, CP = 1, layerwise split = 1, and attention heads divisible by TP × DP. Attention still executes TP-local heads on each token owner, with three collectives per layer. MoE uses its independent MoE TP/EP groups. |
 
 ## KernelConfig
 

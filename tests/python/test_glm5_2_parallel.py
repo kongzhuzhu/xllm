@@ -598,6 +598,9 @@ class _RecordingLoader(W8A8WeightLoader):
         proj: str,
         _shard_dims: dict | None = None,
         dynamic_activation: bool | None = None,
+        *,
+        world: int | None = None,
+        rank: int | None = None,
     ) -> bool:
         self.loaded.append(prefix + proj)
         assert dynamic_activation is self.dynamic_activation
@@ -852,3 +855,173 @@ def test_glm_attention_selects_checkpoint_quantization(
             assert projection.quant_bias.numel() == projection.out_features
             assert projection.input_scale.numel() == 1
             assert projection.input_offset.numel() == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(("tp_size", "dp_size"), [(8, 2), (1, 16)])
+def test_attn_dp_switch_preserves_backend_heads(enabled: bool, tp_size: int, dp_size: int) -> None:
+    values = _config(
+        num_attention_heads=64,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        world_size=16,
+        enable_attn_dp_weight_sharding=enabled,
+        ep_size=1,
+        moe_tp_size=16,
+        moe_tp_rank=13,
+        moe_intermediate_size=2048,
+    )
+    cfg = Glm52Config.from_dict(values)
+    cfg.validate()
+    ranks = []
+    for tp_rank in range(tp_size):
+        for dp_rank in range(dp_size):
+            cfg.tp_rank, cfg.dp_rank = tp_rank, dp_rank
+            world, rank = cfg.attention_weight_shard()
+            assert world == (16 if enabled else tp_size)
+            assert rank == (tp_rank * dp_size + dp_rank if enabled else tp_rank)
+            ranks.append(rank)
+    if enabled:
+        assert ranks == list(range(16))
+    attention = glm5_2.Glm52MLAAttention(cfg, 0, torch.float32, torch.device("cpu"))
+    owner_heads = cfg.n_heads // tp_size
+    assert attention.num_heads_local == attention.num_heads == owner_heads
+    assert attention.q_b_proj.out_features == (4 if enabled else owner_heads) * 8
+    assert attention.o_proj.in_features == (4 if enabled else owner_heads) * cfg.v_head_dim
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cp_size": 2, "world_size": 8},
+        {"layerwise_split_size": 2},
+        {"dp_size": 1, "world_size": 2},
+        {"num_attention_heads": 6},
+    ],
+)
+def test_attn_dp_rejects_unsupported_layout(overrides: dict) -> None:
+    cfg = Glm52Config.from_dict(_config(enable_attn_dp_weight_sharding=True, **overrides))
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+
+def test_attn_dp_switch_defaults_off() -> None:
+    cfg = Glm52Config.from_dict(_config())
+    assert cfg.enable_attn_dp_weight_sharding is False
+    assert cfg.attention_weight_shard() == (cfg.tp_size, cfg.tp_rank)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_attn_dp_absorbs_only_weight_heads_and_preserves_owner_uv(dynamic: bool, dp_rank: int) -> None:
+    cfg = Glm52Config.from_dict(_config(enable_attn_dp_weight_sharding=True, dp_rank=dp_rank))
+    attention = glm5_2.Glm52MLAAttention(cfg, 0, torch.float32, torch.device("cpu"))
+    owner_weight = torch.arange(2 * 8 * 4, dtype=torch.float32).reshape(16, 4)
+    attention.kv_b_proj.weight.data.copy_(owner_weight.chunk(2, dim=0)[dp_rank])
+    for projection in (attention.q_a_proj, attention.kv_a_proj_with_mqa, attention.q_b_proj, attention.o_proj):
+        projection._set_dynamic_activation(dynamic)
+        if dynamic:
+            projection.weight_offset.zero_()
+        else:
+            projection.quant_bias.fill_(7)
+    with (
+        patch.object(glm5_2.kernels, "prepare_quant_weight", side_effect=lambda weight: weight, create=True),
+        patch.object(attention, "_prepare_indexer_weights"),
+    ):
+        attention.process_weights_after_loading(owner_weight.double() if dynamic else None)
+    expected = owner_weight.view(2, 8, 4)
+    torch.testing.assert_close(attention.W_UK, expected[dp_rank : dp_rank + 1, :4])
+    if dynamic:
+        torch.testing.assert_close(attention.W_UV_owner, expected[:, 4:].transpose(1, 2))
+        assert attention.W_UV.numel() == 0
+        assert attention.W_UV_owner.dtype == attention.W_UK.dtype
+        assert attention.W_UV_owner.device == attention.W_UK.device
+    else:
+        torch.testing.assert_close(attention.W_UV, expected[dp_rank : dp_rank + 1, 4:].transpose(1, 2))
+        assert torch.all(attention.o_proj.quant_bias == (7 if dp_rank == 0 else 0))
+    assert attention.kv_b_proj.weight.numel() == 0
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("projection", ["q_b_proj", "o_proj"])
+def test_attention_weight_loader_uses_dp_tp_shards(dynamic: bool, projection: str) -> None:
+    model = Glm52ForCausalLM(_config(enable_attn_dp_weight_sharding=True, dp_rank=1))
+    module = model.model.layers[0].self_attn.get_submodule(projection)
+    prefix = "model.layers.0.self_attn."
+    name = prefix + projection
+    world, rank = model.cfg.attention_weight_shard()
+    dim = 0 if projection == "q_b_proj" else 1
+    shape = list(module.weight.shape)
+    shape[dim] *= world
+    tensors = {name + ".weight": torch.arange(shape[0] * shape[1]).to(torch.int8).reshape(shape)}
+    scale_rows = shape[0]
+    if dynamic:
+        tensors[name + ".weight_scale"] = torch.arange(scale_rows).float().reshape(-1, 1) + 1
+        tensors[name + ".weight_offset"] = torch.zeros(scale_rows, 1)
+        dims = {"weight": dim}
+        if dim == 0:
+            dims.update(weight_scale=0, weight_offset=0)
+    else:
+        tensors[name + ".deq_scale"] = torch.arange(scale_rows).float() + 1
+        tensors[name + ".quant_bias"] = torch.arange(scale_rows, dtype=torch.int32)
+        tensors[name + ".input_scale"] = torch.ones(1, dtype=torch.bfloat16)
+        tensors[name + ".input_offset"] = torch.zeros(1, dtype=torch.bfloat16)
+        dims = {"weight": dim}
+        if dim == 0:
+            dims.update(deq_scale=0, quant_bias=0)
+    loader = W8A8WeightLoader(model, [_TensorStateDict(tensors)], model.cfg.tp_size, model.cfg.tp_rank)
+    glm5_2._load_w8a8_attention_projection(loader, module, prefix, projection, dims, world=world, rank=rank)
+    for key, tensor in tensors.items():
+        suffix = key.rsplit(".", 1)[1]
+        expected = tensor.chunk(world, dim=dims[suffix])[rank] if suffix in dims else tensor
+        torch.testing.assert_close(getattr(module, suffix), expected)
+
+
+@pytest.mark.parametrize("counts", [(1, 3), (3, 1)])
+def test_attn_dp_gathers_padded_inputs_and_slices_owner_rows(counts: tuple[int, int]) -> None:
+    cfg = Glm52Config.from_dict(_config(enable_attn_dp_weight_sharding=True, dp_rank=0))
+    local_tokens = counts[0]
+    hidden = torch.arange(local_tokens * 16).float().reshape(local_tokens, 16)
+    positions = torch.arange(local_tokens, dtype=torch.int32)
+    seen = []
+
+    def gather(value: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert (dim, world_size, group_name) == (0, 2, "dp")
+        assert value.shape[0] == max(counts)
+        assert torch.count_nonzero(value[local_tokens:]) == 0
+        seen.append(value)
+        return torch.cat((value, value + 10), dim=0)
+
+    with (
+        forward_context(
+            ForwardContext(
+                attention_backend=None,
+                device=torch.device("cpu"),
+                metadata=SimpleNamespace(dp_execution_token_counts=counts),
+                layer_caches=[],
+            )
+        ),
+        patch.object(glm5_2.distributed, "all_gather", side_effect=gather),
+    ):
+        global_hidden, global_positions = glm5_2._attn_dp_gather_inputs(hidden, positions, cfg)
+        torch.testing.assert_close(glm5_2._attn_dp_owner_rows(global_hidden, cfg), hidden)
+        cfg.dp_rank = 1
+        expected = global_hidden[max(counts) : max(counts) + counts[1]]
+        torch.testing.assert_close(glm5_2._attn_dp_owner_rows(global_hidden, cfg), expected)
+    assert len(seen) == 2
+    assert global_positions.dtype == torch.int64
+
+
+def test_attn_dp_moe_uses_independent_moe_tp_without_gathering_again() -> None:
+    model = Glm52ForCausalLM(_config(enable_attn_dp_weight_sharding=True, ep_size=1, moe_tp_size=4))
+    moe = model.model.layers[0].mlp
+    hidden = torch.ones(6, 16)
+    with (
+        patch.object(moe, "_run_routed_experts", return_value=hidden * 2),
+        patch.object(moe, "_run_shared_experts", return_value=hidden * 3),
+        patch.object(glm5_2.distributed, "all_reduce_") as reduce,
+        patch.object(glm5_2.distributed, "all_gather", side_effect=AssertionError("duplicate DP gather")),
+    ):
+        output = moe(hidden)
+    torch.testing.assert_close(output, hidden * 5)
+    reduce.assert_called_once_with(output, "moe_tp")

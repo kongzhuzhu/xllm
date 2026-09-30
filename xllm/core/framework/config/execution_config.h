@@ -57,7 +57,8 @@ class ExecutionConfig final {
          "random_seed",
          "python_graph_backend",
          "enable_fia_decode",
-         "enable_dsa_multi_stream"}};
+         "enable_dsa_multi_stream",
+         "enable_attn_dp_weight_sharding"}};
     return kOptionCategory;
   }
 
@@ -95,6 +96,8 @@ class ExecutionConfig final {
   PROPERTY(bool, enable_fia_decode) = false;
 
   PROPERTY(bool, enable_dsa_multi_stream) = false;
+
+  PROPERTY(bool, enable_attn_dp_weight_sharding) = false;
 };
 
 }  // namespace xllm

@@ -260,6 +260,13 @@ py::dict PyCausalLM::build_config_dict(
   d["layerwise_split_rank"] = layerwise_split_rank_;
   d["enable_dsa_multi_stream"] =
       ExecutionConfig::get_instance().enable_dsa_multi_stream();
+  const bool enable_attn_dp_weight_sharding =
+      ExecutionConfig::get_instance().enable_attn_dp_weight_sharding();
+  CHECK(!enable_attn_dp_weight_sharding ||
+        model_args_.model_type() == "glm_moe_dsa" ||
+        model_args_.model_type() == "glm_moe_dsa_mtp")
+      << "--enable_attn_dp_weight_sharding only supports Python GLM MLA models";
+  d["enable_attn_dp_weight_sharding"] = enable_attn_dp_weight_sharding;
   const bool requires_eager_execution =
       !model_args_.layers_to_capture().empty() ||
       model_args_.model_type() == "DFlashDraftModel" ||

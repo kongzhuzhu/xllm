@@ -510,3 +510,26 @@ def test_symmetric_buffer_rejects_ineligible_allocation(monkeypatch: pytest.Monk
 
     assert cuda_collectives._symm_buffer(group, tensor) is None
     empty.assert_not_called()
+
+
+def test_attn_dp_reuses_default_world_without_an_extra_communicator(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, init_world, new_group = _mock_process_groups(monkeypatch, global_rank=0)
+    world = _FakeGroup(0, 4)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=world))
+
+    collectives.init_process_group("dp", "127.0.0.1", 46004, 0, 2, "cuda:0", 0, 4, 0)
+    before = new_group.call_count
+    group = collectives.init_process_group("attn_dp", "127.0.0.1", 46004, 0, 4, "cuda:0", 0, 4, 0)
+
+    assert group is world
+    assert collectives._group_ranks[("attn_dp", "cuda:0")] == (0, 1, 2, 3)
+    assert new_group.call_count == before
+    init_world.assert_called_once()
+
+
+def test_attn_dp_rejects_a_partial_world_before_rendezvous() -> None:
+    with (
+        patch.object(collectives, "_ensure_world", side_effect=AssertionError("invalid rendezvous")),
+        pytest.raises(ValueError, match="full process world"),
+    ):
+        collectives.init_process_group("attn_dp", "127.0.0.1", 46004, 0, 2, "cuda:0", 0, 4, 0)

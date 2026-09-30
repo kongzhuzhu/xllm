@@ -25,6 +25,8 @@ from xllm.python.models.glm5_2 import (
     Glm52Config,
     Glm52DecoderLayer,
     Glm52ForCausalLM,
+    _attn_dp_gather_inputs,
+    _attn_dp_owner_rows,
 )
 
 
@@ -78,6 +80,15 @@ class Glm52MtpModel(DeepseekV32MtpModel):
     def _indexer_interleaved(self) -> bool:
         return self.cfg.indexer_rope_interleave
 
+    def _prepare_layer_inputs(
+        self, hidden: torch.Tensor, positions: torch.Tensor, cp_context: CpContext | None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, torch.Tensor]]:
+        if self.cfg.enable_attn_dp_weight_sharding:
+            if cp_context is not None:
+                raise ValueError("attention DP sharding does not support CP")
+            hidden, positions = _attn_dp_gather_inputs(hidden, positions, self.cfg)
+        return super()._prepare_layer_inputs(hidden, positions, cp_context)
+
     def _prepare_token_hidden(self, hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return torch.where(positions.ne(0).unsqueeze(-1), hidden, torch.zeros_like(hidden))
 
@@ -90,6 +101,8 @@ class Glm52MtpModel(DeepseekV32MtpModel):
     def _format_mtp_output(
         self, hidden: torch.Tensor, topk: torch.Tensor | None
     ) -> tuple[torch.Tensor, None, torch.Tensor | None]:
+        if self.cfg.enable_attn_dp_weight_sharding:
+            hidden = _attn_dp_owner_rows(hidden, self.cfg)
         return hidden, None, topk if self.cfg.index_share_for_mtp_iteration else None
 
 

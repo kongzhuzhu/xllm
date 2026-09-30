@@ -118,7 +118,9 @@ class _DecoderLayer(nn.Module):
 def _mtp_body() -> tuple[glm5_2_mtp.Glm52MtpModel, _DecoderLayer]:
     body = glm5_2_mtp.Glm52MtpModel.__new__(glm5_2_mtp.Glm52MtpModel)
     nn.Module.__init__(body)
-    body.cfg = SimpleNamespace(index_share_for_mtp_iteration=True, indexer_rope_interleave=True)
+    body.cfg = SimpleNamespace(
+        index_share_for_mtp_iteration=True, indexer_rope_interleave=True, enable_attn_dp_weight_sharding=False
+    )
     body.embed_tokens = _Embedding()
     body.eh_proj = _SelectTokenEmbedding()
     body.rot = nn.Identity()
@@ -282,3 +284,37 @@ def test_mtp_prepares_fresh_coefficients_for_full_and_reuse_steps() -> None:
         torch.testing.assert_close(rope[2].view(2, 4), torch.cat((expected[:, :2], expected[:, :2]), dim=-1))
     assert layer.ropes[0][2].data_ptr() != layer.ropes[1][2].data_ptr()
     assert not torch.equal(layer.ropes[0][2], layer.ropes[1][2])
+
+
+def test_attn_dp_mtp_keeps_reused_topk_local_and_returns_owner_hidden() -> None:
+    body, layer = _mtp_body()
+    body.cfg.enable_attn_dp_weight_sharding = True
+    body.cfg.dp_size = 2
+    body.cfg.dp_rank = 1
+    counts = (1, 2)
+    external_topk = torch.ones(2, 1, 2, dtype=torch.int32)
+    gathers = []
+
+    def gather(value: torch.Tensor, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert (dim, world_size, group_name) == (0, 2, "dp")
+        gathers.append(value)
+        return torch.cat((value + 10, value), dim=0)
+
+    with (
+        forward_context(
+            ForwardContext(
+                attention_backend=None,
+                device=torch.device("cpu"),
+                metadata=SimpleNamespace(dp_execution_token_counts=counts),
+                layer_caches=[],
+            )
+        ),
+        patch.object(glm5_2_mtp, "record_layer_event"),
+        patch("xllm.python.models.glm5_2.distributed.all_gather", side_effect=gather),
+    ):
+        hidden, _, topk = body(torch.tensor([1, 2]), torch.tensor([1, 2]), mtp_topk_indices=external_topk)
+    assert len(gathers) == 2
+    assert hidden.shape == (2, 2)
+    assert topk is external_topk
+    assert layer.reuse_flags == [True]
+    torch.testing.assert_close(hidden, torch.tensor([[1.0, 1.0], [2.0, 2.0]]))

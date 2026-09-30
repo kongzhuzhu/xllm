@@ -343,6 +343,7 @@ DECLARE_int32(flashinfer_workspace_buffer_size);
 DECLARE_int32(random_seed);
 
 DECLARE_bool(enable_dsa_multi_stream);
+DECLARE_bool(enable_attn_dp_weight_sharding);
 
 DECLARE_string(dit_cache_policy);
 

@@ -20,6 +20,7 @@ from xllm.python.distributed.collectives import (
     all_gather,
     all_gather_variable,
     all_reduce_,
+    all_to_all_single,
     broadcast_,
     cp_rank,
     cp_world_size,
@@ -51,5 +52,6 @@ __all__ = [
     "all_reduce_",
     "all_gather",
     "all_gather_variable",
+    "all_to_all_single",
     "gather_dp_execution_tokens",
 ]

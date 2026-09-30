@@ -114,6 +114,12 @@ DEFINE_bool(enable_dsa_multi_stream,
             "Overlap projections within the Python GLM DSA indexer using "
             "SGLang NPU-style stream scheduling.");
 
+DEFINE_bool(
+    enable_attn_dp_weight_sharding,
+    false,
+    "Shard Python GLM MLA head-dependent attention weights across "
+    "TP and DP ranks. Requires DP > 1, CP=1 and layerwise_split_size=1.");
+
 namespace xllm {
 
 void ExecutionConfig::from_flags() {
@@ -134,6 +140,7 @@ void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(python_graph_backend);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_fia_decode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_dsa_multi_stream);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_attn_dp_weight_sharding);
 }
 
 void ExecutionConfig::from_json(const JsonReader& json) {
@@ -154,6 +161,7 @@ void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(python_graph_backend);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_fia_decode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_dsa_multi_stream);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_attn_dp_weight_sharding);
 }
 
 void ExecutionConfig::append_config_json(
@@ -193,6 +201,8 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, enable_fia_decode);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_dsa_multi_stream);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_attn_dp_weight_sharding);
 }
 
 ExecutionConfig& ExecutionConfig::get_instance() {
