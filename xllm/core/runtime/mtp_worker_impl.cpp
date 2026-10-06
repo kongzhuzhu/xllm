@@ -56,6 +56,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
+#include "core/runtime/mtp_runtime_helpers.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "models/model_registry.h"
 #include "runtime/llm_worker_impl.h"
@@ -69,6 +70,42 @@ namespace xllm {
 constexpr uint64_t MBUF_SIZE = 128 * 1024 * 1024;
 
 namespace {
+constexpr size_t kMaxPendingTargetContexts = 2;
+torch::Tensor acquire_pinned_output_buffer(const torch::Tensor& source,
+                                           std::vector<torch::Tensor>& pool) {
+  // Every lease is a distinct TensorImpl/view. The pending context retains
+  // it through event synchronization; serializers may retain it longer.
+  // Unique storage therefore proves both producer and consumers retired.
+  auto available =
+      std::find_if(pool.begin(), pool.end(), [&source](const auto& buffer) {
+        return buffer.storage().use_count() == 1 &&
+               buffer.scalar_type() == source.scalar_type() &&
+               buffer.numel() >= source.numel();
+      });
+  if (available == pool.end()) {
+    available = std::find_if(pool.begin(), pool.end(), [](const auto& buffer) {
+      return buffer.storage().use_count() == 1;
+    });
+  }
+  torch::Tensor buffer;
+  if (available != pool.end()) {
+    buffer = *available;
+  }
+  if (!buffer.defined() || buffer.scalar_type() != source.scalar_type() ||
+      buffer.numel() < source.numel()) {
+    buffer =
+        torch::empty({source.numel()},
+                     source.options().device(torch::kCPU).pinned_memory(true));
+    if (available != pool.end()) {
+      *available = buffer;
+    } else if (pool.size() < kMaxPendingTargetContexts + 2) {
+      pool.emplace_back(buffer);
+    }
+  }
+  // If all bounded pool slots are leased, this allocation belongs solely to
+  // the current consumers. Never overwrite an older output to avoid a copy.
+  return buffer.narrow(0, 0, source.numel()).view(source.sizes());
+}
 
 template <typename Input>
 bool has_active_dp_tokens(const Input& input) {
@@ -355,44 +392,6 @@ void set_token_ids_device_tensor(Input& input,
 
 torch::Tensor to_cpu_int_tensor_for_read(const torch::Tensor& values) {
   return to_cpu_contiguous(values.flatten(), torch::kInt);
-}
-
-void check_mtp_decode_states(
-    const std::vector<EmbeddingCache::DecodeState>& states,
-    const std::vector<std::string>& request_ids,
-    const torch::Tensor& token_ids_host,
-    bool allow_overlap_fake_token) {
-  CHECK(!request_ids.empty())
-      << "MTP decode requires request ids for bootstrap state validation";
-  CHECK_EQ(states.size(), request_ids.size())
-      << "MTP decode request/state count mismatch";
-  CHECK_GE(token_ids_host.numel(), static_cast<int64_t>(states.size()))
-      << "MTP decode token/state count mismatch";
-
-  Slice<int32_t> token_ids = tensor_slice(token_ids_host);
-  for (int32_t i = 0; i < static_cast<int32_t>(states.size()); ++i) {
-    const EmbeddingCache::DecodeState& state = states[i];
-    const int32_t token_id = token_ids[i];
-    CHECK(state.valid) << "MTP decode missing target state, request_id="
-                       << request_ids[i];
-    CHECK_EQ(state.request_id, request_ids[i])
-        << "MTP decode target state request mismatch";
-    CHECK(state.embedding.defined())
-        << "MTP decode target state embedding is undefined, request_id="
-        << request_ids[i];
-    if (token_id < 0) {
-      CHECK(allow_overlap_fake_token)
-          << "MTP decode fake token is only allowed with schedule overlap, "
-          << "request_id=" << request_ids[i];
-      CHECK_GE(state.token_id, 0)
-          << "MTP decode fake token requires a valid cached target token, "
-          << "request_id=" << request_ids[i];
-      continue;
-    }
-    CHECK_EQ(state.token_id, token_id)
-        << "MTP decode target state token mismatch, request_id="
-        << request_ids[i];
-  }
 }
 
 template <typename Input>
@@ -809,7 +808,35 @@ MTPWorkerImpl<TargetInput>::MTPWorkerImpl(
 }
 
 template <typename TargetInput>
-MTPWorkerImpl<TargetInput>::~MTPWorkerImpl() = default;
+MTPWorkerImpl<TargetInput>::~MTPWorkerImpl() {
+  drain_pending_execution();
+}
+
+template <typename TargetInput>
+void MTPWorkerImpl<TargetInput>::drain_pending_execution() {
+  if (execution_drained_) {
+    return;
+  }
+  folly::Promise<folly::Unit> barrier;
+  auto future = barrier.getFuture();
+  threadpool_.schedule([barrier = std::move(barrier)]() mutable {
+    barrier.setValue(folly::unit);
+  });
+  std::move(future).get();
+  // Destruction may run on an RPC thread with a different current device.
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK_EQ(compute_stream_->synchronize(), 0);
+  CHECK_EQ(prepare_stream_->synchronize(), 0);
+  execution_drained_ = true;
+}
+
+template <typename TargetInput>
+void MTPWorkerImpl<TargetInput>::retire_legacy_prelaunch() {
+  if (pending_draft_context_.output.has_value()) {
+    CHECK_EQ(compute_stream_->synchronize(), 0);
+    pending_draft_context_ = PendingDraftContext();
+  }
+}
 
 template <typename TargetInput>
 ::xllm::Status MTPWorkerImpl<TargetInput>::create_task_pipeline(
@@ -1408,15 +1435,16 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   // cache flush. The prelaunched draft can be valid before the batch is marked
   // device-context ready, while flush_pending_target_context() clears the
   // owning context below.
-  const torch::Tensor accepted_tokens = pending_target_context_.accepted_tokens;
+  const torch::Tensor accepted_tokens =
+      latest_pending_target_context().accepted_tokens;
   const torch::Tensor accepted_embeddings =
-      pending_target_context_.accepted_embeddings;
+      latest_pending_target_context().accepted_embeddings;
   const torch::Tensor target_base_positions =
-      pending_target_context_.base_positions;
+      latest_pending_target_context().base_positions;
   const torch::Tensor target_base_kv_seq_lens =
-      pending_target_context_.base_kv_seq_lens;
+      latest_pending_target_context().base_kv_seq_lens;
   const StreamEventPtr target_context_ready_event =
-      pending_target_context_.ready_event;
+      latest_pending_target_context().ready_event;
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
     // A batch transition invalidates the speculative prelaunch.  Drain it
@@ -1504,10 +1532,11 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
     // Draft preparation already falls back to the initialized placeholder for
     // invalid states, so reserve strict cache validation for real requests.
     if (!input.input_params.meta.is_graph_warmup) {
-      check_mtp_decode_states(last_states,
-                              input.input_params.embedding.request_ids,
-                              input.token_ids_host,
-                              enable_schedule_overlap());
+      mtp_detail::check_mtp_decode_states(
+          last_states,
+          input.input_params.embedding.request_ids,
+          input.token_ids_host,
+          enable_schedule_overlap());
     }
     update_decode_step_input(input, last_states);
     metadata_template = input.clone();
@@ -1560,10 +1589,11 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
     // Force cache correction before comparing it with the accepted target.
     input.token_ids_host = torch::full_like(input.token_ids_host, -1);
     update_decode_step_input(input, resolved_states);
-    check_mtp_decode_states(resolved_states,
-                            input.input_params.embedding.request_ids,
-                            input.token_ids_host,
-                            /*allow_overlap_fake_token=*/false);
+    mtp_detail::check_mtp_decode_states(
+        resolved_states,
+        input.input_params.embedding.request_ids,
+        input.token_ids_host,
+        /*allow_overlap_fake_token=*/false);
     metadata_template = input.clone();
   };
 
@@ -2386,28 +2416,30 @@ void MTPWorkerImpl<TargetInput>::stage_target_context_write(
     torch::Tensor base_kv_seq_lens,
     StreamEventPtr ready_event,
     torch::Tensor accepted_tokens_host,
-    std::vector<size_t> failed_rows) {
-  CHECK(!pending_target_context_.accepted_tokens.defined())
-      << "previous MTP target context must be flushed before staging another";
-  pending_target_context_.embedding_ids =
-      input.input_params.embedding.embedding_ids;
-  pending_target_context_.request_ids =
-      input.input_params.embedding.request_ids;
-  pending_target_context_.accepted_tokens = validate_output.next_tokens;
-  pending_target_context_.accepted_tokens_host =
-      std::move(accepted_tokens_host);
-  pending_target_context_.accepted_embeddings = validate_output.embeddings;
-  pending_target_context_.base_positions = std::move(base_positions);
-  pending_target_context_.base_kv_seq_lens = std::move(base_kv_seq_lens);
-  pending_target_context_.json_constrained_rows.clear();
-  pending_target_context_.json_constrained_rows.reserve(
-      input.json_object_states.size());
+    std::vector<size_t> failed_rows,
+    torch::Tensor accepted_count_host,
+    bool allow_immutable_compact_view) {
+  PendingTargetContext context;
+  context.generation = next_pending_target_generation_++;
+  context.embedding_ids = input.input_params.embedding.embedding_ids;
+  context.request_ids = input.input_params.embedding.request_ids;
+  context.accepted_tokens = validate_output.next_tokens;
+  context.accepted_tokens_host = std::move(accepted_tokens_host);
+  context.accepted_count_host = std::move(accepted_count_host);
+  context.accepted_embeddings = validate_output.embeddings;
+  context.base_positions = std::move(base_positions);
+  context.base_kv_seq_lens = std::move(base_kv_seq_lens);
+  context.json_constrained_rows.reserve(input.json_object_states.size());
   for (const JsonObjectGrammarState& state : input.json_object_states) {
-    pending_target_context_.json_constrained_rows.emplace_back(
-        state.initialized() ? 1U : 0U);
+    context.json_constrained_rows.emplace_back(state.initialized() ? 1U : 0U);
   }
-  pending_target_context_.failed_rows = std::move(failed_rows);
-  pending_target_context_.ready_event = std::move(ready_event);
+  context.failed_rows = std::move(failed_rows);
+  context.ready_event = std::move(ready_event);
+  context.allow_immutable_compact_view = allow_immutable_compact_view;
+  if (pending_target_context_queue_.size() >= kMaxPendingTargetContexts) {
+    flush_pending_target_context(/*keep_latest=*/kMaxPendingTargetContexts - 1);
+  }
+  pending_target_context_queue_.emplace_back(std::move(context));
 }
 
 template <typename TargetInput>
@@ -2415,13 +2447,14 @@ torch::Tensor MTPWorkerImpl<TargetInput>::acquire_accepted_tokens_host_buffer(
     const torch::Tensor& accepted_tokens) {
   CHECK(accepted_tokens.defined()) << "accepted tokens must be defined";
   CHECK_GT(accepted_tokens.numel(), 0) << "accepted tokens must not be empty";
-  CHECK(!pending_target_context_.accepted_tokens.defined())
-      << "accepted-token host buffer is still in use";
-
   const int64_t required_capacity = accepted_tokens.numel();
   const int64_t configured_capacity =
       static_cast<int64_t>(options_.max_seqs_per_batch()) *
       (static_cast<int64_t>(options_.num_speculative_tokens()) + 1);
+  if (enable_schedule_overlap()) {
+    return acquire_pinned_output_buffer(accepted_tokens,
+                                        accepted_tokens_host_pool_);
+  }
   const bool needs_allocation =
       !accepted_tokens_host_buffer_.defined() ||
       accepted_tokens_host_buffer_.scalar_type() !=
@@ -2442,12 +2475,22 @@ torch::Tensor MTPWorkerImpl<TargetInput>::acquire_accepted_tokens_host_buffer(
 template <typename TargetInput>
 bool MTPWorkerImpl<TargetInput>::pending_target_context_matches(
     const TargetInput& input) const {
-  return pending_target_context_.failed_rows.empty() &&
-         pending_target_context_.accepted_tokens.defined() &&
-         pending_target_context_.embedding_ids ==
-             input.input_params.embedding.embedding_ids &&
-         pending_target_context_.request_ids ==
-             input.input_params.embedding.request_ids;
+  if (pending_target_context_queue_.empty()) {
+    return false;
+  }
+  const PendingTargetContext& context = pending_target_context_queue_.back();
+  return context.failed_rows.empty() && context.accepted_tokens.defined() &&
+         context.embedding_ids == input.input_params.embedding.embedding_ids &&
+         context.request_ids == input.input_params.embedding.request_ids;
+}
+
+template <typename TargetInput>
+const typename MTPWorkerImpl<TargetInput>::PendingTargetContext&
+MTPWorkerImpl<TargetInput>::latest_pending_target_context() const {
+  static const PendingTargetContext empty;
+  return pending_target_context_queue_.empty()
+             ? empty
+             : pending_target_context_queue_.back();
 }
 
 template <typename TargetInput>
@@ -2460,115 +2503,180 @@ bool MTPWorkerImpl<TargetInput>::device_target_context_ready_for_batch(
 }
 
 template <typename TargetInput>
-void MTPWorkerImpl<TargetInput>::flush_pending_target_context() {
-  if (!pending_target_context_.accepted_tokens.defined()) {
-    return;
-  }
-  CHECK(pending_target_context_.ready_event == nullptr ||
-        pending_target_context_.ready_event->synchronize())
-      << "failed to wait for pending MTP target context";
-  CHECK(embedding_cache_ != nullptr)
-      << "embedding_cache_ must be initialized before target cache write";
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t num_validation_tokens = num_speculative_tokens + 1;
-  const torch::Tensor accepted_tokens =
-      pending_target_context_.accepted_tokens_host.contiguous();
-  CHECK_EQ(accepted_tokens.numel() % num_validation_tokens, 0)
-      << "MTP validation output width mismatch";
-  const torch::Tensor output_tokens =
-      accepted_tokens.view({-1, num_validation_tokens});
-  if (!pending_target_context_.json_constrained_rows.empty()) {
-    CHECK_EQ(pending_target_context_.json_constrained_rows.size(),
-             static_cast<size_t>(output_tokens.size(0)))
-        << "MTP JSON row metadata mismatch";
-  }
-  int64_t constrained_accepted = 0;
-  int64_t plain_accepted = 0;
-  int64_t constrained_draft = 0;
-  int64_t plain_draft = 0;
-  for (int64_t sequence_idx = 0; sequence_idx < output_tokens.size(0);
-       ++sequence_idx) {
-    const bool constrained =
-        !pending_target_context_.json_constrained_rows.empty() &&
-        pending_target_context_
-                .json_constrained_rows[static_cast<size_t>(sequence_idx)] != 0U;
-    int64_t rejected = 0;
-    for (int32_t token_idx = 0; token_idx < num_validation_tokens;
-         ++token_idx) {
-      if (output_tokens.index({sequence_idx, token_idx})
-              .template item<int64_t>() < 0) {
-        ++rejected;
+torch::Tensor MTPWorkerImpl<TargetInput>::snapshot_pending_target_tokens() {
+  // Retain storage, not a copy of its contents, until the D2H event completes.
+  torch::Tensor host_tokens =
+      latest_pending_target_context().accepted_tokens_host;
+  CHECK(host_tokens.defined());
+  flush_pending_target_context();
+  return host_tokens.clone();
+}
+
+template <typename TargetInput>
+void MTPWorkerImpl<TargetInput>::flush_pending_target_context(
+    size_t keep_latest) {
+  while (pending_target_context_queue_.size() > keep_latest) {
+    PendingTargetContext pending =
+        std::move(pending_target_context_queue_.front());
+    pending_target_context_queue_.pop_front();
+    if (!pending.accepted_tokens.defined()) {
+      continue;
+    }
+    CHECK(pending.ready_event == nullptr || pending.ready_event->synchronize())
+        << "failed to wait for pending MTP target context generation "
+        << pending.generation;
+    CHECK(embedding_cache_ != nullptr)
+        << "embedding_cache_ must be initialized before target cache write";
+    const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+    const int32_t num_validation_tokens = num_speculative_tokens + 1;
+    const torch::Tensor accepted_tokens =
+        pending.accepted_tokens_host.contiguous();
+    CHECK_EQ(accepted_tokens.numel() % num_validation_tokens, 0)
+        << "MTP validation output width mismatch";
+    const torch::Tensor output_tokens =
+        accepted_tokens.view({-1, num_validation_tokens});
+    if (!pending.json_constrained_rows.empty()) {
+      CHECK_EQ(pending.json_constrained_rows.size(),
+               static_cast<size_t>(output_tokens.size(0)))
+          << "MTP JSON row metadata mismatch";
+    }
+    int64_t constrained_accepted = 0;
+    int64_t plain_accepted = 0;
+    int64_t constrained_draft = 0;
+    int64_t plain_draft = 0;
+    const torch::Tensor& accepted_count_host = pending.accepted_count_host;
+    if (accepted_count_host.defined()) {
+      CHECK(accepted_count_host.device().is_cpu())
+          << "accepted count host state must be on CPU";
+      CHECK_EQ(accepted_count_host.dim(), 1)
+          << "accepted count host state must be a vector";
+      CHECK_EQ(accepted_count_host.size(0), output_tokens.size(0))
+          << "accepted count host state batch mismatch";
+      CHECK(accepted_count_host.scalar_type() == torch::kInt ||
+            accepted_count_host.scalar_type() == torch::kLong)
+          << "accepted count host state must be int32 or int64";
+    }
+    const int32_t* counts_i32 =
+        accepted_count_host.defined() &&
+                accepted_count_host.scalar_type() == torch::kInt
+            ? accepted_count_host.const_data_ptr<int32_t>()
+            : nullptr;
+    const int64_t* counts_i64 =
+        accepted_count_host.defined() &&
+                accepted_count_host.scalar_type() == torch::kLong
+            ? accepted_count_host.const_data_ptr<int64_t>()
+            : nullptr;
+    const int64_t count_stride =
+        accepted_count_host.defined() ? accepted_count_host.stride(0) : 0;
+    CHECK(output_tokens.device().is_cpu());
+    CHECK(output_tokens.scalar_type() == torch::kLong ||
+          output_tokens.scalar_type() == torch::kInt);
+    const int64_t* tokens_i64 = output_tokens.scalar_type() == torch::kLong
+                                    ? output_tokens.const_data_ptr<int64_t>()
+                                    : nullptr;
+    const int32_t* tokens_i32 = output_tokens.scalar_type() == torch::kInt
+                                    ? output_tokens.const_data_ptr<int32_t>()
+                                    : nullptr;
+    for (int64_t sequence_idx = 0; sequence_idx < output_tokens.size(0);
+         ++sequence_idx) {
+      const bool constrained =
+          !pending.json_constrained_rows.empty() &&
+          pending.json_constrained_rows[static_cast<size_t>(sequence_idx)] !=
+              0U;
+      int64_t accepted = 0;
+      if (accepted_count_host.defined()) {
+        const int64_t offset = sequence_idx * count_stride;
+        accepted =
+            counts_i32 != nullptr ? counts_i32[offset] : counts_i64[offset];
+        CHECK_GE(accepted, 0);
+        CHECK_LE(accepted, num_speculative_tokens);
+      } else {
+        int64_t rejected = 0;
+        for (int32_t token_idx = 0; token_idx < num_validation_tokens;
+             ++token_idx) {
+          const int64_t offset =
+              sequence_idx * num_validation_tokens + token_idx;
+          const int64_t token =
+              tokens_i64 != nullptr ? tokens_i64[offset] : tokens_i32[offset];
+          if (token < 0) {
+            ++rejected;
+          }
+        }
+        accepted = num_speculative_tokens -
+                   std::min<int64_t>(rejected, num_speculative_tokens);
+      }
+      if (constrained) {
+        constrained_accepted += accepted;
+        constrained_draft += num_speculative_tokens;
+      } else {
+        plain_accepted += accepted;
+        plain_draft += num_speculative_tokens;
       }
     }
-    const int64_t accepted =
-        num_speculative_tokens -
-        std::min<int64_t>(rejected, num_speculative_tokens);
-    if (constrained) {
-      constrained_accepted += accepted;
-      constrained_draft += num_speculative_tokens;
-    } else {
-      plain_accepted += accepted;
-      plain_draft += num_speculative_tokens;
-    }
-  }
-  COUNTER_ADD(speculative_num_accepted_tokens_constrained_total,
-              constrained_accepted);
-  COUNTER_ADD(speculative_num_accepted_tokens_plain_total, plain_accepted);
-  COUNTER_ADD(speculative_num_draft_tokens_constrained_total,
-              constrained_draft);
-  COUNTER_ADD(speculative_num_draft_tokens_plain_total, plain_draft);
-  if (pending_target_context_.failed_rows.empty()) {
-    embedding_cache_->write_target_context(
-        pending_target_context_.embedding_ids,
-        pending_target_context_.request_ids,
-        pending_target_context_.accepted_tokens_host,
-        pending_target_context_.accepted_embeddings,
-        options_.num_speculative_tokens());
-  } else {
-    CHECK(pending_target_context_.request_ids.empty() ||
-          pending_target_context_.request_ids.size() ==
-              pending_target_context_.embedding_ids.size())
-        << "target context request ids must match embedding ids";
-    std::unordered_set<size_t> failed_row_set(
-        pending_target_context_.failed_rows.begin(),
-        pending_target_context_.failed_rows.end());
-    CHECK_EQ(failed_row_set.size(), pending_target_context_.failed_rows.size())
-        << "target context failed rows must be unique";
-
-    std::vector<int32_t> failed_embedding_ids;
-    failed_embedding_ids.reserve(pending_target_context_.failed_rows.size());
-    for (const size_t failed_row : pending_target_context_.failed_rows) {
-      CHECK_LT(failed_row, pending_target_context_.embedding_ids.size())
-          << "target context failed row exceeds embedding ids";
-      failed_embedding_ids.emplace_back(
-          pending_target_context_.embedding_ids[failed_row]);
-    }
-    embedding_cache_->clear(failed_embedding_ids);
-
-    for (size_t sequence_index = 0;
-         sequence_index < pending_target_context_.embedding_ids.size();
-         ++sequence_index) {
-      if (failed_row_set.contains(sequence_index)) {
-        continue;
-      }
-      const std::vector<int32_t> row_embedding_ids = {
-          pending_target_context_.embedding_ids[sequence_index]};
-      const std::vector<std::string> row_request_ids =
-          pending_target_context_.request_ids.empty()
-              ? std::vector<std::string>()
-              : std::vector<std::string>{
-                    pending_target_context_.request_ids[sequence_index]};
+    COUNTER_ADD(speculative_num_accepted_tokens_constrained_total,
+                constrained_accepted);
+    COUNTER_ADD(speculative_num_accepted_tokens_plain_total, plain_accepted);
+    COUNTER_ADD(speculative_num_draft_tokens_constrained_total,
+                constrained_draft);
+    COUNTER_ADD(speculative_num_draft_tokens_plain_total, plain_draft);
+    if (pending.failed_rows.empty()) {
       embedding_cache_->write_target_context(
-          row_embedding_ids,
-          row_request_ids,
-          pending_target_context_.accepted_tokens_host.narrow(
-              /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
-          pending_target_context_.accepted_embeddings.narrow(
-              /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
-          options_.num_speculative_tokens());
+          pending.embedding_ids,
+          pending.request_ids,
+          pending.accepted_tokens_host,
+          pending.accepted_embeddings,
+          pending.accepted_count_host,
+          options_.num_speculative_tokens(),
+          pending.allow_immutable_compact_view);
+    } else {
+      CHECK(pending.request_ids.empty() ||
+            pending.request_ids.size() == pending.embedding_ids.size())
+          << "target context request ids must match embedding ids";
+      std::unordered_set<size_t> failed_row_set(pending.failed_rows.begin(),
+                                                pending.failed_rows.end());
+      CHECK_EQ(failed_row_set.size(), pending.failed_rows.size())
+          << "target context failed rows must be unique";
+
+      std::vector<int32_t> failed_embedding_ids;
+      failed_embedding_ids.reserve(pending.failed_rows.size());
+      for (const size_t failed_row : pending.failed_rows) {
+        CHECK_LT(failed_row, pending.embedding_ids.size())
+            << "target context failed row exceeds embedding ids";
+        failed_embedding_ids.emplace_back(pending.embedding_ids[failed_row]);
+      }
+      embedding_cache_->clear(failed_embedding_ids);
+
+      for (size_t sequence_index = 0;
+           sequence_index < pending.embedding_ids.size();
+           ++sequence_index) {
+        if (failed_row_set.contains(sequence_index)) {
+          continue;
+        }
+        const std::vector<int32_t> row_embedding_ids = {
+            pending.embedding_ids[sequence_index]};
+        const std::vector<std::string> row_request_ids =
+            pending.request_ids.empty()
+                ? std::vector<std::string>()
+                : std::vector<std::string>{pending.request_ids[sequence_index]};
+        embedding_cache_->write_target_context(
+            row_embedding_ids,
+            row_request_ids,
+            pending.accepted_tokens_host.narrow(
+                /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
+            pending.accepted_embeddings.dim() == 2
+                ? pending.accepted_embeddings.narrow(
+                      /*dim=*/0, /*start=*/sequence_index * 2, /*length=*/2)
+                : pending.accepted_embeddings.narrow(
+                      /*dim=*/0, /*start=*/sequence_index, /*length=*/1),
+            pending.accepted_count_host.defined()
+                ? pending.accepted_count_host.narrow(
+                      /*dim=*/0, /*start=*/sequence_index, /*length=*/1)
+                : torch::Tensor(),
+            options_.num_speculative_tokens(),
+            pending.allow_immutable_compact_view);
+      }
     }
   }
-  pending_target_context_ = PendingTargetContext();
 }
 
 template <typename TargetInput>

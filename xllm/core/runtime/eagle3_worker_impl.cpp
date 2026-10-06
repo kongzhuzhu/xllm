@@ -68,6 +68,11 @@ Eagle3WorkerImpl<TargetInput>::Eagle3WorkerImpl(
 }
 
 template <typename TargetInput>
+Eagle3WorkerImpl<TargetInput>::~Eagle3WorkerImpl() {
+  this->drain_pending_execution();
+}
+
+template <typename TargetInput>
 bool Eagle3WorkerImpl<TargetInput>::init_model(
     const std::string& model_weights_path,
     int32_t random_seed,

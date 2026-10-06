@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -247,6 +248,9 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
       bool wait_for_compute_stream = true);
 
   struct PendingTargetContext {
+    uint64_t generation = 0;
+    torch::Tensor accepted_count_host;
+    bool allow_immutable_compact_view = false;
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
     // Both tensors stay on device.  A steady-state overlap step consumes them
@@ -280,12 +284,18 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
                                   torch::Tensor base_kv_seq_lens,
                                   StreamEventPtr ready_event,
                                   torch::Tensor accepted_tokens_host,
-                                  std::vector<size_t> failed_rows);
+                                  std::vector<size_t> failed_rows,
+                                  torch::Tensor accepted_count_host = {},
+                                  bool allow_immutable_compact_view = false);
   torch::Tensor acquire_accepted_tokens_host_buffer(
       const torch::Tensor& accepted_tokens);
   bool pending_target_context_matches(const TargetInput& input) const;
   bool device_target_context_ready_for_batch(const TargetInput& input) const;
-  void flush_pending_target_context();
+  void flush_pending_target_context(size_t keep_latest = 0);
+  const PendingTargetContext& latest_pending_target_context() const;
+  torch::Tensor snapshot_pending_target_tokens();
+  void drain_pending_execution();
+  void retire_legacy_prelaunch();
   bool supports_combined_first_draft_execution() const;
   bool can_use_combined_first_draft() const;
   bool can_prelaunch_next_first_draft(const TargetInput& input) const;
@@ -314,7 +324,10 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   // Rejection sampling produces accepted state on the compute stream.  Keep
   // that state device-resident so the next overlap task can be fully enqueued
   // without waiting for target verification to finish.
-  PendingTargetContext pending_target_context_;
+  std::deque<PendingTargetContext> pending_target_context_queue_;
+  uint64_t next_pending_target_generation_ = 1;
+  bool execution_drained_ = false;
+  std::vector<torch::Tensor> accepted_tokens_host_pool_;
   std::vector<int32_t> device_context_ready_embedding_ids_;
   std::vector<std::string> device_context_ready_request_ids_;
   // A single persistent pinned destination is sufficient for accepted-token

@@ -23,6 +23,10 @@ namespace xllm {
 
 class LlmForwardInput;
 
+namespace kernel::npu {
+struct MtpPrepareNextDraftWorkspace;
+}  // namespace kernel::npu
+
 namespace mtp_async {
 
 // Applies accepted target state to the fixed [repair, current] draft layout.
@@ -39,7 +43,9 @@ void prepare_next_draft_from_accepted_state(
     const torch::Tensor& base_kv_seq_lens,
     bool use_chunked_prefill,
     bool rebuild_expanded_decode_metadata,
-    int32_t block_size);
+    int32_t block_size,
+    bool require_fused_npu_kernel = false,
+    kernel::npu::MtpPrepareNextDraftWorkspace* reusable_workspace = nullptr);
 
 // Builds one-row-per-sequence metadata for a later draft step from the
 // accepted device base used by draft-0. The caller must order this work after
@@ -61,7 +67,9 @@ void prepare_target_verify_from_accepted_state(
     const torch::Tensor& accepted_tokens,
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens,
-    int32_t block_size);
+    int32_t block_size,
+    bool use_chunked_prefill = false,
+    bool step_major_layout = false);
 
 }  // namespace mtp_async
 }  // namespace xllm

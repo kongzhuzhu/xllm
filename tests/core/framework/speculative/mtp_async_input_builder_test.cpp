@@ -30,6 +30,7 @@ limitations under the License.
 
 #include "core/kernels/xllm_torch_ops.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/runtime/forward_params.h"
 #include "core/runtime/py_attention_metadata.h"
@@ -142,6 +143,100 @@ TEST(MtpAsyncInputBuilderTest, CanSkipExpandedMetadataRebuild) {
   EXPECT_FALSE(draft_input.input_params.graph.expanded_kv_seq_lens.defined());
 }
 
+TEST(MtpAsyncInputBuilderTest, RefreshesVerifyPagesAfterAcceptedPrefix) {
+  const torch::Tensor original_positions =
+      torch::tensor({{2, 3, 4, 5}, {1, 2, 3, 4}}, torch::kInt);
+  const torch::Tensor expected_positions =
+      torch::tensor({{4, 5, 6, 7}, {2, 3, 4, 5}}, torch::kInt);
+  const torch::Tensor expected_slots =
+      torch::tensor({{44, 45, 46, 47}, {82, 83, 84, 85}}, torch::kInt);
+  const torch::Tensor block_tables =
+      torch::tensor({{10, 11}, {20, 21}}, torch::kInt);
+  for (bool chunked : {false, true}) {
+    for (bool step_major : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "chunked=" << chunked << ", step_major=" << step_major);
+      auto flatten_rows = [step_major](const torch::Tensor& rows) {
+        return (step_major ? rows.transpose(0, 1) : rows).flatten();
+      };
+      LlmForwardInput input;
+      input.token_ids = torch::zeros({8}, torch::kInt);
+      input.positions = flatten_rows(original_positions).clone();
+      input.positions_host = input.positions.clone();
+      auto& params = input.input_params;
+      const torch::Tensor original_kv = flatten_rows(original_positions + 1);
+      const std::vector<int32_t> original_host_kv =
+          step_major ? std::vector<int32_t>{3, 2, 4, 3, 5, 4, 6, 5}
+                     : std::vector<int32_t>{3, 4, 5, 6, 2, 3, 4, 5};
+      const torch::Tensor expanded_tables =
+          step_major ? block_tables.repeat({4, 1})
+                     : block_tables.repeat_interleave(4, 0);
+      params.attention.device.block_tables =
+          chunked ? block_tables : expanded_tables;
+      params.attention.device.kv_seq_lens =
+          chunked ? torch::tensor({6, 5}, torch::kInt) : original_kv;
+      params.attention.host.kv_seq_lens =
+          chunked ? std::vector<int32_t>{6, 5} : original_host_kv;
+      layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+          ModelInputParams(params),
+          original_kv,
+          expanded_tables,
+          original_host_kv,
+          kBlockSize);
+
+      prepare_target_verify_from_accepted_state(
+          input,
+          torch::tensor({{42, 43, -1, -1}, {52, -1, -1, -1}}, torch::kLong),
+          torch::tensor({2, 1}, torch::kInt),
+          torch::tensor({3, 2}, torch::kInt),
+          kBlockSize,
+          chunked,
+          step_major);
+
+      const torch::Tensor expected_kv = flatten_rows(expected_positions + 1);
+      const std::vector<int32_t> expected_host_kv =
+          step_major ? std::vector<int32_t>{5, 3, 6, 4, 7, 5, 8, 6}
+                     : std::vector<int32_t>{5, 6, 7, 8, 3, 4, 5, 6};
+      EXPECT_TRUE(
+          torch::equal(input.positions, flatten_rows(expected_positions)));
+      EXPECT_TRUE(torch::equal(input.positions_host, input.positions));
+      EXPECT_TRUE(torch::equal(params.attention.device.new_cache_slots,
+                               flatten_rows(expected_slots)));
+      EXPECT_TRUE(torch::equal(
+          params.attention.device.kv_seq_lens,
+          chunked ? torch::tensor({8, 6}, torch::kInt) : expected_kv));
+      EXPECT_EQ(params.attention.host.kv_seq_lens,
+                chunked ? (std::vector<int32_t>{8, 6}) : expected_host_kv);
+      EXPECT_EQ(params.meta.kv_max_seq_len, 8);
+      EXPECT_TRUE(torch::equal(params.graph.expanded_kv_seq_lens, expected_kv));
+      EXPECT_EQ(params.graph.expanded_kv_seq_lens_vec, expected_host_kv);
+      const torch::Tensor expected_indptr =
+          step_major
+              ? torch::tensor({0, 2, 3, 5, 6, 8, 10, 12, 14}, torch::kInt)
+              : torch::tensor({0, 2, 4, 6, 8, 9, 10, 12, 14}, torch::kInt);
+      const torch::Tensor expected_indices =
+          step_major
+              ? torch::tensor(
+                    {10, 11, 20, 10, 11, 20, 10, 11, 20, 21, 10, 11, 20, 21},
+                    torch::kInt)
+              : torch::tensor(
+                    {10, 11, 10, 11, 10, 11, 10, 11, 20, 20, 20, 21, 20, 21},
+                    torch::kInt);
+      EXPECT_TRUE(
+          torch::equal(params.graph.expanded_paged_kv_indptr, expected_indptr));
+      EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_indices,
+                               expected_indices));
+      EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_last_page_len,
+                               (expected_kv - 1).remainder(kBlockSize) + 1));
+      const torch::Tensor token_rows =
+          step_major ? input.token_ids.view({4, 2}).transpose(0, 1)
+                     : input.token_ids.view({2, 4});
+      EXPECT_TRUE(torch::equal(token_rows.select(1, 0),
+                               torch::tensor({43, 52}, torch::kInt)));
+    }
+  }
+}
+
 TEST(MtpAsyncInputBuilderTest, BuildsTokenwiseSpecVerifyKvLengths) {
   EXPECT_EQ(layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
                 /*q_seq_lens=*/{2, 1}, /*kv_seq_lens=*/{4, 3}),
@@ -246,7 +341,7 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
       torch::tensor({2, 7}, torch::kInt)));
 }
 
-TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
+TEST(MtpAsyncInputBuilderTest, PybindViewsPreserveGraphMetadataStorage) {
   ensure_xllm_torch_ops_registered();
   if (!Py_IsInitialized()) {
     setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0", 1);
@@ -320,6 +415,40 @@ TEST(MtpAsyncInputBuilderTest, PybindViewSelectsExpandedGraphMetadata) {
             metadata->expanded_decode.kv_seq_lens_host_vec);
   EXPECT_TRUE(torch::equal(selected[3].cast<torch::Tensor>(),
                            metadata->expanded_decode.paged_kv_indptr));
+
+  // Sparse graph views borrow the final arena tensors without Host/CSR data.
+  const torch::Tensor table = torch::tensor({{10, 11}}, torch::kInt);
+  const torch::Tensor lengths = torch::tensor({128}, torch::kInt);
+  const torch::Tensor slots = torch::tensor({1407}, torch::kInt);
+  auto sparse = std::make_shared<layer::AttentionMetadata>(
+      layer::AttentionMetadataBuilder::build_mtp_sparse_decode(
+          table, lengths, slots, /*block_size=*/128));
+  py::object sparse_view = py::cast(PyAttentionMetadataView(sparse));
+  const torch::Tensor view_table =
+      sparse_view.attr("block_table").cast<torch::Tensor>();
+  const torch::Tensor view_lengths =
+      sparse_view.attr("kv_seq_lens").cast<torch::Tensor>();
+  const torch::Tensor view_slots =
+      sparse_view.attr("slot_mapping").cast<torch::Tensor>();
+  EXPECT_EQ(view_table.data_ptr(), table.data_ptr());
+  EXPECT_EQ(view_lengths.data_ptr(), lengths.data_ptr());
+  EXPECT_EQ(view_slots.data_ptr(), slots.data_ptr());
+  EXPECT_TRUE(sparse->kv_seq_lens_vec.empty());
+  EXPECT_FALSE(sparse->kv_seq_lens_host.defined());
+  EXPECT_FALSE(sparse->paged_kv_indptr.defined());
+  EXPECT_FALSE(sparse->paged_kv_indices.defined());
+  EXPECT_FALSE(sparse->expanded_decode.enabled);
+
+  // The Python view retains the owner as the request crosses a page boundary.
+  sparse.reset();
+  lengths.fill_(129);
+  slots.fill_(1408);
+  EXPECT_EQ(sparse_view.attr("kv_seq_lens").cast<torch::Tensor>().data_ptr(),
+            view_lengths.data_ptr());
+  EXPECT_EQ(sparse_view.attr("slot_mapping").cast<torch::Tensor>().data_ptr(),
+            view_slots.data_ptr());
+  EXPECT_EQ(view_lengths.item<int32_t>(), 129);
+  EXPECT_EQ(view_slots.item<int32_t>(), 1408);
 }
 
 TEST(MtpAsyncInputBuilderTest, SharedModulesPointToTargetModel) {

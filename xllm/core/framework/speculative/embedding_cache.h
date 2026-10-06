@@ -87,6 +87,15 @@ class EmbeddingCache final {
                             int32_t num_speculative_tokens,
                             bool retain_previous_embedding = true);
 
+  void write_target_context(const std::vector<int32_t>& embedding_ids,
+                            const std::vector<std::string>& request_ids,
+                            const torch::Tensor& accepted_tokens,
+                            const torch::Tensor& accepted_embeddings,
+                            const torch::Tensor& accepted_count,
+                            int32_t num_speculative_tokens,
+                            bool allow_immutable_compact_view = false,
+                            bool retain_previous_embedding = true);
+
   // Algorithm-specific placeholder embedding for missing target context, e.g.
   // PD first decode. MTP uses hidden_size; Eagle3 uses 3 * hidden_size.
   void set_placeholder(const torch::Tensor& embedding_placeholder);

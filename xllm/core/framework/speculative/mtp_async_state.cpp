@@ -88,7 +88,8 @@ torch::Tensor extract_target_base_kv_seq_lens(
     const torch::Tensor& validate_kv_seq_lens,
     int64_t batch_size,
     int64_t num_validate_tokens,
-    bool use_chunked_prefill) {
+    bool use_chunked_prefill,
+    bool step_major_layout) {
   CHECK(validate_kv_seq_lens.defined());
   CHECK_GT(batch_size, 0);
   CHECK_GT(num_validate_tokens, 0);
@@ -101,10 +102,14 @@ torch::Tensor extract_target_base_kv_seq_lens(
 
   const int64_t expanded_rows = batch_size * num_validate_tokens;
   CHECK_GE(flattened.numel(), expanded_rows);
-  return flattened.slice(/*dim=*/0, /*start=*/0, /*end=*/expanded_rows)
-      .view({batch_size, num_validate_tokens})
-      .select(/*dim=*/1, /*index=*/0)
-      .contiguous();
+  torch::Tensor rows =
+      flattened.slice(/*dim=*/0, /*start=*/0, /*end=*/expanded_rows);
+  if (step_major_layout) {
+    rows = rows.view({num_validate_tokens, batch_size}).transpose(0, 1);
+  } else {
+    rows = rows.view({batch_size, num_validate_tokens});
+  }
+  return rows.select(/*dim=*/1, /*index=*/0).contiguous();
 }
 
 AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
@@ -114,9 +119,14 @@ AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
                                    const torch::Tensor& base_kv_seq_lens) {
   AcceptedTokenMetadata token_metadata = build_accepted_token_metadata(
       accepted_tokens, base_positions, base_kv_seq_lens);
-  CHECK_EQ(accepted_embeddings.dim(), 3);
+  const bool compact = accepted_embeddings.dim() == 2;
+  CHECK(compact || accepted_embeddings.dim() == 3);
   const int64_t batch_size = accepted_tokens.size(0);
-  CHECK_EQ(accepted_embeddings.size(0), batch_size);
+  CHECK_EQ(accepted_embeddings.size(0), compact ? batch_size * 2 : batch_size);
+  const torch::Tensor embedding_rows =
+      compact ? accepted_embeddings.view(
+                    {batch_size, 2, accepted_embeddings.size(-1)})
+              : accepted_embeddings;
 
   AcceptedState state;
   state.accepted_lengths = token_metadata.accepted_lengths;
@@ -134,9 +144,11 @@ AcceptedState build_accepted_state(const torch::Tensor& accepted_tokens,
       torch::where(has_previous, gathered_previous_tokens, state.last_tokens);
   torch::Tensor last_indices = (state.accepted_lengths - 1).clamp_min(0);
   state.last_embeddings =
-      gather_sequence_rows(accepted_embeddings, last_indices);
+      compact ? embedding_rows.select(1, 1)
+              : gather_sequence_rows(embedding_rows, last_indices);
   torch::Tensor gathered_previous_embeddings =
-      gather_sequence_rows(accepted_embeddings, previous_indices);
+      compact ? embedding_rows.select(1, 0)
+              : gather_sequence_rows(embedding_rows, previous_indices);
   torch::Tensor placeholder = embedding_placeholder;
   if (placeholder.dim() == 1) {
     placeholder = placeholder.unsqueeze(0);
