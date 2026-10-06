@@ -16,8 +16,10 @@ limitations under the License.
 #pragma once
 #include <folly/futures/Future.h>
 
+#include <cstdint>
 #include <deque>
 #include <optional>
+#include <thread>
 
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
@@ -67,6 +69,8 @@ struct TaskModel {
   std::vector<KVCache>& kv_caches;
 };
 
+class ProcessGroup;
+class WorkerImpl;
 enum class SpeculativeTaskKind : uint8_t { MTP, DFLASH, DFLASH2 };
 
 struct SpeculativeTaskCapacity {
@@ -116,6 +120,14 @@ class TaskExecutionPipeline final {
                        TaskModel target,
                        TaskModel draft,
                        const SpeculativeTaskCapacity& capacity,
+                       std::unique_ptr<TaskExecutionPipeline>& output);
+  // Reuse this same queue for workers whose execution state is owned by the
+  // WorkerImpl. The worker supplies only prepare/execute hooks; admission,
+  // FIFO ordering, launch and result retirement remain in this class.
+  static Status create(ThreadPool& state_executor,
+                       TaskModel target,
+                       WorkerImpl& worker,
+                       const LlmTaskCapacity& capacity,
                        std::unique_ptr<TaskExecutionPipeline>& output);
 
   ~TaskExecutionPipeline();
@@ -219,6 +231,13 @@ class TaskExecutionPipeline final {
     SampleOutput sample_output;
     ModelOutput model_output;
     torch::Tensor logits;
+    // Used only by the WorkerImpl-owned execution mode. These values stay in
+    // the normal task slot until the completed FIFO retires it.
+    LlmForwardInput worker_input;
+    // Packed host views borrow this storage even if worker preparation builds
+    // a different contiguous H2D buffer.
+    torch::Tensor worker_input_host_buffer;
+    std::optional<ForwardOutput> worker_output;
   };
 
   struct SlotTicket {
@@ -230,9 +249,11 @@ class TaskExecutionPipeline final {
                         CausalLM& model,
                         Executor& executor,
                         std::vector<KVCache>& kv_caches,
-                        LlmTaskCapacity capacity);
+                        LlmTaskCapacity capacity,
+                        WorkerImpl* worker_pipeline = nullptr);
   Status validate(const Slot& slot, const LlmForwardInput& input) const;
   Status prepare(uint32_t slot_id, const LlmForwardInput& input);
+  Status prepare_worker(uint32_t slot_id, const LlmForwardInput& input);
   void launch(uint32_t slot_id);
   ForwardOutput consume(uint32_t slot_id);
   void discard(uint32_t slot_id);
@@ -281,6 +302,7 @@ class TaskExecutionPipeline final {
   void release_outputs(SpeculativeSlot& slot);
 
   std::unique_ptr<SpeculativeTaskCapacity> speculative_capacity_;
+  WorkerImpl* worker_pipeline_ = nullptr;
   std::unique_ptr<TaskModel> draft_;
   torch::ScalarType hidden_dtype_ = torch::kFloat32;
   std::unique_ptr<MtpContextStorage> context_;

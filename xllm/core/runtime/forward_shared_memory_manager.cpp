@@ -14,6 +14,7 @@ limitations under the License.
 #include "forward_shared_memory_manager.h"
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include <atomic>
 #include <cstdint>
@@ -2748,6 +2749,11 @@ inline void deserialize_forward_input_payload(
     read_data(context, sampling_params.num_return_sequences);
     read_data(context, sampling_params.use_beam_search);
   }
+  forward_input.input_host_sample_count =
+      forward_input.sampling_params.sample_idxes.defined()
+          ? static_cast<int32_t>(
+                forward_input.sampling_params.sample_idxes.numel())
+          : 0;
   // acc_logprob
   read_tensor(context, forward_input.sampling_params.acc_logprob, stream);
   read_string_vector(context, forward_input.sample_sequence_ids);

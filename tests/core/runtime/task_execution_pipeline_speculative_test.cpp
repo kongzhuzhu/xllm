@@ -18,6 +18,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -25,7 +27,10 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/runtime/executor_impl_factory.h"
+#include "core/runtime/params_utils.h"
 #include "core/runtime/task_execution_pipeline.h"
+#include "core/runtime/unified_mtp_worker_impl.h"
+#include "core/runtime/worker_impl.h"
 
 namespace xllm {
 namespace {
@@ -112,6 +117,123 @@ class PreparedTestExecutor final : public ExecutorImpl {
 
  private:
   CausalLM* model_;
+};
+
+// The composite worker deliberately owns no model: the shared queue must use
+// the explicit leaf TaskModel, as UnifiedMtpWorkerImpl does in production.
+class PreparedTestWorker final : public WorkerImpl {
+ public:
+  explicit PreparedTestWorker(const torch::Device& device)
+      : WorkerImpl(ParallelArgs(0, 1, 1, nullptr), device, runtime::Options()),
+        release_future_(release_.get_future().share()) {}
+
+  bool init_model(ModelContext& /*context*/) override { return false; }
+
+  void prepare_task_pipeline_input(const LlmForwardInput& input,
+                                   LlmForwardInput& prepared) override {
+    auto guard = prepare_stream_->set_stream_guard();
+    if (contiguous_input_) {
+      prepared = input.to(device_.unwrap(), torch::kFloat32);
+    } else {
+      prepared = input.clone();
+      prepared.token_ids = input.token_ids.to(device_.unwrap());
+    }
+    prepared.runtime.metadata_ready_event = prepare_stream_->record_event();
+    CHECK(prepared.runtime.metadata_ready_event != nullptr);
+    prepared.runtime.retained_device_tensors.emplace_back(torch::from_blob(
+        new int32_t(0),
+        {1},
+        [this](void* data) {
+          if (!finished_.load()) {
+            released_early_.store(true);
+          }
+          delete static_cast<int32_t*>(data);
+          ++released_inputs_;
+        },
+        torch::TensorOptions().dtype(torch::kInt32)));
+  }
+
+  std::optional<ForwardOutput> step(const LlmForwardInput& /*input*/) override {
+    LOG(FATAL) << "Shared task queue must call the direct execute hook.";
+    return std::nullopt;
+  }
+
+  std::optional<ForwardOutput> execute_task_pipeline(
+      const LlmForwardInput& prepared) override {
+    auto guard = compute_stream_->set_stream_guard();
+    CHECK(compute_stream_->wait_event(prepared.runtime.metadata_ready_event));
+    CHECK_EQ(aclrtLaunchHostFunc(
+                 compute_stream_->get_stream()->stream(),
+                 [](void* data) {
+                   auto* worker = static_cast<PreparedTestWorker*>(data);
+                   if (!worker->entered_signaled_.exchange(true)) {
+                     worker->entered_.set_value();
+                   }
+                   worker->release_future_.wait_for(std::chrono::seconds(10));
+                   worker->finished_.store(true);
+                 },
+                 this),
+             ACL_SUCCESS);
+    ForwardOutput output;
+    if (with_tokens_) {
+      output.sample_output.next_tokens = prepared.token_ids + 1;
+    }
+    output.ready_event = compute_stream_->record_event();
+    CHECK(output.ready_event != nullptr);
+    return output;
+  }
+
+  std::future<void> entered() { return entered_.get_future(); }
+  void release() { release_.set_value(); }
+  void without_tokens() { with_tokens_ = false; }
+  void with_contiguous_input() { contiguous_input_ = true; }
+  bool released_early() const { return released_early_.load(); }
+  int32_t released_inputs() const { return released_inputs_.load(); }
+
+ private:
+  bool with_tokens_ = true;
+  bool contiguous_input_ = false;
+  std::promise<void> entered_;
+  std::promise<void> release_;
+  std::shared_future<void> release_future_;
+  std::atomic<bool> entered_signaled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<bool> released_early_{false};
+  std::atomic<int32_t> released_inputs_{0};
+};
+
+// Exercise the production Unified execute hook without loading model weights.
+class JsonTaskTestWorker final : public UnifiedMtpWorkerImpl {
+ public:
+  explicit JsonTaskTestWorker(const torch::Device& device)
+      : UnifiedMtpWorkerImpl(ParallelArgs(0, 1, 1, nullptr),
+                             device,
+                             options(),
+                             WorkerType::LLM) {}
+
+  std::optional<ForwardOutput> step(const LlmForwardInput& input) override {
+    if (!input.json_object_states.empty()) {
+      observed_tokens = input.json_object_states.front().snapshot().token_ids;
+    }
+    if (!with_output) {
+      return std::nullopt;
+    }
+    ForwardOutput output;
+    output.sample_output.next_tokens =
+        torch::tensor({next_token}, torch::kInt64);
+    return output;
+  }
+
+  int64_t next_token = 0;
+  bool with_output = true;
+  std::vector<int32_t> observed_tokens;
+
+ private:
+  static runtime::Options options() {
+    runtime::Options result;
+    result.enable_schedule_overlap(true);
+    return result;
+  }
 };
 
 // Supply a leader's values that differ from the local draws. Downstream model
@@ -750,6 +872,188 @@ TEST_F(SpeculativePipelineTest,
   ASSERT_TRUE(decoded.sample_output.next_tokens.defined());
   EXPECT_TRUE(torch::equal(decoded.sample_output.next_tokens,
                            torch::tensor({{6, 7, 8}}, torch::kInt64)));
+}
+
+TEST_F(SpeculativePipelineTest,
+       WorkerResultWaitsForDeviceBeforeReleasingPreparedInput) {
+  PreparedTestWorker worker(device_);
+  auto entered = worker.entered();
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  {*target_, *target_executor_, target_cache_},
+                  worker,
+                  capacity_.common,
+                  pipeline_)
+                  .ok());
+  const auto submitted = pipeline_->submit(input(true));
+  ASSERT_TRUE(submitted.status.ok());
+  EXPECT_EQ(entered.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  auto result = pipeline_->take_result_async(submitted.task_id);
+  result.wait(std::chrono::milliseconds(50));
+  EXPECT_FALSE(result.isReady());
+  EXPECT_EQ(worker.released_inputs(), 0);
+  worker.release();
+  auto completed = std::move(result).get();
+  EXPECT_TRUE(completed.status.ok());
+  EXPECT_EQ(completed.task_id, submitted.task_id);
+  EXPECT_FALSE(worker.released_early());
+  EXPECT_EQ(worker.released_inputs(), 1);
+  EXPECT_TRUE(completed.output.retained_inputs.empty());
+  EXPECT_TRUE(torch::equal(completed.output.sample_output.next_tokens.cpu(),
+                           torch::tensor({4}, torch::kInt32)));
+  pipeline_.reset();
+}
+
+TEST_F(SpeculativePipelineTest,
+       WorkerDiscardWaitsForTokenlessDeviceOutputBeforeReleasingInput) {
+  PreparedTestWorker worker(device_);
+  worker.without_tokens();
+  auto entered = worker.entered();
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  {*target_, *target_executor_, target_cache_},
+                  worker,
+                  capacity_.common,
+                  pipeline_)
+                  .ok());
+  ASSERT_TRUE(pipeline_->submit(input(true)).status.ok());
+  EXPECT_EQ(entered.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  auto destroyed =
+      std::async(std::launch::async, [this] { pipeline_.reset(); });
+  EXPECT_EQ(destroyed.wait_for(std::chrono::milliseconds(50)),
+            std::future_status::timeout);
+  EXPECT_EQ(worker.released_inputs(), 0);
+  worker.release();
+  destroyed.get();
+  EXPECT_FALSE(worker.released_early());
+  EXPECT_EQ(worker.released_inputs(), 1);
+}
+
+TEST_F(SpeculativePipelineTest,
+       WorkerKeepsPackedHostViewsUntilResultCompletes) {
+  PreparedTestWorker worker(device_);
+  worker.with_contiguous_input();
+  auto entered = worker.entered();
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  {*target_, *target_executor_, target_cache_},
+                  worker,
+                  capacity_.common,
+                  pipeline_)
+                  .ok());
+  proto::PackedForwardInput payload;
+  ASSERT_TRUE(forward_input_to_packed_proto(input(false), &payload));
+  LlmForwardInput packed;
+  packed_proto_to_forward_input(payload, packed, device_, nullptr);
+  auto released = std::make_shared<std::atomic<bool>>(false);
+  torch::Tensor owner = packed.runtime.input_host_buffer;
+  packed.runtime.input_host_buffer = torch::from_blob(
+      owner.data_ptr(),
+      owner.sizes(),
+      [owner, released](void* /*data*/) mutable {
+        owner = torch::Tensor();
+        released->store(true);
+      },
+      owner.options());
+  owner = torch::Tensor();
+  const auto submitted = pipeline_->submit(packed);
+  ASSERT_TRUE(submitted.status.ok());
+  EXPECT_EQ(entered.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  packed = LlmForwardInput();
+  EXPECT_FALSE(released->load());
+  worker.release();
+  auto result = pipeline_->take_result_async(submitted.task_id).get();
+  EXPECT_TRUE(result.status.ok());
+  EXPECT_TRUE(released->load());
+  EXPECT_TRUE(torch::equal(result.output.sample_output.next_tokens.cpu(),
+                           torch::tensor({2, 3}, torch::kInt32)));
+  pipeline_.reset();
+}
+
+TEST_F(SpeculativePipelineTest, WorkerOwnedPipelineUsesBothSlotsAndFifo) {
+  capacity_.common.slot_count = 2;
+  PreparedTestWorker worker(device_);
+  auto entered = worker.entered();
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  {*target_, *target_executor_, target_cache_},
+                  worker,
+                  capacity_.common,
+                  pipeline_)
+                  .ok());
+
+  const auto first = pipeline_->submit(input(true));
+  ASSERT_TRUE(first.status.ok()) << first.status.message();
+  ASSERT_EQ(entered.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  const auto second =
+      pipeline_->submit(input(true, /*token=*/6, /*position=*/5));
+  ASSERT_TRUE(second.status.ok()) << second.status.message();
+  const auto full = pipeline_->submit(input(true, /*token=*/7, /*position=*/6));
+  EXPECT_EQ(full.status.code(), StatusCode::RESOURCE_EXHAUSTED);
+
+  worker.release();
+  const auto first_result = pipeline_->take_result_async(first.task_id).get();
+  ASSERT_TRUE(first_result.status.ok()) << first_result.status.message();
+  const auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(second_result.status.ok()) << second_result.status.message();
+
+  const auto reused =
+      pipeline_->submit(input(true, /*token=*/8, /*position=*/7));
+  EXPECT_TRUE(reused.status.ok()) << reused.status.message();
+  pipeline_->take_result_async(reused.task_id).get();
+}
+
+TEST_F(SpeculativePipelineTest, UnifiedTaskAdvancesJsonFromOwnedPriorTokens) {
+  JsonTaskTestWorker worker(device_);
+  JsonObjectGrammar grammar({"{", "}", "stop"}, {2});
+  auto prefill = input(false);
+  prefill.json_object_states = {grammar.initial_state()};
+  prefill.sample_sequence_ids = {"json#0"};
+  prefill.sample_prior_output_rows = {-1};
+  auto first = worker.execute_task_pipeline(prefill);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_TRUE(worker.observed_tokens.empty());
+  // The consumer may release/reuse a pinned result before the next launch.
+  first->sample_output.next_tokens.fill_(2);
+
+  auto decode = input(true);
+  decode.json_object_states = {grammar.initial_state()};
+  decode.sample_sequence_ids = {"json#0"};
+  decode.sample_prior_output_rows = {0};
+  worker.next_token = 1;
+  auto second = worker.execute_task_pipeline(decode);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_TRUE(second->json_object_errors.empty());
+  EXPECT_EQ(worker.observed_tokens, (std::vector<int32_t>{0}));
+  EXPECT_TRUE(decode.json_object_states.front().snapshot().token_ids.empty());
+
+  ASSERT_TRUE(decode.json_object_states.front().accept_token(0));
+  worker.next_token = 2;
+  auto third = worker.execute_task_pipeline(decode);
+  ASSERT_TRUE(third.has_value());
+  EXPECT_TRUE(third->json_object_errors.empty());
+  EXPECT_EQ(worker.observed_tokens, (std::vector<int32_t>{0, 1}));
+
+  // A new prefill has no prior row and must not inherit the old grammar.
+  prefill.sample_sequence_ids = {"new-json#0"};
+  worker.next_token = 0;
+  worker.execute_task_pipeline(prefill);
+  EXPECT_TRUE(worker.observed_tokens.empty());
+  worker.with_output = false;
+  worker.execute_task_pipeline(input(true));
+  worker.with_output = true;
+  decode.json_object_states = {grammar.initial_state()};
+  decode.sample_sequence_ids = {"new-json#0"};
+  decode.token_ids = torch::tensor({-1}, torch::kInt32);
+  auto missing = worker.execute_task_pipeline(decode);
+  ASSERT_TRUE(missing.has_value());
+  ASSERT_EQ(missing->json_object_errors.size(), 1U);
+  EXPECT_EQ(missing->json_object_errors.front().sample_sequence_id,
+            "new-json#0");
 }
 
 }  // namespace

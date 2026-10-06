@@ -82,6 +82,13 @@ class StoppingChecker {
     return stop_strings_;
   }
 
+  inline void set_generated_stop_sequences(
+      std::vector<std::vector<int32_t>> sequences,
+      std::vector<std::string> stop_strings) {
+    generated_stop_sequences_ = std::move(sequences);
+    generated_stop_strings_ = std::move(stop_strings);
+  }
+
   size_t get_max_stop_sequence_token_count() const;
 
  private:
@@ -101,6 +108,10 @@ class StoppingChecker {
   // stopping sequences
   std::vector<std::vector<int32_t>> stop_sequences_;
   std::vector<std::string> stop_strings_;
+
+  // Tokenization variants must not finish a request before generation starts.
+  std::vector<std::vector<int32_t>> generated_stop_sequences_;
+  std::vector<std::string> generated_stop_strings_;
 };
 
 }  // namespace xllm

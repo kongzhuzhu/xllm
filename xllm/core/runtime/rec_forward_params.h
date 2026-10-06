@@ -61,6 +61,7 @@ class RecForwardInput final {
     inputs.decoder_sampling_params = decoder_sampling_params;
     inputs.step_decode = step_decode;
     inputs.transfer_kv_infos = transfer_kv_infos;
+    inputs.input_host_sample_count = input_host_sample_count;
     inputs.sample_sequence_ids = sample_sequence_ids;
     inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
@@ -98,6 +99,7 @@ class RecForwardInput final {
     inputs.decoder_sampling_params = decoder_sampling_params.to(device, dtype);
     inputs.step_decode = step_decode;
     inputs.transfer_kv_infos = transfer_kv_infos;
+    inputs.input_host_sample_count = input_host_sample_count;
     inputs.sample_sequence_ids = sample_sequence_ids;
     inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
@@ -134,6 +136,7 @@ class RecForwardInput final {
   std::vector<int32_t> sample_prior_output_rows;
   std::vector<JsonObjectGrammarState> json_object_states;
   std::vector<JsonObjectGrammarSnapshot> json_object_state_snapshots;
+  int32_t input_host_sample_count = kUnknownPackedSampleCount;
   ForwardRuntimeState runtime;
 };
 

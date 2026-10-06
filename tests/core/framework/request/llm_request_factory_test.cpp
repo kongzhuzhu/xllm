@@ -17,15 +17,19 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/options.h"
 #include "common/rate_limiter.h"
 #include "core/common/message.h"
 #include "core/common/types.h"
+#include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "framework/chat_template/chat_template.h"
 #include "framework/config/service_config.h"
 #include "framework/model/model_args.h"
@@ -37,8 +41,69 @@ namespace xllm {
 namespace {
 
 using test::CallbackCapture;
-using test::FakeTokenizer;
 using test::make_capture_callback;
+
+constexpr int32_t kBareStopToken = 13;
+constexpr int32_t kStopWithLfToken = 624;
+constexpr int32_t kStopWithCrlfToken = 625;
+constexpr int32_t kStopWithSpaceToken = 626;
+constexpr int32_t kNonStopToken = 627;
+
+// Deterministic tokenizer used for factory tests. It encodes each character to
+// a token id inside the vocabulary range, except for the stop strings used by
+// the factory tests. Those strings model a byte-level tokenizer where the
+// first generated token can contain the stop text and its line ending.
+class StopSequenceTokenizer final : public Tokenizer {
+ public:
+  explicit StopSequenceTokenizer(int32_t vocab_size) : fallback_(vocab_size) {}
+
+  bool encode(const std::string_view& text,
+              std::vector<int32_t>* ids,
+              bool /*add_special_tokens*/ = true) const override {
+    if (text == ".") {
+      *ids = {kBareStopToken};
+      return true;
+    }
+    if (text == ".\n") {
+      *ids = {kStopWithLfToken};
+      return true;
+    }
+    if (text == ".\r\n") {
+      *ids = {kStopWithCrlfToken};
+      return true;
+    }
+    if (text == ". ") {
+      *ids = {kStopWithSpaceToken};
+      return true;
+    }
+    return fallback_.encode(text, ids);
+  }
+
+  size_t vocab_size() const override { return fallback_.vocab_size(); }
+
+  std::string id_to_token(int32_t id) const override {
+    if (id == kBareStopToken) {
+      return ".";
+    }
+    if (id == kStopWithLfToken) {
+      return ".\\n";
+    }
+    if (id == kStopWithCrlfToken) {
+      return ".\\r\\n";
+    }
+    if (id == kStopWithSpaceToken) {
+      return ". ";
+    }
+    return std::string(1, static_cast<char>('a' + (id % 26)));
+  }
+
+  std::unique_ptr<Tokenizer> clone() const override {
+    return std::make_unique<StopSequenceTokenizer>(*this);
+  }
+
+ private:
+  test::FakeTokenizer fallback_;
+};
 
 // Chat template that renders to a fixed prompt, or reports failure when
 // configured to, so the message overload's error path can be tested without a
@@ -61,6 +126,9 @@ class FakeChatTemplate final : public ChatTemplate {
   }
 
   void set_succeed(bool succeed) { succeed_ = succeed; }
+  void set_rendered_prompt(std::string prompt) {
+    rendered_prompt_ = std::move(prompt);
+  }
 
  private:
   bool succeed_ = true;
@@ -70,6 +138,8 @@ class FakeChatTemplate final : public ChatTemplate {
 class LLMRequestFactoryTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    execution_config_ = ExecutionConfig::get_instance();
+    model_config_ = ModelConfig::get_instance();
     previous_json_object_output_ =
         ServiceConfig::get_instance().enable_json_object_output();
     ServiceConfig::get_instance().enable_json_object_output(true);
@@ -79,6 +149,8 @@ class LLMRequestFactoryTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    ExecutionConfig::get_instance() = execution_config_;
+    ModelConfig::get_instance() = model_config_;
     ServiceConfig::get_instance().enable_json_object_output(
         previous_json_object_output_);
   }
@@ -87,14 +159,14 @@ class LLMRequestFactoryTest : public ::testing::Test {
       int32_t vocab_size = 1000,
       int32_t max_position = 2048,
       std::string task = "generate") {
-    tokenizer_ = std::make_unique<FakeTokenizer>(vocab_size);
+    tokenizer_ = std::make_unique<StopSequenceTokenizer>(vocab_size);
     chat_template_ = std::make_unique<FakeChatTemplate>();
     model_args_.vocab_size(vocab_size)
         .max_position_embeddings(max_position)
         .eos_token_id(-1);
     // enable_chunked_prefill defaults true; keep it so the prompt length limit
     // is exactly max_position_embeddings.
-    options_.enable_service_routing(false).num_speculative_tokens(0);
+    options_.enable_service_routing(false);
     return std::make_unique<LLMRequestFactory>(
         tokenizer_.get(),
         chat_template_.get(),
@@ -105,12 +177,14 @@ class LLMRequestFactoryTest : public ::testing::Test {
         [](const std::vector<RequestOutput>&) { return std::vector<bool>{}; });
   }
 
-  std::unique_ptr<FakeTokenizer> tokenizer_;
+  std::unique_ptr<StopSequenceTokenizer> tokenizer_;
   std::unique_ptr<FakeChatTemplate> chat_template_;
   ModelArgs model_args_;
   Options options_;
   RateLimiter rate_limiter_;
   bool previous_json_object_output_ = true;
+  ExecutionConfig execution_config_;
+  ModelConfig model_config_;
 };
 
 TEST_F(LLMRequestFactoryTest, RejectsEmptyPromptAndReleasesRateLimitSlot) {
@@ -237,6 +311,54 @@ TEST_F(LLMRequestFactoryTest,
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+TEST_F(LLMRequestFactoryTest, FactoryAddsStopSequenceVariants) {
+  options_.enable_schedule_overlap(true);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.stop = std::vector<std::string>{"."};
+
+  auto request = factory->create(/*prompt=*/".\n",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  ASSERT_TRUE(request->state().enable_schedule_overlap);
+  EXPECT_FALSE(request->finished());
+  const StoppingChecker& checker = request->state().stopping_checker;
+  const std::vector<int32_t>& prompt_tokens = request->state().prompt_tokens;
+  EXPECT_EQ(prompt_tokens, std::vector<int32_t>({kStopWithLfToken}));
+  const std::vector<int32_t> pending_tokens = {kStopWithLfToken, -1};
+  EXPECT_EQ(checker.check(pending_tokens, prompt_tokens.size()),
+            FinishReason::NONE);
+  const std::vector<int32_t> bare_stop_prompt = {kBareStopToken};
+  EXPECT_EQ(checker.check(bare_stop_prompt, bare_stop_prompt.size()),
+            FinishReason::STOP);
+  const auto check_generated_token = [&](int32_t token_id,
+                                         FinishReason expected) {
+    std::vector<int32_t> token_ids(prompt_tokens.begin(), prompt_tokens.end());
+    token_ids.push_back(token_id);
+    EXPECT_EQ(checker.check(token_ids, prompt_tokens.size()), expected);
+    token_ids.push_back(-1);
+    StopReason stop_reason;
+    EXPECT_EQ(
+        checker.check(token_ids, prompt_tokens.size(), nullptr, &stop_reason),
+        expected);
+    if (expected == FinishReason::STOP) {
+      ASSERT_TRUE(std::holds_alternative<std::string>(stop_reason));
+      EXPECT_EQ(std::get<std::string>(stop_reason), ".");
+    }
+  };
+
+  check_generated_token(kBareStopToken, FinishReason::STOP);
+  check_generated_token(kStopWithLfToken, FinishReason::STOP);
+  check_generated_token(kStopWithCrlfToken, FinishReason::STOP);
+  check_generated_token(kStopWithSpaceToken, FinishReason::STOP);
+  check_generated_token(kNonStopToken, FinishReason::NONE);
+}
+
 TEST_F(LLMRequestFactoryTest, TaskPipelineRejectsJsonObjectBeforeGrammarSetup) {
   options_.enable_task_pipeline(true);
   auto factory = make_factory();
@@ -255,35 +377,70 @@ TEST_F(LLMRequestFactoryTest, TaskPipelineRejectsJsonObjectBeforeGrammarSetup) {
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
   EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(
-      capture.status->message(),
-      "response_format=json_object is not supported with enable_task_pipeline");
+  EXPECT_EQ(capture.status->message(),
+            "response_format=json_object is not supported with "
+            "enable_task_pipeline");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+#if defined(USE_NPU)
 TEST_F(LLMRequestFactoryTest,
-       TaskPipelineRejectsJsonObjectChatAndReleasesSlot) {
-  options_.enable_task_pipeline(true);
+       UnifiedTaskPipelineKeepsJsonObjectChatForLegacyCompatibilityFallback) {
+  options_.enable_task_pipeline(true)
+      .num_speculative_tokens(3)
+      .draft_model_path(std::string("/fake/draft"))
+      .speculative_algorithm("MTP");
+  ModelConfig::get_instance().model_impl("python");
+  ExecutionConfig::get_instance().enable_unified_mtp_graph(true);
   auto factory = make_factory();
   CallbackCapture capture;
   RequestParams sp;
   sp.response_format = ResponseFormatType::JSON_OBJECT;
   const std::vector<Message> messages = {Message("user", std::string("hi"))};
 
+  chat_template_->set_rendered_prompt("rendered prompt </think>");
   auto request = factory->create(messages,
                                  /*prompt_tokens=*/std::nullopt,
                                  sp,
                                  /*call=*/std::nullopt,
                                  make_capture_callback(&capture));
 
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_NE(request->state().json_object_grammar, nullptr);
+  EXPECT_FALSE(request->state().json_reasoning_enabled);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest, DisabledUnifiedTaskMtpRejectsJsonObject) {
+  options_.enable_task_pipeline(true)
+      .num_speculative_tokens(3)
+      .draft_model_path(std::string("/fake/draft"))
+      .speculative_algorithm("MTP");
+  ModelConfig::get_instance().model_impl("python");
+  ExecutionConfig::get_instance().enable_unified_mtp_graph(false);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.response_format = ResponseFormatType::JSON_OBJECT;
+
+  auto request = factory->create(
+      /*prompt=*/"hello world",
+      /*prompt_tokens=*/std::nullopt,
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      ChatTemplateGenerationMode::UNKNOWN);
+
   EXPECT_EQ(request, nullptr);
   ASSERT_TRUE(capture.status.has_value());
   EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
-  EXPECT_EQ(
-      capture.status->message(),
-      "response_format=json_object is not supported with enable_task_pipeline");
+  EXPECT_EQ(capture.status->message(),
+            "response_format=json_object is not supported with "
+            "enable_task_pipeline");
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
+#endif
 
 TEST_F(LLMRequestFactoryTest, TaskPipelineAcceptsOrdinaryRequest) {
   options_.enable_task_pipeline(true);

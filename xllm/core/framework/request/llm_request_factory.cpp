@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -25,8 +26,10 @@ limitations under the License.
 #include "api_service/call.h"
 #include "common/macros.h"
 #include "common/metrics.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -36,6 +39,21 @@ limitations under the License.
 
 namespace xllm {
 namespace {
+
+bool task_worker_supports_json_object(const Options& options) {
+#if defined(USE_NPU)
+  return ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
+         options.num_speculative_tokens() > 0 &&
+         options.draft_model_path().has_value() &&
+         !options.draft_model_path()->empty() &&
+         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) &&
+         ModelConfig::is_python_model_impl(
+             ModelConfig::get_instance().model_impl());
+#else
+  static_cast<void>(options);
+  return false;
+#endif
+}
 
 bool get_enable_thinking(const nlohmann::json& chat_template_kwargs) {
   const bool default_value =
@@ -55,6 +73,29 @@ bool get_enable_thinking(const nlohmann::json& chat_template_kwargs) {
 }
 
 constexpr uint32_t kDefaultMaxTokens = 5120;
+
+void append_stop_sequence_variant(const Tokenizer& tokenizer,
+                                  std::string_view stop,
+                                  std::vector<std::vector<int32_t>>* sequences,
+                                  std::vector<std::string>* stop_strings) {
+  // A byte-level tokenizer may keep a stop string and its immediately
+  // following line break in one token (for example, ".\\n"). Encoding only
+  // the bare stop string would then miss that first generated token and leak
+  // it to the client before the next token completes the stop sequence.
+  for (const std::string_view suffix : {"\n", "\r\n", " "}) {
+    std::string candidate(stop);
+    candidate.append(suffix);
+    std::vector<int32_t> token_ids;
+    if (!tokenizer.encode(candidate, &token_ids) || token_ids.empty()) {
+      continue;
+    }
+    if (std::find(sequences->begin(), sequences->end(), token_ids) ==
+        sequences->end()) {
+      sequences->push_back(std::move(token_ids));
+      stop_strings->emplace_back(stop);
+    }
+  }
+}
 
 }  // namespace
 
@@ -348,7 +389,8 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   const bool json_object = sampling_param.json_object;
-  if (json_object && options_->enable_task_pipeline()) {
+  if (json_object && options_->enable_task_pipeline() &&
+      !task_worker_supports_json_object(*options_)) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "response_format=json_object is not supported with "
                         "enable_task_pipeline",
@@ -366,6 +408,21 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   if (!validate_prompt_not_finished(
           *stopping_checker, local_prompt_tokens, sp, callback)) {
     return nullptr;
+  }
+  // Keep both prompt validation and the scheduler's initial finish check on
+  // the original stop strings. Variants only match after a generated token.
+  if (sp.stop.has_value()) {
+    std::vector<std::vector<int32_t>> generated_stop_sequences;
+    std::vector<std::string> generated_stop_strings;
+    generated_stop_sequences.reserve(sp.stop->size() * 3);
+    for (const auto& stop : sp.stop.value()) {
+      append_stop_sequence_variant(*tokenizer_,
+                                   stop,
+                                   &generated_stop_sequences,
+                                   &generated_stop_strings);
+    }
+    stopping_checker->set_generated_stop_sequences(
+        std::move(generated_stop_sequences), std::move(generated_stop_strings));
   }
 
   // results cannot be streamed when best_of != n

@@ -664,6 +664,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {
                                                     unpacked_input,
                                                     false));
   ASSERT_TRUE(unpacked_input.sampling_params.sample_idxes.defined());
+  EXPECT_EQ(unpacked_input.input_host_sample_count, 1);
   EXPECT_TRUE(tensor_equals_vector<int32_t>(
       unpacked_input.sampling_params.sample_idxes, {0}));
   ASSERT_TRUE(unpacked_input.sampling_params.filter_bitmask.defined());

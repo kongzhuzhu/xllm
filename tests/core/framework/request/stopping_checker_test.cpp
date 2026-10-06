@@ -89,5 +89,23 @@ TEST(StoppingCheckerTest, IgnoreEosStillStopsOnStopSequence) {
             FinishReason::STOP);
 }
 
+TEST(StoppingCheckerTest, StopSequenceIgnoresOverlapPlaceholder) {
+  StoppingChecker checker(
+      /*max_generated_tokens=*/2,
+      /*max_context_len=*/0,
+      /*eos_token=*/2,
+      /*ignore_eos=*/false,
+      /*stop_tokens=*/std::unordered_set<int32_t>{},
+      /*stop_sequences=*/std::vector<std::vector<int32_t>>{{4, 5}});
+  const std::vector<int32_t> token_ids = {1, 4, 5, -1};
+  size_t matched_stop_token_count = 0;
+
+  EXPECT_EQ(checker.check(token_ids,
+                          /*num_prompt_tokens=*/1,
+                          &matched_stop_token_count),
+            FinishReason::STOP);
+  EXPECT_EQ(matched_stop_token_count, 2);
+}
+
 }  // namespace
 }  // namespace xllm

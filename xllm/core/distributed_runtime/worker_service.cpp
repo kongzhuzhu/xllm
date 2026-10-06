@@ -58,6 +58,10 @@ int32_t get_num_decode_seqs_for_schedule_overlap(const Input& input) {
     return static_cast<int32_t>(input.sampling_params.sample_idxes.size(0));
   }
 
+  if (input.input_host_sample_count != kUnknownPackedSampleCount) {
+    return input.input_host_sample_count;
+  }
+
   if (!input.runtime.input_host_buffer_has_layout) {
     return 0;
   }
@@ -90,6 +94,23 @@ void stabilize_schedule_overlap_host_views(Input& input) {
   input.positions_host = clone_cpu_tensor_view(input.positions_host);
   input.input_params.attention.host.block_tables =
       clone_cpu_tensor_view(input.input_params.attention.host.block_tables);
+}
+
+bool has_cpu_serialization_inputs(const ForwardOutput& output) {
+  const auto on_cpu = [](const torch::Tensor& tensor) {
+    return !tensor.defined() || tensor.device().is_cpu();
+  };
+  const auto& sample = output.sample_output;
+  const auto& beam = output.beam_search_output;
+  return on_cpu(output.next_tokens_host.defined() ? output.next_tokens_host
+                                                  : sample.next_tokens) &&
+         on_cpu(output.expert_load_data) && on_cpu(sample.embeddings) &&
+         on_cpu(sample.logprobs) && on_cpu(sample.top_tokens) &&
+         on_cpu(sample.top_logprobs) && on_cpu(beam.src_seq_idxes) &&
+         on_cpu(beam.out_tokens) && on_cpu(beam.out_logprobs) &&
+         std::all_of(output.dit_forward_output.tensors.begin(),
+                     output.dit_forward_output.tensors.end(),
+                     on_cpu);
 }
 
 // Preformatted position tags for MULTI_COUNTER_ADD so the metrics loop does
@@ -476,7 +497,18 @@ void WorkerService::step(
   const bool use_default_stream =
       !options_.enable_schedule_overlap() && options_.backend() == "llm";
   const bool task_pipeline = options_.enable_task_pipeline();
-  if (options_.enable_schedule_overlap() && !task_pipeline) {
+  const bool cpu_ready_task_result =
+      task_pipeline && !worker_->task_pipeline_uses_worker_prepare();
+  const bool worker_owned_packed_input =
+      task_pipeline && worker_->task_pipeline_uses_worker_prepare() &&
+      fwd_input.runtime.input_host_buffer_has_layout &&
+      fwd_input.runtime.input_host_buffer.defined();
+  if (options_.enable_schedule_overlap() &&
+      (!task_pipeline || (worker_->task_pipeline_uses_worker_prepare() &&
+                          !worker_owned_packed_input))) {
+    // A worker-owned task slot retains the packed host buffer through Consume.
+    // Its prepare path reconstructs host views from that owner, so cloning the
+    // three SHM views here would only be overwritten by task submit.
     stabilize_schedule_overlap_host_views(fwd_input);
   }
   // execute model
@@ -568,7 +600,7 @@ void WorkerService::step(
                         /*non_blocking=*/true);
           }
         };
-        if (task_pipeline) {
+        if (cpu_ready_task_result) {
           // The pipeline Future completes after Consume produces CPU results.
           copy_output_to_host();
         } else {
@@ -1186,11 +1218,22 @@ void WorkerService::GetLastStepResult(
             !options_.enable_schedule_overlap() && options_.backend() == "llm";
 
         const bool task_pipeline = options_.enable_task_pipeline();
+        const bool worker_task_pipeline =
+            task_pipeline && worker_->task_pipeline_uses_worker_prepare();
         auto future = worker_->get_last_step_result_async();
         auto forward_outputs = std::move(future).get();
         if (forward_outputs) {
           const ForwardOutput& forward_output = forward_outputs.value();
           const auto& sample_output = forward_output.sample_output;
+          // Worker-owned Consume retires the producer event before fulfilling
+          // this Future. A CPU-only result needs no second event wait/stream
+          // fence. Device-valued optional outputs still require the D2H path.
+          const bool cpu_ready_worker_result =
+              worker_task_pipeline &&
+              has_cpu_serialization_inputs(forward_output);
+          const bool cpu_ready_task_result =
+              (task_pipeline && !worker_task_pipeline) ||
+              cpu_ready_worker_result;
           int64_t prepared_token = forward_output.prepared_token;
           const auto& beam_search_output = forward_output.beam_search_output;
           torch::Tensor expert_load_data;
@@ -1206,10 +1249,6 @@ void WorkerService::GetLastStepResult(
           std::vector<torch::Tensor> dit_images;
           std::vector<std::string> dit_text_output;
           auto copy_output_to_host = [&]() {
-            if (options_.enable_schedule_overlap() && !task_pipeline) {
-              CHECK(stream_->wait_event(forward_output.ready_event))
-                  << "failed to wait forward output ready event";
-            }
             expert_load_data = safe_to(forward_output.expert_load_data,
                                        torch::kCPU,
                                        /*non_blocking=*/true);
@@ -1231,7 +1270,9 @@ void WorkerService::GetLastStepResult(
                 forward_outputs.value().dit_forward_output.text_output;
 
             // [num_seq]
-            next_tokens = safe_to(sample_output.next_tokens,
+            next_tokens = safe_to(forward_output.next_tokens_host.defined()
+                                      ? forward_output.next_tokens_host
+                                      : sample_output.next_tokens,
                                   torch::kCPU,
                                   /*non_blocking=*/true);
             if (next_tokens.defined() ||
@@ -1264,9 +1305,15 @@ void WorkerService::GetLastStepResult(
             }
           };
 
-          if (task_pipeline) {
+          if (cpu_ready_task_result) {
             // The pipeline Future completes after Consume produces CPU results.
             copy_output_to_host();
+#if defined(USE_NPU)
+            if (cpu_ready_worker_result && !use_default_stream) {
+              DeviceMonitor::get_instance().update_active_activation_memory(
+                  device_.index());
+            }
+#endif
           } else {
             if (use_default_stream) {
               copy_output_to_host();

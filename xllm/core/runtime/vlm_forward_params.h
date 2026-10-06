@@ -173,6 +173,7 @@ class VlmForwardInput final {
 
   void copy_non_runtime_metadata_to(VlmForwardInput& inputs) const {
     inputs.transfer_kv_infos = transfer_kv_infos;
+    inputs.input_host_sample_count = input_host_sample_count;
     inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
     inputs.return_selected_hidden = return_selected_hidden;
     inputs.sample_sequence_ids = sample_sequence_ids;
@@ -237,6 +238,7 @@ class VlmForwardInput final {
   // kv info for disaggregated prefill/decode
   std::vector<TransferKVInfo> transfer_kv_infos;
 
+  int32_t input_host_sample_count = kUnknownPackedSampleCount;
   ForwardRuntimeState runtime;
 };
 

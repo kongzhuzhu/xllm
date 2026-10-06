@@ -51,6 +51,9 @@ size_t StoppingChecker::get_max_stop_sequence_token_count() const {
   for (const auto& sequence : stop_sequences_) {
     max_token_count = std::max(max_token_count, sequence.size());
   }
+  for (const auto& sequence : generated_stop_sequences_) {
+    max_token_count = std::max(max_token_count, sequence.size());
+  }
   return max_token_count;
 }
 
@@ -68,15 +71,13 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
 
   // if enable_schedule_overlap, there might be pre scheduled fake token -1
   // need to figure out the valid token to check finish.
-  size_t last_token_id;
-  size_t total_tokens;
-  for (auto i = token_ids.size() - 1; i >= 0; --i) {
-    if (token_ids[i] >= 0) {
-      last_token_id = token_ids[i];
-      total_tokens = i + 1;
-      break;
-    }
+  size_t total_tokens = token_ids.size();
+  while (total_tokens > 0 && token_ids[total_tokens - 1] < 0) {
+    --total_tokens;
   }
+  CHECK_GT(total_tokens, 0);
+  const int32_t last_token_id = token_ids[total_tokens - 1];
+  const Slice<int32_t> valid_token_ids(token_ids.data(), total_tokens);
 
   // check eos token
   if (!ignore_eos_ && last_token_id == eos_token_) {
@@ -106,7 +107,8 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
   // check stop sequences
   for (size_t index = 0; index < stop_sequences_.size(); ++index) {
     const auto& seq = stop_sequences_[index];
-    if (seq.back() == last_token_id && util::match_suffix(token_ids, seq)) {
+    if (seq.back() == last_token_id &&
+        util::match_suffix(valid_token_ids, seq)) {
       if (stop_reason != nullptr && index < stop_strings_.size() &&
           !stop_strings_[index].empty()) {
         *stop_reason = stop_strings_[index];
@@ -118,6 +120,23 @@ FinishReason StoppingChecker::check(const Slice<int32_t>& token_ids,
             std::min(seq.size(), total_tokens - num_prompt_tokens);
       }
       return FinishReason::STOP;
+    }
+  }
+
+  if (total_tokens > num_prompt_tokens) {
+    for (size_t index = 0; index < generated_stop_sequences_.size(); ++index) {
+      const auto& seq = generated_stop_sequences_[index];
+      if (seq.back() == last_token_id &&
+          util::match_suffix(valid_token_ids, seq)) {
+        if (stop_reason != nullptr && index < generated_stop_strings_.size()) {
+          *stop_reason = generated_stop_strings_[index];
+        }
+        if (matched_stop_token_count != nullptr) {
+          *matched_stop_token_count =
+              std::min(seq.size(), total_tokens - num_prompt_tokens);
+        }
+        return FinishReason::STOP;
+      }
     }
   }
 

@@ -939,6 +939,26 @@ WorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
 template <typename Input>
 void WorkerImpl::update_json_object_states_by_last_step_output_impl(
     Input& input) {
+  const ForwardOutput empty_output;
+  update_json_object_states_by_output_impl(
+      input,
+      last_step_output_valid_ ? last_step_output_ : empty_output,
+      last_step_sample_sequence_ids_);
+}
+
+void WorkerImpl::update_json_object_states_by_output(
+    LlmForwardInput& input,
+    const ForwardOutput& prior_output,
+    const std::vector<std::string>& prior_sample_sequence_ids) {
+  update_json_object_states_by_output_impl(
+      input, prior_output, prior_sample_sequence_ids);
+}
+
+template <typename Input>
+void WorkerImpl::update_json_object_states_by_output_impl(
+    Input& input,
+    const ForwardOutput& prior_output,
+    const std::vector<std::string>& prior_sample_sequence_ids) {
   if (input.json_object_states.empty()) {
     return;
   }
@@ -949,19 +969,18 @@ void WorkerImpl::update_json_object_states_by_last_step_output_impl(
       << "JSON grammar states must align with prior output rows";
 
   const bool has_prior_output =
-      last_step_output_valid_ &&
-      last_step_output_.sample_output.next_tokens.defined();
+      prior_output.sample_output.next_tokens.defined();
   torch::Tensor next_tokens;
   if (has_prior_output) {
     CHECK(compute_stream_ != nullptr)
         << "JSON grammar overlap update requires a compute stream";
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-    if (last_step_output_.ready_event != nullptr) {
-      CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
+    if (prior_output.ready_event != nullptr) {
+      CHECK(compute_stream_->wait_event(prior_output.ready_event))
           << "failed to wait for last-step output before JSON grammar update";
     }
     next_tokens =
-        safe_to(last_step_output_.sample_output.next_tokens,
+        safe_to(prior_output.sample_output.next_tokens,
                 torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
                 /*non_blocking=*/false);
     CHECK(next_tokens.dim() == 1 || next_tokens.dim() == 2)
@@ -979,8 +998,8 @@ void WorkerImpl::update_json_object_states_by_last_step_output_impl(
     }
   }
   if (has_prior_output &&
-      (!last_step_sample_sequence_ids_.empty() || expects_prior_output)) {
-    CHECK_EQ(last_step_sample_sequence_ids_.size(),
+      (!prior_sample_sequence_ids.empty() || expects_prior_output)) {
+    CHECK_EQ(prior_sample_sequence_ids.size(),
              static_cast<size_t>(next_tokens.size(0)))
         << "last-step sampled request ids must align with output rows";
   }
@@ -989,16 +1008,14 @@ void WorkerImpl::update_json_object_states_by_last_step_output_impl(
   std::vector<JsonObjectOutputError> output_errors;
   std::string row_error;
   const std::vector<std::string> empty_sample_sequence_ids;
-  const std::vector<std::string>& prior_sample_sequence_ids =
-      has_prior_output ? last_step_sample_sequence_ids_
-                       : empty_sample_sequence_ids;
-  CHECK(detail::resolve_json_object_output_rows(input.json_object_states,
-                                                input.sample_sequence_ids,
-                                                input.sample_prior_output_rows,
-                                                prior_sample_sequence_ids,
-                                                &output_rows,
-                                                &output_errors,
-                                                &row_error))
+  CHECK(detail::resolve_json_object_output_rows(
+      input.json_object_states,
+      input.sample_sequence_ids,
+      input.sample_prior_output_rows,
+      has_prior_output ? prior_sample_sequence_ids : empty_sample_sequence_ids,
+      &output_rows,
+      &output_errors,
+      &row_error))
       << row_error;
 
   for (const JsonObjectOutputError& output_error : output_errors) {
@@ -1302,21 +1319,37 @@ std::optional<ForwardOutput> WorkerImpl::execute_no_sync_on_stream(
   return std::nullopt;
 }
 
+void WorkerImpl::prepare_input_on_stream(const LlmForwardInput& input,
+                                         LlmForwardInput& processed_input,
+                                         Stream& prepare_stream,
+                                         bool record_ready_event,
+                                         bool restore_linear_state,
+                                         bool wait_for_compute_stream) {
+  prepare_work_before_execute_on_stream_impl(input,
+                                             processed_input,
+                                             prepare_stream,
+                                             record_ready_event,
+                                             restore_linear_state,
+                                             wait_for_compute_stream);
+}
+
 template <typename Input>
 void WorkerImpl::prepare_work_before_execute_on_stream_impl(
     const Input& input,
     Input& processed_input,
     Stream& prepare_stream,
     bool record_ready_event,
-    bool restore_linear_state) {
+    bool restore_linear_state,
+    bool wait_for_compute_stream) {
   if (!input.json_object_state_snapshots.empty()) {
     Input restored_input = input.clone();
     restore_json_object_states(restored_input);
-    prepare_work_before_execute_on_stream(restored_input,
-                                          processed_input,
-                                          prepare_stream,
-                                          record_ready_event,
-                                          restore_linear_state);
+    prepare_work_before_execute_on_stream_impl(restored_input,
+                                               processed_input,
+                                               prepare_stream,
+                                               record_ready_event,
+                                               restore_linear_state,
+                                               wait_for_compute_stream);
     return;
   }
 #if defined(USE_NPU)
@@ -1338,7 +1371,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
   }
 #endif
   c10::StreamGuard stream_guard = prepare_stream.set_stream_guard();
-  if (enable_schedule_overlap() &&
+  if (enable_schedule_overlap() && wait_for_compute_stream &&
       !can_prepare_without_compute_stream_wait(input.input_params) &&
       compute_stream_) {
     // MTP updates reuse shared prepare/compute streams and need this ordering;
@@ -1800,6 +1833,16 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
     }
   });
   return future;
+}
+
+void WorkerImpl::prepare_task_pipeline_input(const LlmForwardInput& input,
+                                             LlmForwardInput& prepared) {
+  prepare_work_before_execute(input, prepared);
+}
+
+std::optional<ForwardOutput> WorkerImpl::execute_task_pipeline(
+    const LlmForwardInput& prepared) {
+  return step_for_schedule_overlap(prepared);
 }
 
 ForwardOutput WorkerImpl::get_last_step_result() {

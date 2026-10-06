@@ -47,6 +47,7 @@ limitations under the License.
 namespace xllm {
 
 class LlmForwardInput;
+constexpr int32_t kUnknownPackedSampleCount = -1;
 
 namespace detail {
 
@@ -508,6 +509,7 @@ class LlmForwardInput final {
 
   void copy_non_runtime_metadata_to(LlmForwardInput& inputs) const {
     inputs.transfer_kv_infos = transfer_kv_infos;
+    inputs.input_host_sample_count = input_host_sample_count;
     inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
     inputs.return_selected_hidden = return_selected_hidden;
     inputs.sample_sequence_ids = sample_sequence_ids;
@@ -581,6 +583,7 @@ class LlmForwardInput final {
   // kv info for disaggregated prefill/decode
   std::vector<TransferKVInfo> transfer_kv_infos;
 
+  int32_t input_host_sample_count = kUnknownPackedSampleCount;
   ForwardRuntimeState runtime;
 };
 
@@ -595,6 +598,9 @@ struct ForwardOutput {
   // max number of top logprobs in the batch
   int64_t max_top_logprobs = 0;
   SampleOutput sample_output;
+  // Optional CPU token snapshot, valid after ready_event. Device next_tokens
+  // remains available for continuation; serializers can reuse this D2H copy.
+  torch::Tensor next_tokens_host;
   // The target sampler applies packed token masks in-place before returning
   // sampled tokens. MTP validation uses this local contract to avoid applying
   // the same mask to target logits a second time.
