@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from copy import copy
 from typing import Protocol
 
 import torch
@@ -43,6 +44,7 @@ class ScopedWeightLoader:
         strip_src_prefixes: bool = False,
     ) -> None:
         self._state_dicts = state_dicts
+        self._state_dict_by_key = self._build_state_dict_index(state_dicts)
         self._prefix = prefix
         self._src_prefixes = tuple(src_prefixes)
         # Resolve aliases in order, then source prefixes and checkpoint shards.
@@ -52,13 +54,28 @@ class ScopedWeightLoader:
         self._strip_src_prefixes = strip_src_prefixes
 
     def with_prefix(self, prefix: str) -> ScopedWeightLoader:
-        return ScopedWeightLoader(
-            self._state_dicts,
-            self._prefix + prefix,
-            src_prefixes=self._src_prefixes,
-            name_aliases=self._name_aliases,
-            strip_src_prefixes=self._strip_src_prefixes,
-        )
+        scoped = copy(self)
+        scoped._prefix += prefix
+        return scoped
+
+    @staticmethod
+    def _build_state_dict_index(state_dicts: Sequence[StateDictLike]) -> dict[str, StateDictLike] | None:
+        index: dict[str, StateDictLike] = {}
+        for state_dict in state_dicts:
+            keys = getattr(state_dict, "keys", None)
+            if not callable(keys):
+                return None
+            for key in keys():
+                index.setdefault(str(key), state_dict)
+        return index
+
+    def _find_state_dict(self, name: str) -> StateDictLike | None:
+        if self._state_dict_by_key is not None:
+            return self._state_dict_by_key.get(name)
+        for state_dict in self._state_dicts:
+            if state_dict.has(name):
+                return state_dict
+        return None
 
     def _resolve(self, local_name: str) -> tuple[StateDictLike, str] | None:
         """First present ``(state_dict, resolved_name)`` for the scoped name,
@@ -68,16 +85,16 @@ class ScopedWeightLoader:
         for alias in aliases:
             for prefix in self._src_prefixes:
                 full = prefix + alias
-                for state in self._state_dicts:
-                    if state.has(full):
-                        return state, full
+                state = self._find_state_dict(full)
+                if state is not None:
+                    return state, full
             if self._strip_src_prefixes:
                 for prefix in self._src_prefixes:
                     if prefix and alias.startswith(prefix):
                         stripped = alias[len(prefix) :]
-                        for state in self._state_dicts:
-                            if state.has(stripped):
-                                return state, stripped
+                        state = self._find_state_dict(stripped)
+                        if state is not None:
+                            return state, stripped
         return None
 
     def find(self, local_name: str) -> StateDictLike | None:
@@ -97,12 +114,9 @@ class ScopedWeightLoader:
         returned loader never strips prefixes, so all reads stay under the chosen root.
         """
         for prefix in self._src_prefixes:
-            candidate = ScopedWeightLoader(
-                self._state_dicts,
-                self._prefix,
-                src_prefixes=(prefix,),
-                name_aliases=self._name_aliases,
-            )
+            candidate = copy(self)
+            candidate._src_prefixes = (prefix,)
+            candidate._strip_src_prefixes = False
             if candidate.has(probe):
                 return candidate
         raise KeyError(f"no checkpoint root among {self._src_prefixes} has {probe!r}")

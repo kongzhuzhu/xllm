@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -290,23 +291,272 @@ def test_glm_ep1_moe_reduces_only_on_ordinary_tp_group() -> None:
     torch.testing.assert_close(output, routed + shared)
 
 
-def test_glm_ep_moe_preserves_parent_combine_behavior() -> None:
+@pytest.mark.parametrize(
+    ("enabled", "ep_size", "gate_overlap", "fine_overlap", "expected"),
+    [
+        (True, 1, False, False, True),
+        (False, 1, False, False, False),
+        (True, 2, False, False, False),
+        (True, 1, True, False, True),
+        (True, 1, True, True, True),
+        (False, 1, True, True, False),
+        (True, 2, True, True, False),
+    ],
+)
+def test_glm_moe_finalize_follows_unified_switch_contract(
+    enabled: bool,
+    ep_size: int,
+    gate_overlap: bool,
+    fine_overlap: bool,
+    expected: bool,
+) -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
-    moe.ep_size = 2
-    routed = torch.tensor([[1.0]])
-    shared = torch.tensor([[2.0]])
-    expected = torch.tensor([[3.0]])
+    moe.ep_size = ep_size
+    moe._expert_parallel_enabled = True
+    moe._gate_overlap_enabled = gate_overlap
+    moe._fine_overlap_enabled = fine_overlap
+    moe.set_unified_mtp_graph_enabled(enabled)
+    assert moe._enable_moe_finalize_routing is expected
+    if ep_size == 1:
+        assert moe._gate_overlap_enabled is enabled
+        assert moe._fine_overlap_enabled is False
+    else:
+        assert moe._gate_overlap_enabled is gate_overlap
+        assert moe._fine_overlap_enabled is fine_overlap
 
-    with patch.object(
-        glm5_2.DeepseekV3MoE,
-        "_combine_expert_outputs",
-        return_value=expected,
-    ) as parent_combine:
-        output = moe._combine_expert_outputs(routed, shared, False)
 
-    parent_combine.assert_called_once_with(routed, shared, False)
-    assert output is expected
+def test_glm_unified_switch_does_not_enable_overlap_on_other_devices() -> None:
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe.ep_size = 1
+    moe._expert_parallel_enabled = False
+    moe._gate_overlap_enabled = False
+    moe._fine_overlap_enabled = False
+    moe.set_unified_mtp_graph_enabled(True)
+    assert not moe._enable_moe_finalize_routing
+    assert not moe._gate_overlap_enabled
+    assert not moe._fine_overlap_enabled
+
+
+@pytest.mark.parametrize(("enabled", "tokens"), [(False, 2), (True, 2), (True, 0)])
+def test_glm_unified_switch_selects_grouped_moe_output(enabled: bool, tokens: int) -> None:
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe._enable_moe_finalize_routing = enabled
+    moe.cfg = SimpleNamespace(norm_topk_prob=True)
+    moe.gate = MagicMock(return_value=torch.zeros(tokens, 4))
+    for name in (
+        "experts_w13",
+        "experts_w2",
+        "experts_w13_scale",
+        "experts_w2_scale_compute",
+        "e_score_correction_bias",
+    ):
+        setattr(moe, name, torch.empty(1))
+    moe.topk = 2
+    moe.topk_group = 1
+    moe.n_group = 1
+    moe.routed_scaling = 1.0
+    moe.local_expert_start = 0
+    moe.local_expert_end = 4
+    hidden = SimpleNamespace(shape=(tokens, 4), device=SimpleNamespace(type="npu"))
+    routed = torch.ones(tokens, 4)
+    metadata = (routed, torch.ones(tokens, 2), torch.zeros(tokens * 2, dtype=torch.int32))
+    with (
+        patch.object(glm5_2.kernels, "supports_fused_moe_gmm1", return_value=True),
+        patch.object(glm5_2.kernels, "grouped_moe", return_value=routed) as legacy,
+        patch.object(glm5_2.kernels, "grouped_moe_with_routing", return_value=metadata) as retained,
+    ):
+        result = moe._run_routed_experts(hidden)
+    use_finalize = enabled and tokens > 0
+    assert result is (metadata if use_finalize else routed)
+    assert retained.call_count == int(use_finalize)
+    assert legacy.call_count == int(not use_finalize)
+
+
+@pytest.mark.parametrize(
+    "device_type",
+    ["cpu", "cuda", "npu", "privateuseone"],
+    ids=["host", "other-device", "ascend", "ascend-alias"],
+)
+@pytest.mark.parametrize("supports_fused", [False, True])
+def test_glm_moe_finalize_device_and_capability_guard(device_type: str, supports_fused: bool) -> None:
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe._enable_moe_finalize_routing = True
+    hidden = SimpleNamespace(shape=(1, 4), device=SimpleNamespace(type=device_type))
+    with patch.object(glm5_2.kernels, "supports_fused_moe_gmm1", return_value=supports_fused) as capability:
+        assert moe._use_moe_finalize_routing(hidden) is (device_type in ("npu", "privateuseone") and supports_fused)
+    if device_type in ("cpu", "cuda"):
+        capability.assert_not_called()
+
+
+@pytest.mark.parametrize("gate_overlap", [False, True])
+def test_glm_moe_finalize_orders_stream_dependencies(gate_overlap: bool) -> None:
+    class _Event:
+        def __init__(self, name: str, events: list[tuple[str, object]]) -> None:
+            self.name = name
+            self.events = events
+
+        def record(self, stream: object) -> None:
+            self.events.append((f"record:{self.name}", stream))
+
+    class _Stream:
+        def __init__(self, name: str, events: list[tuple[str, object]]) -> None:
+            self.name = name
+            self.events = events
+
+        def wait_event(self, event: object) -> None:
+            self.events.append((f"wait:{self.name}", event))
+
+    events: list[tuple[str, object]] = []
+    event_ids = iter(("start", "shared_done", "gate_done"))
+    current_stream = _Stream("current", events)
+    gate_stream = _Stream("gate", events)
+    shared_stream = _Stream("shared", events)
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe.ep_size = 1
+    moe.moe_tp_size = 1
+    moe.cfg = SimpleNamespace(
+        tp_size=1,
+        enable_attn_dp_weight_sharding=False,
+        norm_topk_prob=True,
+    )
+    moe._gate_overlap_enabled = gate_overlap
+    moe._fine_overlap_enabled = False
+    moe._enable_moe_finalize_routing = True
+    moe.gate = MagicMock(return_value=torch.zeros(2, 4))
+    moe.e_score_correction_bias = torch.zeros(4)
+    moe.topk = 2
+    moe.topk_group = 1
+    moe.n_group = 1
+    moe.routed_scaling = 1.0
+    moe.experts_w13 = torch.empty(1)
+    moe.experts_w2 = torch.empty(1)
+    moe.experts_w13_scale = torch.empty(1)
+    moe.experts_w2_scale_compute = torch.empty(1)
+    moe._shared_expert_start_event = None
+    moe._gate_done_event = None
+    moe._shared_expert_done_event = None
+    routed = (
+        torch.ones(4, 4),
+        torch.tensor([[0.2, 0.8], [0.7, 0.3]]),
+        torch.tensor([1, 0, 1, 0], dtype=torch.int32),
+    )
+    shared = torch.full((2, 4), 2.0)
+
+    def make_event() -> _Event:
+        return _Event(next(event_ids), events)
+
+    def fake_finalize(
+        routed_value: torch.Tensor,
+        shared_value: torch.Tensor,
+        probs_value: torch.Tensor,
+        indices_value: torch.Tensor,
+    ) -> torch.Tensor:
+        assert routed_value is routed[0]
+        assert shared_value is shared
+        assert probs_value is routed[1]
+        assert indices_value is routed[2]
+        events.append(("finalize", None))
+        return torch.full((2, 4), 3.0)
+
+    with (
+        patch.object(deepseek_v32, "_gate_stream", return_value=gate_stream),
+        patch.object(glm5_2.kernels, "supports_fused_moe_gmm1", return_value=True),
+        patch.object(deepseek_v32, "_shared_expert_stream", return_value=shared_stream),
+        patch.object(
+            torch,
+            "npu",
+            SimpleNamespace(
+                Event=make_event,
+                current_stream=lambda: current_stream,
+                stream=lambda _: nullcontext(),
+            ),
+            create=True,
+        ),
+        patch.object(
+            glm5_2.kernels,
+            "moe_gate_routing",
+            return_value=(torch.ones(2, 2), torch.zeros(2, 2, dtype=torch.int32)),
+        ),
+        patch.object(
+            glm5_2.kernels,
+            "moe_expert_compute_with_routing",
+            side_effect=lambda *args: events.append(("routed", None)) or routed,
+        ),
+        patch.object(
+            moe,
+            "_run_shared_experts",
+            side_effect=lambda hidden: events.append(("shared", None)) or shared,
+        ),
+        patch.object(
+            moe,
+            "_run_routed_experts",
+            side_effect=lambda *args: events.append(("routed", None)) or routed,
+        ),
+        patch.object(glm5_2.kernels, "moe_finalize_routing", side_effect=fake_finalize),
+    ):
+        hidden = SimpleNamespace(shape=(2, 4), device=SimpleNamespace(type="npu"))
+        result = moe._forward_parallel(hidden, use_mega_moe=False)
+
+    assert torch.equal(result, torch.full((2, 4), 3.0))
+    expected = ["record:start"]
+    if gate_overlap:
+        expected.extend(("wait:gate", "record:gate_done"))
+    expected.extend(("wait:shared", "shared", "record:shared_done"))
+    if gate_overlap:
+        expected.append("wait:current")
+    expected.extend(("routed", "wait:current", "finalize"))
+    assert [event[0] for event in events] == expected
+
+
+def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce() -> None:
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe.ep_size = 1
+    moe.moe_tp_size = 1
+    moe.cfg = SimpleNamespace(tp_size=2)
+    moe._enable_moe_finalize_routing = True
+    permuted = torch.tensor([[1.0], [2.0], [3.0]])
+    probs = torch.tensor([[0.25], [0.5], [0.75]])
+    row_idx = torch.tensor([1, 0, 1], dtype=torch.int32)
+    shared = torch.tensor([[10.0], [20.0]])
+    finalized = torch.tensor([[11.0], [22.5]])
+
+    def fake_finalize(
+        routed_value: torch.Tensor,
+        shared_value: torch.Tensor,
+        probs_value: torch.Tensor,
+        indices_value: torch.Tensor,
+    ) -> torch.Tensor:
+        assert routed_value is permuted
+        assert shared_value is shared
+        assert probs_value is probs
+        assert indices_value is row_idx
+        output = shared_value.clone()
+        output.index_add_(0, indices_value.to(torch.long), routed_value * probs_value)
+        return output
+
+    with (
+        patch.object(glm5_2.kernels, "moe_finalize_routing", side_effect=fake_finalize) as finalize,
+        patch.object(glm5_2.distributed, "all_reduce_", create=True) as reduce,
+    ):
+        output = moe._combine_expert_outputs((permuted, probs, row_idx), shared)
+
+    assert finalize.call_count == 1
+    finalize_args = finalize.call_args.args
+    assert finalize_args[0] is permuted
+    assert finalize_args[1] is shared
+    assert finalize_args[2] is probs
+    assert finalize_args[3] is row_idx
+    assert reduce.call_count == 1
+    reduce_args = reduce.call_args.args
+    torch.testing.assert_close(reduce_args[0], finalized)
+    assert reduce_args[1] == "tp"
+    torch.testing.assert_close(output, finalized)
 
 
 def test_shared_dense_mlp_fused_path_preserves_reduction_dtype() -> None:
@@ -849,3 +1099,22 @@ def test_rope_contract_rejects_inconsistent_metadata(interleaved: bool, invalid:
     cos_sin = (torch.empty(shape, dtype=dtype, device=device),) * 2
     with pytest.raises(ValueError, match="test consumer cos: expected shape=.*got shape="):
         glm5_2._validate_rope_cos_sin(cos_sin, torch.empty(2, 8), 4, interleaved, "test consumer")
+
+
+def test_glm_ep_moe_preserves_parent_combine_behavior() -> None:
+    moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
+    nn.Module.__init__(moe)
+    moe.ep_size = 2
+    routed = torch.tensor([[1.0]])
+    shared = torch.tensor([[2.0]])
+    expected = torch.tensor([[3.0]])
+
+    with patch.object(
+        glm5_2.DeepseekV3MoE,
+        "_combine_expert_outputs",
+        return_value=expected,
+    ) as parent_combine:
+        output = moe._combine_expert_outputs(routed, shared, False)
+
+    parent_combine.assert_called_once_with(routed, shared, False)
+    assert output is expected

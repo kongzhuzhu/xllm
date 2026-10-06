@@ -90,7 +90,9 @@ class Glm52MtpModel(DeepseekV32MtpModel):
         return super()._prepare_layer_inputs(hidden, positions, cp_context)
 
     def _prepare_token_hidden(self, hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return torch.where(positions.ne(0).unsqueeze(-1), hidden, torch.zeros_like(hidden))
+        # A scalar zero broadcasts in the where kernel; avoid materializing a
+        # full hidden-shaped zeros_like tensor for the position-zero rows.
+        return torch.where(positions.ne(0).unsqueeze(-1), hidden, 0)
 
     def _recurrent_hidden(self, hidden: torch.Tensor, residual: torch.Tensor | None) -> torch.Tensor:
         return hidden if residual is None else hidden + residual
@@ -115,6 +117,11 @@ class Glm52MtpForCausalLM(Glm52ForCausalLM):
 
     def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
         return _compute_mtp_logits(self.model, self.lm_head, hidden, selected_idxes)
+
+    def compute_greedy_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        normalized = self.model.norm(hidden)
+        assert isinstance(normalized, torch.Tensor)
+        return super().compute_greedy_tokens(normalized)
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         _load_mtp_weights(self, super().load_weights, state_dicts, tp_rank, tp_size)

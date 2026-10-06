@@ -864,7 +864,7 @@ class Glm52Indexer(DeepseekV3Indexer):
         self._wk_weights_proj_ready = False
 
     def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wk_weights_proj_ready:
+        if getattr(self, "_wk_weights_proj_ready", False):
             projected = F.linear(hidden, self._wk_weights_proj_weight)
             return projected[..., : self.head_dim], projected[..., self.head_dim :].contiguous()
         return self.wk(hidden), self.weights_proj(hidden)
@@ -890,16 +890,51 @@ class Glm52Indexer(DeepseekV3Indexer):
 class Glm52MoE(DeepseekV3MoE):
     """EP MoE with CP rows materialized before expert reduction."""
 
+    def __init__(
+        self,
+        cfg: Glm52Config,
+        layer_id: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__(cfg, layer_id, dtype, device)
+        # The executor configures both target and draft from the Unified
+        # switch. EP1 NPU models must not inherit experimental overlap flags.
+        self.set_unified_mtp_graph_enabled(False)
+
+    def set_unified_mtp_graph_enabled(self, enabled: bool) -> None:
+        supported = self.ep_size == 1 and self._expert_parallel_enabled
+        self._enable_moe_finalize_routing = bool(enabled) and supported
+        if supported:
+            self._gate_overlap_enabled = bool(enabled)
+            self._fine_overlap_enabled = False
+
+    def _use_moe_finalize_routing(self, hidden: torch.Tensor) -> bool:
+        if not super()._use_moe_finalize_routing(hidden):
+            return False
+        if hidden.device.type not in ("npu", "privateuseone"):
+            return False
+        return kernels.supports_fused_moe_gmm1(hidden.device)
+
     def _combine_expert_outputs(
         self,
-        routed: torch.Tensor,
+        routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         shared: torch.Tensor,
-        use_mega_moe: bool,
+        use_mega_moe: bool = False,
     ) -> torch.Tensor:
         if self.ep_size > 1:
             return super()._combine_expert_outputs(routed, shared, use_mega_moe)
 
-        final = routed + shared
+        if isinstance(routed, tuple):
+            permuted_output, probs, sorted_indices = routed
+            final = kernels.moe_finalize_routing(
+                permuted_output,
+                shared,
+                probs,
+                sorted_indices,
+            )
+        else:
+            final = routed + shared
         if getattr(self.cfg, "enable_attn_dp_weight_sharding", False):
             if self.moe_tp_size > 1:
                 distributed.all_reduce_(final, "moe_tp")
@@ -1067,6 +1102,10 @@ class Glm52ForCausalLM(PyModelBase):
             dtype=self.dtype,
             device=self.device,
         )
+
+    def compute_greedy_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        assert isinstance(self.lm_head, ColumnParallelLinear)
+        return self.lm_head.greedy_tokens(hidden)
 
     def load_weights(
         self,

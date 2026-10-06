@@ -74,6 +74,12 @@ def _shared_expert_stream(device: torch.device) -> torch.npu.Stream:
 
 _GATE_STREAMS: dict[tuple[str, int | None], torch.npu.Stream] = {}
 
+# Keep host-side staging bounded while reducing the number of tiny H2D copies
+# during GLM5/DeepSeek W8A8 expert loading.  The previous one-expert loop was
+# dominated by Python/pybind launch overhead; a small batch preserves the
+# staged-memory property of the loader.
+_EXPERT_LOAD_BATCH_SIZE = 8
+
 
 def _gate_stream(device: torch.device) -> torch.npu.Stream:
     key = (device.type, device.index)
@@ -86,13 +92,8 @@ def _gate_stream(device: torch.device) -> torch.npu.Stream:
 
 def _tp_rank_from_device(device: object) -> int:
     """Local device index from the worker device string ("npu:3" -> 3)."""
-    s = str(device)
-    if ":" in s:
-        try:
-            return int(s.rsplit(":", 1)[-1])
-        except ValueError:
-            return 0
-    return 0
+    _, separator, index = str(device).rpartition(":")
+    return int(index) if separator and index.isdecimal() else 0
 
 
 def _create_hadamard_matrix(
@@ -1718,19 +1719,25 @@ class DeepseekV3MoE(nn.Module):
     ) -> None:
         """Allocate, fill, and format the stacked W8A8 experts, staged w13 then w2.
 
-        Staging keeps peak load memory at one raw int8 expert buffer, not two.
+        Chunked staging keeps peak load memory bounded to a small batch of raw
+        int8 expert buffers, not the full stacked checkpoint.
         The grouped-MoE path keeps no per-expert offset buffer, so each expert's
         symmetric-int8 (zero ``weight_offset``) invariant is asserted here while
         its shard is warm. MegaMoe encodes the retained scales with zero offsets.
         """
+        local_experts = list(range(self.local_expert_start, self.local_expert_end))
         self.allocate_experts_w13_for_loading()
-        for idx, j in enumerate(range(self.local_expert_start, self.local_expert_end)):
-            src = f"{src_prefix}{j}."
-            loader.assert_symmetric_int8(src, ("gate_proj", "up_proj"))
-            w = loader.pack_gate_up(src, "weight", world=world, rank=rank)
-            s = loader.pack_gate_up(src, "weight_scale", world=world, rank=rank)
-            self.experts_w13.data[idx].copy_(w)
-            self.experts_w13_scale.data[idx].copy_(s.reshape(-1))
+        for begin in range(0, len(local_experts), _EXPERT_LOAD_BATCH_SIZE):
+            batch = local_experts[begin : begin + _EXPERT_LOAD_BATCH_SIZE]
+            weights = []
+            scales = []
+            for j in batch:
+                src = f"{src_prefix}{j}."
+                loader.assert_symmetric_int8(src, ("gate_proj", "up_proj"))
+                weights.append(loader.pack_gate_up(src, "weight", world=world, rank=rank))
+                scales.append(loader.pack_gate_up(src, "weight_scale", world=world, rank=rank).reshape(-1))
+            self.experts_w13.data[begin : begin + len(batch)].copy_(torch.stack(weights, dim=0))
+            self.experts_w13_scale.data[begin : begin + len(batch)].copy_(torch.stack(scales, dim=0))
         if self._mega_moe_enabled:
             self.mega_moe_w13_scale = kernels.encode_mega_moe_scale(
                 self.experts_w13_scale,
@@ -1749,16 +1756,21 @@ class DeepseekV3MoE(nn.Module):
             if self._mega_moe_enabled
             else None
         )
-        for idx, j in enumerate(range(self.local_expert_start, self.local_expert_end)):
-            src = f"{src_prefix}{j}."
-            loader.assert_symmetric_int8(src, ("down_proj",))
-            w, s = loader.load_w8a8_down(src, world=world, rank=rank)
-            self.experts_w2.data[idx].copy_(w)
+        for begin in range(0, len(local_experts), _EXPERT_LOAD_BATCH_SIZE):
+            batch = local_experts[begin : begin + _EXPERT_LOAD_BATCH_SIZE]
+            weights = []
+            scales = []
+            for j in batch:
+                src = f"{src_prefix}{j}."
+                loader.assert_symmetric_int8(src, ("down_proj",))
+                w, s = loader.load_w8a8_down(src, world=world, rank=rank)
+                weights.append(w)
+                scales.append(s.reshape(-1))
+            self.experts_w2.data[begin : begin + len(batch)].copy_(torch.stack(weights, dim=0))
             # GMM2 needs bf16 scales; compute buffer holds the cast.
-            scale = s.reshape(-1)
-            self.experts_w2_scale_compute.data[idx].copy_(scale)
+            self.experts_w2_scale_compute.data[begin : begin + len(batch)].copy_(torch.stack(scales, dim=0))
             if mega_moe_w2_scale is not None:
-                mega_moe_w2_scale[idx].copy_(scale)
+                mega_moe_w2_scale[begin : begin + len(batch)].copy_(torch.stack(scales, dim=0))
         if mega_moe_w2_scale is not None:
             self.mega_moe_w2_scale = kernels.encode_mega_moe_scale(
                 mega_moe_w2_scale,
@@ -1799,7 +1811,9 @@ class DeepseekV3MoE(nn.Module):
             raise RuntimeError("MegaMoe graph token mask must contain one value per token")
         return graph_mask
 
-    def _run_routed_experts(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
+    def _run_routed_experts(
+        self, hidden: torch.Tensor, use_mega_moe: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if use_mega_moe and hidden.shape[0] > self._mega_moe_num_max_tokens_per_rank:
             raise RuntimeError(
                 "MegaMoe token count exceeds the communication cap: "
@@ -1807,7 +1821,10 @@ class DeepseekV3MoE(nn.Module):
             )
         logits = self.gate(hidden)
         if not use_mega_moe:
-            return kernels.grouped_moe(
+            expert_compute = (
+                kernels.grouped_moe_with_routing if self._use_moe_finalize_routing(hidden) else kernels.grouped_moe
+            )
+            return expert_compute(
                 hidden,
                 logits,
                 self.experts_w13,
@@ -1847,6 +1864,10 @@ class DeepseekV3MoE(nn.Module):
             self._mega_moe_token_mask(hidden),
         )
 
+    def _use_moe_finalize_routing(self, hidden: torch.Tensor) -> bool:
+        """Return whether this forward may use fused MoE finalization."""
+        return bool(getattr(self, "_enable_moe_finalize_routing", False)) and hidden.shape[0] > 0
+
     def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._fuse_shared_expert:
             output = None
@@ -1874,15 +1895,18 @@ class DeepseekV3MoE(nn.Module):
         return final
 
     def _ensure_expert_parallel_resources(self) -> None:
-        if self._shared_expert_start_event is not None:
-            return
-        self._shared_expert_start_event = torch.npu.Event()
-        self._shared_expert_done_event = torch.npu.Event()
+        if self._shared_expert_start_event is None:
+            self._shared_expert_start_event = torch.npu.Event()
+        if self._shared_expert_done_event is None:
+            self._shared_expert_done_event = torch.npu.Event()
         if self._gate_overlap_enabled:
-            self._gate_done_event = torch.npu.Event()
+            if self._gate_done_event is None:
+                self._gate_done_event = torch.npu.Event()
         if self._fine_overlap_enabled:
-            self._before_dispatch_event = torch.npu.Event()
-            self._before_gmm2_event = torch.npu.Event()
+            if self._before_dispatch_event is None:
+                self._before_dispatch_event = torch.npu.Event()
+            if self._before_gmm2_event is None:
+                self._before_gmm2_event = torch.npu.Event()
 
     def _forward_parallel(self, hidden: torch.Tensor, use_mega_moe: bool) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
@@ -1920,7 +1944,12 @@ class DeepseekV3MoE(nn.Module):
                 shared_done_event.record(shared_stream)
 
             current_stream.wait_event(gate_done_event)
-            routed = kernels.moe_expert_compute(
+            expert_compute = (
+                kernels.moe_expert_compute_with_routing
+                if self._use_moe_finalize_routing(hidden)
+                else kernels.moe_expert_compute
+            )
+            routed = expert_compute(
                 hidden,
                 topk_weights,
                 topk_ids,

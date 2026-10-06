@@ -26,6 +26,134 @@ from xllm.python.kernels_npu import moe
 from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 
 
+def test_unpermute_probs_keeps_fp32_without_a_dtype_copy() -> None:
+    output = torch.empty(3, 16, dtype=torch.bfloat16)
+    fp32_probs = torch.ones(3, 2, dtype=torch.float32)
+    assert moe._unpermute_probs(fp32_probs, output) is fp32_probs
+
+    bf16_probs = fp32_probs.to(torch.bfloat16)
+    converted = moe._unpermute_probs(bf16_probs, output)
+    assert converted is bf16_probs
+
+
+@pytest.mark.parametrize("prob_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_moe_expert_compute_with_routing_preserves_metadata_without_unpermute(
+    monkeypatch: pytest.MonkeyPatch,
+    prob_dtype: torch.dtype,
+) -> None:
+    hidden = torch.empty(2, 4, dtype=torch.bfloat16)
+    topk_weights = torch.tensor([[0.2, 0.8], [0.7, 0.3]], dtype=prob_dtype)
+    topk_ids = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    sorted_hidden = torch.empty(4, 4, dtype=torch.int8)
+    sorted_indices = torch.tensor([1, 0, 3, 2], dtype=torch.int32)
+    group_list = torch.tensor([1, 1, 1, 1], dtype=torch.int64)
+    per_token_scale = torch.ones(4, dtype=torch.float32)
+    permuted_output = torch.arange(16, dtype=torch.bfloat16).view(4, 4)
+    weights = torch.empty(4, 4, 8, dtype=torch.int8)
+    down_weights = torch.empty(4, 4, 4, dtype=torch.int8)
+    weight_scale = torch.empty(4, 8, dtype=torch.float32)
+    down_scale = torch.empty(4, 4, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(moe, "supports_fused_moe_gmm1", lambda device: False)
+    monkeypatch.setattr(
+        moe.torch_npu,
+        "npu_moe_init_routing_v2",
+        MagicMock(return_value=(sorted_hidden, sorted_indices, group_list, per_token_scale)),
+    )
+    monkeypatch.setattr(
+        moe,
+        "_grouped_matmul_swiglu_quant_v2",
+        MagicMock(return_value=(torch.empty(4, 4, dtype=torch.int8), per_token_scale)),
+    )
+    monkeypatch.setattr(
+        moe,
+        "_grouped_matmul_gmm2",
+        MagicMock(return_value=permuted_output),
+    )
+    monkeypatch.setattr(
+        moe.torch_npu,
+        "npu_moe_token_unpermute",
+        MagicMock(side_effect=AssertionError("metadata path must not unpermute")),
+    )
+
+    output, probs, indices = moe.moe_expert_compute_with_routing(
+        hidden,
+        topk_weights,
+        topk_ids,
+        weights,
+        down_weights,
+        weight_scale,
+        down_scale,
+        2,
+    )
+
+    assert output is permuted_output
+    if prob_dtype in (torch.float32, torch.bfloat16):
+        assert probs is topk_weights
+    else:
+        assert torch.equal(probs, topk_weights.to(output.dtype))
+    assert torch.equal(indices, sorted_indices)
+
+
+def test_moe_routing_metadata_keeps_probabilities_during_fake_capture() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        hidden = torch.empty(2, 4, dtype=torch.bfloat16)
+        probs = torch.empty(2, 2, dtype=torch.float32)
+        ids = torch.empty(2, 2, dtype=torch.int32)
+        output, retained_probs, indices = moe.moe_expert_compute_with_routing(
+            hidden,
+            probs,
+            ids,
+            torch.empty(4, 4, 8, dtype=torch.int8),
+            torch.empty(4, 4, 4, dtype=torch.int8),
+            torch.empty(4, 8, dtype=torch.float32),
+            torch.empty(4, 4, dtype=torch.bfloat16),
+            2,
+        )
+        assert retained_probs is probs
+        assert output.shape == (4, 4)
+        assert output.dtype == torch.bfloat16
+        assert indices.shape == (4,)
+        assert indices.dtype == torch.int32
+
+
+@pytest.mark.parametrize("active_range", [None, [0, 4], [1, 3]])
+def test_grouped_moe_retains_partial_expert_probability_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    active_range: list[int] | None,
+) -> None:
+    hidden = torch.empty(2, 4, dtype=torch.bfloat16)
+    probs = torch.tensor([[0.2, 0.8], [0.7, 0.3]], dtype=torch.float32)
+    ids = torch.tensor([[2, 0], [1, 3]], dtype=torch.int32)
+    permuted = torch.empty(4, 4, dtype=torch.bfloat16)
+    indices = torch.tensor([1, 0, 3, 2], dtype=torch.int32)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_gating_top_k", MagicMock(return_value=(probs, ids, None)))
+    monkeypatch.setattr(moe, "_moe_expert_compute_impl", MagicMock(return_value=(permuted, indices)))
+    output, retained_probs, retained_indices = moe._grouped_moe_impl(
+        hidden,
+        torch.empty(2, 4),
+        hidden,
+        hidden,
+        hidden,
+        hidden,
+        None,
+        2,
+        1,
+        1,
+        True,
+        1.0,
+        active_range,
+    )
+    assert output is permuted
+    assert retained_indices is indices
+    if active_range == [1, 3]:
+        torch.testing.assert_close(retained_probs, torch.tensor([[0.2, 0.0], [0.7, 0.0]]))
+    else:
+        assert retained_probs is probs
+
+
 def test_selected_expert_moe_matches_native_call_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
