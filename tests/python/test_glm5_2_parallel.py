@@ -677,6 +677,22 @@ class _TensorStateDict:
         return self._tensors[name]
 
 
+class _KeyedStateDict(_TensorStateDict):
+    def keys(self) -> list[str]:
+        return list(self._tensors)
+
+
+def test_weight_loader_indexed_shards_preserve_lookup_precedence() -> None:
+    first = _KeyedStateDict({"shared": torch.tensor(1)})
+    second = _KeyedStateDict({"shared": torch.tensor(2), "second": torch.tensor(3)})
+    model = torch.nn.Linear(1, 1, bias=False)
+
+    loader = W8A8WeightLoader(model, [first, second], tp_size=1, tp_rank=0)
+
+    assert loader.get_tensor("shared") is first._tensors["shared"]
+    assert loader.get_tensor("second") is second._tensors["second"]
+
+
 @pytest.mark.parametrize("dynamic_activation", [False, True])
 def test_compatible_attention_loader_allocates_only_selected_quantization(dynamic_activation: bool) -> None:
     projection = deepseek_v32.W8A8AttentionLinear(4, 6, torch.device("cpu"))
@@ -1331,3 +1347,40 @@ def test_all_decode_dp_uses_mega_moe_without_ep_reduce(monkeypatch) -> None:
     grouped.assert_not_called()
     mega.assert_called_once()
     assert all(len(call.args) < 2 or call.args[1] != "moe_ep" for call in ep_reduce.call_args_list)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_greedy_head_matches_full_vocabulary_argmax(dtype: torch.dtype, tp_size: int) -> None:
+    from xllm.python.layers.linear import ColumnParallelLinear
+
+    # Include ties spanning shards, infinities, and NaNs. The first global
+    # index must agree with the full head for every rank.
+    logits = torch.arange(32, dtype=dtype).expand(6, -1).clone()
+    logits[1].zero_()
+    logits[2, [2, 17, 31]] = 100
+    logits[3].fill_(-torch.inf)
+    logits[4, [9, 19]] = torch.inf
+    logits[5, [7, 23]] = torch.nan
+    partitions = logits.chunk(tp_size, dim=-1)
+    candidates = torch.cat(
+        [torch.stack((part.max(dim=-1).values.float(), part.argmax(dim=-1).float()), dim=-1) for part in partitions],
+        dim=-1,
+    )
+    expected = logits.argmax(dim=-1)
+    for rank, part in enumerate(partitions):
+        head = ColumnParallelLinear(1, part.shape[-1], tp_size, gather_output=True, dtype=dtype)
+
+        def gather(value: torch.Tensor, dim: int, world_size: int, rank: int = rank) -> torch.Tensor:
+            assert dim == -1 and world_size == tp_size
+            assert value.shape == (6, 2)  # no vocabulary tensor crosses TP
+            torch.testing.assert_close(value, candidates[:, rank * 2 : rank * 2 + 2], equal_nan=True)
+            return candidates
+
+        with (
+            patch("torch.nn.functional.linear", return_value=part),
+            patch.object(glm5_2.distributed, "tp_all_gather", side_effect=gather, create=True) as collective,
+        ):
+            actual = head.greedy_tokens(torch.zeros(6, 1, dtype=dtype))
+        assert torch.equal(actual, expected)
+        assert collective.call_count == int(tp_size > 1)

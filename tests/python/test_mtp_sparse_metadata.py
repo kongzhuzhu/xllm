@@ -35,7 +35,10 @@ def _metadata(table: torch.Tensor, lengths: torch.Tensor, slots: torch.Tensor) -
     return SimpleNamespace(block_table=table, kv_seq_lens=lengths, slot_mapping=slots)
 
 
-def test_sparse_registry_owns_final_destinations_and_reuses_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("step_major", [False, True])
+def test_sparse_registry_owns_final_destinations_and_reuses_capacity(
+    monkeypatch: pytest.MonkeyPatch, step_major: bool
+) -> None:
     update = Mock()
     monkeypatch.setattr(torch.ops.xllm_ops, "mtp_sparse_metadata_update", update, raising=False)
     runners = []
@@ -63,6 +66,7 @@ def test_sparse_registry_owns_final_destinations_and_reuses_capacity(monkeypatch
             self.closed = True
 
     def create(_executor: object, draft: tuple[object, ...], target: object, **kwargs: object) -> Runner:
+        assert kwargs["target_step_major_layout"] == step_major
         runner = Runner(kwargs["draft_metadata_storage"], kwargs["target_metadata_storage"])
         runners.append(runner)
         plans.append(kwargs["target_sampling"])
@@ -93,10 +97,12 @@ def test_sparse_registry_owns_final_destinations_and_reuses_capacity(monkeypatch
             speculative_tokens=3,
             vocab_size=37,
             block_size=128,
+            target_step_major_layout=step_major,
             **sampling,
         )
 
     first_output = execute(1)
+    assert update.call_args.args[-1] == step_major
     first_arena = update.call_args.args[6]
     for columns in (2, 9, 32, 1):
         execute(columns, 4)

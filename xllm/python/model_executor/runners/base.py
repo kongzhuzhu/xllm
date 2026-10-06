@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,23 @@ from xllm.python.model_executor.forward_context import ExecutionMetadataBuilder,
 ModelExecutionOutput = (
     torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
 )
+
+
+@dataclass(frozen=True)
+class SpeculativeRuntimeOutput:
+    """Owned snapshots consumed by the C++ MTP worker and API serialization."""
+
+    committed_tokens: torch.Tensor
+    accepted_count: torch.Tensor
+    # Compact [2 * batch, hidden], interleaved previous/current selected rows.
+    # At count=0 the previous row is ignored and prepare uses its placeholder.
+    target_embeddings: torch.Tensor
+    # int64 token matrix followed by int32 counts; views share this lease.
+    token_state: torch.Tensor
+    logprobs: torch.Tensor | None = None
+    top_logprobs: torch.Tensor | None = None
+    top_tokens: torch.Tensor | None = None
+    target_probs: torch.Tensor | None = None
 
 
 class BaseRunner(ABC):

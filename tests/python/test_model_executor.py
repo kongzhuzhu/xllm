@@ -40,8 +40,10 @@ from xllm.python.attention.csa_attention import DsaAttentionBackend  # noqa: E40
 from xllm.python.layers.attention import Attention  # noqa: E402
 from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
+    _configure_unified_mtp_graph,
     _create_attention_backend,
     _resolve_graph_backend,
+    _unified_mtp_graph_enabled,
     _validate_npu_cp_model_config,
 )
 from xllm.python.model_executor.forward_context import (  # noqa: E402
@@ -151,6 +153,82 @@ class _FakeModelNoAttention(nn.Module):
         super().__init__()
         self.model = nn.Linear(1, 1)
         self._param = nn.Parameter(torch.zeros(1))
+
+
+class _UnifiedSwitchProbe(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enabled: bool | None = None
+
+    def set_unified_mtp_graph_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+
+def test_model_executor_propagates_unified_switch_to_moe_modules() -> None:
+    model = nn.Sequential(_UnifiedSwitchProbe(), nn.Sequential(_UnifiedSwitchProbe()))
+    _configure_unified_mtp_graph(model, True)
+    assert [module.enabled for module in model.modules() if isinstance(module, _UnifiedSwitchProbe)] == [True, True]
+    _configure_unified_mtp_graph(model, False)
+    assert [module.enabled for module in model.modules() if isinstance(module, _UnifiedSwitchProbe)] == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {
+                "enable_unified_mtp_graph": True,
+                "model_type": "glm_moe_dsa",
+                "is_draft_engine": False,
+                "num_speculative_tokens": 3,
+                "speculative_algorithm": "mtp",
+            },
+            True,
+        ),
+        (
+            {
+                "enable_unified_mtp_graph": True,
+                "model_type": "glm_moe_dsa_mtp",
+                "is_draft_engine": True,
+                "num_speculative_tokens": 0,
+                "speculative_algorithm": "mtp",
+            },
+            True,
+        ),
+        (
+            {
+                "enable_unified_mtp_graph": False,
+                "model_type": "glm_moe_dsa_mtp",
+                "is_draft_engine": True,
+                "num_speculative_tokens": 0,
+                "speculative_algorithm": "mtp",
+            },
+            False,
+        ),
+        (
+            {
+                "enable_unified_mtp_graph": True,
+                "model_type": "glm_moe_dsa",
+                "is_draft_engine": False,
+                "num_speculative_tokens": 0,
+                "speculative_algorithm": "mtp",
+            },
+            False,
+        ),
+        (
+            {
+                "enable_unified_mtp_graph": True,
+                "model_type": "qwen3",
+                "is_draft_engine": False,
+                "num_speculative_tokens": 3,
+                "speculative_algorithm": "eagle3",
+            },
+            False,
+        ),
+    ],
+)
+def test_unified_switch_targets_only_glm_mtp_roles(config: dict, expected: bool) -> None:
+    assert _unified_mtp_graph_enabled(config) is expected
 
 
 class _FailingLayerSynchronizer:

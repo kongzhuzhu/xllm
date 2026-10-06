@@ -318,3 +318,38 @@ def test_attn_dp_mtp_keeps_reused_topk_local_and_returns_owner_hidden() -> None:
     assert topk is external_topk
     assert layer.reuse_flags == [True]
     torch.testing.assert_close(hidden, torch.tensor([[1.0, 1.0], [2.0, 2.0]]))
+
+
+def test_mtp_greedy_head_preserves_normalization_and_hidden() -> None:
+    from xllm.python.layers.linear import ColumnParallelLinear
+
+    draft = glm5_2_mtp.Glm52MtpForCausalLM.__new__(glm5_2_mtp.Glm52MtpForCausalLM)
+    nn.Module.__init__(draft)
+    draft.model = _NormBody()
+    draft.lm_head = ColumnParallelLinear(2, 3, 1, gather_output=True, bias=True)
+    with torch.no_grad():
+        draft.lm_head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]]))
+        draft.lm_head.bias.copy_(torch.tensor([1.5, 0.0, 0.0]))
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [-2.0, -1.0]])
+    saved = hidden.clone()
+    assert torch.equal(draft.compute_greedy_tokens(hidden), draft.compute_logits(hidden, None).argmax(-1))
+    assert torch.equal(hidden, saved)
+
+
+def test_mtp_rope_is_shared_across_layers_and_refreshes_positions() -> None:
+    body, first = _mtp_body()
+    second = _DecoderLayer()
+    body.layers.append(second)
+    body._reuse_topk_by_layer = (False, False)
+    with (
+        patch.object(glm5_2_mtp, "get_forward_context", return_value=SimpleNamespace(cp_context=None)),
+        patch.object(glm5_2_mtp, "record_layer_event"),
+        patch.object(body.rotary, "forward", wraps=body.rotary.forward) as prepare,
+    ):
+        for positions in (torch.tensor([1, 2]), torch.tensor([7, 9])):
+            body(torch.tensor([3, 4]), positions)
+    assert prepare.call_count == 2
+    for generation in range(2):
+        for first_coefficient, second_coefficient in zip(first.ropes[generation], second.ropes[generation]):
+            assert first_coefficient is second_coefficient
+    assert not torch.equal(first.ropes[0][2], first.ropes[1][2])
