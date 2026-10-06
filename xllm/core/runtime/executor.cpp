@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
+#include "core/runtime/py_executor_impl.h"
 #include "executor_impl_factory.h"
 #include "platform/device.h"
 #include "platform/platform.h"
@@ -76,6 +77,10 @@ bool Executor::prepare_static_mtp_graph_tasks(
     const SpecVerifyGraphTaskSignal& signal,
     const Stream& signal_stream) {
   return impl_->prepare_static_mtp_graph_tasks(signal, signal_stream);
+}
+
+PyExecutorImpl* Executor::python_impl() {
+  return dynamic_cast<PyExecutorImpl*>(impl_.get());
 }
 
 }  // namespace xllm

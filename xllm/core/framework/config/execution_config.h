@@ -43,6 +43,7 @@ class ExecutionConfig final {
         "EXECUTION OPTIONS",
         {"enable_task_pipeline",
          "enable_graph",
+         "enable_unified_mtp_graph",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -66,6 +67,11 @@ class ExecutionConfig final {
   PROPERTY(bool, enable_task_pipeline) = false;
 
   PROPERTY(bool, enable_graph) = false;
+
+  // Opt supported NPU MTP requests into the unified Python graph path.
+  // Disabling this keeps the legacy ACL graph/decode route available for
+  // comparison and fallback without disabling ordinary graph execution.
+  PROPERTY(bool, enable_unified_mtp_graph) = false;
 
   PROPERTY(bool, disable_graph_warmup) = false;
 

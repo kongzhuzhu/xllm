@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/python.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -40,6 +41,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include "platform/npu/device_capture_lock.h"
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
@@ -196,6 +198,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["instance_role"] = options_.instance_role().to_string();
   executor_config["task_type"] = options_.task_type();
   executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  executor_config["enable_unified_mtp_graph"] =
+      ExecutionConfig::get_instance().enable_unified_mtp_graph();
   executor_config["speculative_algorithm"] = options_.speculative_algorithm();
   executor_config["is_draft_engine"] = options_.is_draft_engine();
   executor_config["enable_task_pipeline"] = options_.enable_task_pipeline();
@@ -219,6 +223,67 @@ PyExecutorImpl::~PyExecutorImpl() {
     active_py_causal_lm = nullptr;
   }
   clear_python_object(py_executor_);
+}
+
+py::object PyExecutorImpl::mtp_sparse_attention_metadata_view(
+    const torch::Tensor& block_table,
+    const torch::Tensor& kv_seq_lens,
+    const torch::Tensor& slots) const {
+  auto metadata = std::make_shared<layer::AttentionMetadata>(
+      layer::AttentionMetadataBuilder::build_mtp_sparse_decode(
+          block_table, kv_seq_lens, slots, options_.block_size()));
+  LlmModelParams storage;
+  ModelInputParams params(storage);
+  const int32_t rows = static_cast<int32_t>(kv_seq_lens.numel());
+  params.parallel.dp_global_token_nums = {rows};
+  params.parallel.dp_global_sequence_nums = {rows};
+  params.parallel.dp_is_decode = {true};
+  return py::cast(PyAttentionMetadataView(std::move(metadata), params));
+}
+
+py::object PyExecutorImpl::create_mtp_graph_variant_registry(
+    PyExecutorImpl& draft_executor,
+    int32_t max_variants) {
+  py::gil_scoped_acquire gil;
+  py::cpp_function draft_activate = py::cpp_function([&draft_executor]() {
+    active_py_causal_lm = draft_executor.py_causal_lm_;
+  });
+  py::cpp_function target_activate =
+      py::cpp_function([this]() { active_py_causal_lm = py_causal_lm_; });
+  py::object capture_runner = py::none();
+#if defined(USE_NPU)
+  capture_runner =
+      py::cpp_function([device_index = device_.index()](
+                           const py::object& runner, const py::args& inputs) {
+        // Prepare may need the GIL while it holds this device lock. Never
+        // wait for the lock with the GIL held. Only cold capture takes it.
+        py::gil_scoped_release release;
+        auto& capture_lock =
+            npu::DeviceCaptureLock::get_instance().get_lock(device_index);
+        std::lock_guard<std::mutex> lock(capture_lock);
+        py::gil_scoped_acquire acquire;
+        runner.attr("capture")(*inputs);
+      });
+#endif
+  return py_executor_.attr("create_mtp_graph_variant_registry")(
+      draft_executor.py_executor_,
+      py::arg("max_variants") = max_variants,
+      py::arg("draft_activate") = draft_activate,
+      py::arg("target_activate") = target_activate,
+      py::arg("capture_runner") = capture_runner,
+      py::arg("draft_metadata_factory") =
+          py::cpp_function([&draft_executor](const torch::Tensor& table,
+                                             const torch::Tensor& lengths,
+                                             const torch::Tensor& slots) {
+            return draft_executor.mtp_sparse_attention_metadata_view(
+                table, lengths, slots);
+          }),
+      py::arg("target_metadata_factory") =
+          py::cpp_function([this](const torch::Tensor& table,
+                                  const torch::Tensor& lengths,
+                                  const torch::Tensor& slots) {
+            return mtp_sparse_attention_metadata_view(table, lengths, slots);
+          }));
 }
 
 void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {

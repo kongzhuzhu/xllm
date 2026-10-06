@@ -34,6 +34,13 @@ DEFINE_bool(
     "MLU Graph, or DCU Graph) to optimize decode performance by reducing "
     "kernel launch overhead and device idle time.");
 
+DEFINE_bool(
+    enable_unified_mtp_graph,
+    false,
+    "Whether to route supported NPU MTP decode requests through the unified "
+    "Python graph path. When disabled, MTP uses the legacy ACL graph/decode "
+    "route while ordinary graph execution remains enabled.");
+
 DEFINE_bool(disable_graph_warmup,
             false,
             "Whether to skip synthetic graph warmup during engine startup. "
@@ -125,6 +132,7 @@ namespace xllm {
 void ExecutionConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_unified_mtp_graph);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_graph_mode_decode_no_padding);
@@ -146,6 +154,7 @@ void ExecutionConfig::from_flags() {
 void ExecutionConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_task_pipeline);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_unified_mtp_graph);
   XLLM_CONFIG_ASSIGN_FROM_JSON(disable_graph_warmup);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_double_buffer);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_graph_mode_decode_no_padding);
@@ -171,6 +180,8 @@ void ExecutionConfig::append_config_json(
       config_json, default_config, enable_task_pipeline);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_unified_mtp_graph);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, disable_graph_warmup);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

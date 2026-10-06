@@ -88,6 +88,7 @@ class Worker {
   bool unlink_p2p(const std::string& remote_addr);
 
   const bool is_driver();
+  bool task_pipeline_uses_worker_prepare() const;
 
   // prepare input for execution
   RecForwardInput prepare_inputs(RecBatch& batch);
@@ -133,8 +134,7 @@ class Worker {
       Slice<BlockTransferInfo>& block_transfer_info);
 
   // Run the model asynchronously. Task pipeline with overlap returns an
-  // empty PrepareAck; without overlap, successful completion returns
-  // independent CPU results that are ready to read.
+  // empty PrepareAck; the shared Slot pipeline retires the result later.
   folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const LlmForwardInput& inputs);
 
@@ -151,8 +151,8 @@ class Worker {
 
   const torch::Device& device() const;
 
-  // Task pipeline completes this Future after Consume finishes D2H and
-  // returns independent CPU results that are ready to read.
+  // Task results use the shared FIFO and retain the worker's ready event when
+  // execution is worker-owned.
   folly::SemiFuture<std::optional<ForwardOutput>> get_last_step_result_async();
 
   int64_t get_active_activation_memory();

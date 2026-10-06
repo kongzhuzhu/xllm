@@ -154,6 +154,8 @@ constexpr int32_t kGraphExecutorLogVerboseLevel = 50;
 
 DECLARE_bool(enable_graph);
 
+DECLARE_bool(enable_unified_mtp_graph);
+
 DECLARE_bool(disable_graph_warmup);
 
 DECLARE_bool(enable_graph_double_buffer);

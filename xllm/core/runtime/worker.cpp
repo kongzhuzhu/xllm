@@ -34,6 +34,9 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/platform/platform.h"
 #include "core/runtime/task_execution_pipeline.h"
+#if defined(USE_NPU)
+#include "core/runtime/unified_mtp_worker_impl.h"
+#endif
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
@@ -134,6 +137,15 @@ Worker::Worker(const ParallelArgs& parallel_args,
       if (worker_type == WorkerType::VLM) {
         impl_ = new MTPWorkerImpl<VlmForwardInput>(
             parallel_args, device, options, worker_type);
+#if defined(USE_NPU)
+      } else if (worker_type == WorkerType::LLM && device.is_privateuseone() &&
+                 ModelConfig::is_python_model_impl(
+                     ModelConfig::get_instance().model_impl()) &&
+                 ExecutionConfig::get_instance().enable_unified_mtp_graph()) {
+        LOG(INFO) << "Unified MTP worker enabled";
+        impl_ = new UnifiedMtpWorkerImpl(
+            parallel_args, device, options, worker_type);
+#endif
       } else {
         impl_ = new MTPWorkerImpl<LlmForwardInput>(
             parallel_args, device, options, worker_type);
@@ -178,9 +190,14 @@ bool Worker::initialize_task_pipeline() {
     return true;
   }
   if (!impl_->task_models_loaded()) {
+    // Composite workers can receive target and draft model-load RPCs
+    // separately. Wait until both are ready before creating the shared task
+    // pipeline.
     return true;
   }
-  CHECK(task_pipeline_ == nullptr);
+  if (task_pipeline_ != nullptr) {
+    return true;
+  }
   const Status status = impl_->create_task_pipeline(task_pipeline_);
   if (!status.ok()) {
     LOG(ERROR) << status.message();
@@ -288,6 +305,10 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
 
 const bool Worker::is_driver() { return impl_->is_driver(); }
 
+bool Worker::task_pipeline_uses_worker_prepare() const {
+  return impl_->uses_worker_task_pipeline();
+}
+
 folly::SemiFuture<std::tuple<int64_t, int64_t>>
 Worker::estimate_kv_cache_capacity_async() {
   return impl_->estimate_kv_cache_capacity_async();
@@ -303,7 +324,8 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
       // PrepareAck releases all caller views. GetLast consumes the FIFO later.
       return folly::makeSemiFuture(std::optional<ForwardOutput>{});
     }
-    return task_pipeline_->take_result_async(submission.task_id)
+    auto result = task_pipeline_->take_result_async(submission.task_id);
+    return std::move(result)
         .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
           CHECK(result.status.ok()) << result.status.message();
           return std::move(result.output);
@@ -385,7 +407,8 @@ Worker::get_last_step_result_async() {
     CHECK(impl_->enable_schedule_overlap())
         << "Task results without scheduler overlap are returned by step_async.";
     CHECK(task_pipeline_ != nullptr);
-    return task_pipeline_->take_result_async()
+    auto result = task_pipeline_->take_result_async();
+    return std::move(result)
         .thenValue([](TaskResult result) -> std::optional<ForwardOutput> {
           CHECK(result.status.ok()) << result.status.message();
           return std::move(result.output);

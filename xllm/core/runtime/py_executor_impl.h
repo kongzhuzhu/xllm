@@ -59,6 +59,16 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
 
+  // GLM sparse MTP consumes one decode row per token and no Host KV/CSR data.
+  pybind11::object mtp_sparse_attention_metadata_view(
+      const torch::Tensor& block_table,
+      const torch::Tensor& kv_seq_lens,
+      const torch::Tensor& slots) const;
+
+  pybind11::object create_mtp_graph_variant_registry(
+      PyExecutorImpl& draft_executor,
+      int32_t max_variants);
+
  private:
   // Caller holds the GIL. First binding occurs on Prepare for pipeline input.
   void bind_kv_caches(std::vector<KVCache>& kv_caches);

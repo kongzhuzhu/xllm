@@ -25,6 +25,7 @@ namespace py = pybind11;
 #endif
 
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -297,6 +298,14 @@ void init_npu_python_runtime() {
   const aclError acl_ret = aclInit(nullptr);
   CHECK(acl_ret == ACL_SUCCESS || acl_ret == ACL_ERROR_INTERNAL_ERROR)
       << "aclInit failed with error " << acl_ret;
+
+  // Bind the ACL context before torch_npu creates its default runtime state.
+  // Without this, every rank can briefly allocate on logical device 0 before
+  // the worker selects its own card, leaving stray per-rank processes there.
+  const aclError set_device_ret = aclrtSetDevice(device_index);
+  CHECK_EQ(set_device_ret, ACL_SUCCESS)
+      << "aclrtSetDevice failed for device " << device_index << " with error "
+      << set_device_ret;
 
   // We own ACL initialization, so torch_npu will skip aclFinalize. Register
   // before importing torch_npu: Python runs exit hooks in reverse order,

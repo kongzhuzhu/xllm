@@ -28,6 +28,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
+    mtp_py_executor_pair.h
+    unified_mtp_executor.h
     py_attention_metadata.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
@@ -43,6 +45,8 @@ cc_library(
     draft_model_spec_worker_impl.h
     speculative_worker_impl.h
     mtp_worker_impl.h
+    mtp_runtime_helpers.h
+    unified_mtp_worker_impl.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h
@@ -67,6 +71,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
+    mtp_py_executor_pair.cpp
+    unified_mtp_executor.cpp
     py_attention_metadata.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
@@ -84,6 +90,8 @@ cc_library(
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
     mtp_worker_impl.cpp
+    mtp_runtime_helpers.cpp
+    unified_mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
     dflash_worker_impl.cpp
