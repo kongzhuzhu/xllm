@@ -4,20 +4,22 @@ endif()
 
 if(USE_NPU)
   add_subdirectory(python)
+  get_filename_component(_xllm_build_import_root
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" DIRECTORY)
 
   # The multi-process HCCL probe requires exclusive device use.
   add_test(
     NAME python_hccl_decode_graph_test
     COMMAND
       "${CMAKE_COMMAND}" -E env
-      "PYTHONPATH=${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
-      "${Python3_EXECUTABLE}" -m pytest -q
+      "PYTHONPATH=${_xllm_build_import_root}:${PROJECT_SOURCE_DIR}:$ENV{PYTHONPATH}"
+      "${Python3_EXECUTABLE}" -m pytest -q --import-mode=importlib
       "${CMAKE_CURRENT_SOURCE_DIR}/npu/test_hccl_decode_graph.py"
   )
   set_tests_properties(
     python_hccl_decode_graph_test
     PROPERTIES
-      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
       RUN_SERIAL TRUE
   )
 endif()

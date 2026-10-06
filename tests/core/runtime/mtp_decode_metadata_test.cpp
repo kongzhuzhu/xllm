@@ -49,6 +49,11 @@ TEST(MtpWorkerSelectionTest, UnifiedFlagSelectsPythonMtpWorker) {
   const torch::Device device("npu:0");
   runtime::Options options;
   options.enable_speculative_decode(true).num_speculative_tokens(3);
+  ExecutionConfig::get_instance() = ExecutionConfig();
+  {
+    Worker default_worker(parallel_args, device, options, WorkerType::LLM);
+    EXPECT_FALSE(default_worker.task_pipeline_uses_worker_prepare());
+  }
   for (const bool unified : {false, true}) {
     ExecutionConfig::get_instance().enable_unified_mtp_graph(unified);
     Worker worker(parallel_args, device, options, WorkerType::LLM);

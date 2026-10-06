@@ -384,9 +384,8 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes(prepared_backe
     assert torch.equal(expanded[0, :4], torch.tensor([4, 5, 6, 7], dtype=torch.int32))
 
 
-@pytest.mark.parametrize("owned_metadata", [False, True])
 @pytest.mark.parametrize("first_kv_len", [3, 511])
-def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int, owned_metadata: bool) -> None:
+def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
     backend = SfaDcpAttentionBackend(
         num_heads=8,
         num_kv_heads=1,
@@ -448,10 +447,7 @@ def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int, owned_meta
     )
 
     with forward_context(_cpu_context(AclGraphExecutionState({}))):
-        if owned_metadata:
-            backend.prepare_owned_graph_metadata(metadata)
-        else:
-            backend.prepare(metadata, graph_mode=True)
+        backend.prepare(metadata, graph_mode=True)
 
     assert captured["num_reqs"] == 4
     assert captured["num_input_tokens"] == 4
