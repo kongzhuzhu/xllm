@@ -65,8 +65,14 @@ class AclGraphTask:
 class AclGraphExecutionState:
     """Persistent resources owned by one model-execution graph entry."""
 
-    persistent_buffers: dict[tuple[object, ...], torch.Tensor]
+    persistent_buffers: dict[tuple[object, ...], object]
     paged_attention: dict[int, PagedAttentionGraphState] = field(default_factory=dict)
+    # Serial MTP draft steps may share temporary attention storage.  Keep the
+    # per-step map above for outputs and metadata whose addresses are part of
+    # the captured graph, while allowing explicitly shared workspaces to use a
+    # role-owned pool.  The pool is only used on the single graph stream, so a
+    # later step cannot overwrite a live workspace from an earlier step.
+    shared_persistent_buffers: dict[tuple[object, ...], object] | None = None
 
 
 @dataclass(slots=True)
@@ -139,15 +145,28 @@ def record_layer_event(layer_id: int) -> None:
             raise RuntimeError(f"failed to record layer completion event for layer {layer_id}")
 
 
-def get_execution_buffer(key: tuple[object, ...], factory: Callable[[], torch.Tensor]) -> torch.Tensor:
+def get_execution_buffer(
+    key: tuple[object, ...],
+    factory: Callable[[], torch.Tensor],
+    *,
+    shared: bool = False,
+) -> torch.Tensor:
     """Get a tensor owned by the active model execution graph entry."""
     state = get_forward_context().execution_state
     if state is None:
         return factory()
-    buffer = state.persistent_buffers.get(key)
+    # A regular single-step graph has no sibling state to share with; use its
+    # private map in that case. MTP role adapters install the explicit shared
+    # pool above when serial steps can reuse temporary storage.
+    buffers = (
+        state.shared_persistent_buffers
+        if shared and state.shared_persistent_buffers is not None
+        else state.persistent_buffers
+    )
+    buffer = buffers.get(key)
     if buffer is None:
         buffer = factory()
-        state.persistent_buffers[key] = buffer
+        buffers[key] = buffer
     if not isinstance(buffer, torch.Tensor):
         raise TypeError("execution buffer must be a torch.Tensor")
     return buffer
