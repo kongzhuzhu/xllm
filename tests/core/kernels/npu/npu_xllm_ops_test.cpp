@@ -1047,6 +1047,10 @@ class FakeBackend:
     def page_size(self):
         return 1
 
+    @property
+    def supports_prepared_metadata(self) -> bool:
+        return False
+
 
 class FakeModel(torch.nn.Module):
     def __init__(self):

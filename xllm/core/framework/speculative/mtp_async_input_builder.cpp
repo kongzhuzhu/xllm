@@ -18,7 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #if defined(USE_NPU)
-#include "kernels/npu/xllm_ops/xllm_ops_api.h"
+#include "kernels/npu/tilelang/mtp_prepare_next_draft.h"
 #endif
 
 #include "core/framework/speculative/mtp_async_state.h"

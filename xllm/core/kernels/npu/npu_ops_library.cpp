@@ -583,6 +583,16 @@ void ensure_xllm_ops_registered() {
 // Schema declarations (device-agnostic). Identical to cuda_ops_library.cpp —
 // compiled only under USE_NPU (mutually exclusive with USE_CUDA).
 TORCH_LIBRARY(xllm_ops, m) {
+  m.def(
+      "mtp_greedy_commit(Tensor draft, Tensor target, Tensor hidden) -> "
+      "(Tensor, Tensor)");
+  m.def(
+      "mtp_sparse_metadata_update(Tensor block_table, Tensor base_positions, "
+      "Tensor base_kv_lengths, Tensor first_kv_lengths, Tensor first_slots, "
+      "Tensor layout, Tensor(a!) draft_arena, Tensor(b!) target_arena, "
+      "Tensor(c!) position_arena, "
+      "int speculative_tokens, int table_capacity, int block_size, "
+      "bool target_step_major) -> ()");
   m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
   m.def(
       "rms_norm_gated(Tensor input, Tensor gate, Tensor weight, float eps) -> "
@@ -821,6 +831,10 @@ TORCH_LIBRARY(xllm_ops, m) {
 }
 
 TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
+  m.impl("mtp_greedy_commit",
+         TORCH_FN(xllm::kernel::npu::tilelang::mtp_greedy_commit));
+  m.impl("mtp_sparse_metadata_update",
+         TORCH_FN(xllm::kernel::npu::tilelang::mtp_sparse_metadata_update));
   m.impl("rms_norm", TORCH_FN(xllm::rms_norm_npu));
   m.impl("rms_norm_gated", TORCH_FN(xllm::rms_norm_gated_npu));
   m.impl("l2_norm", TORCH_FN(xllm::l2_norm_npu));

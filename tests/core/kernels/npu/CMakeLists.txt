@@ -39,7 +39,7 @@ cc_test(
   SRCS
     mtp_prepare_next_draft_test.cpp
   DEPS
-    :xllm_ops
+    :tilelang_kernels
     ascendcl
     nnopbase
     torch

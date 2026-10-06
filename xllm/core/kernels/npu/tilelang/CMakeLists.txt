@@ -143,6 +143,21 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME mtp_prepare_next_draft
+  WRAPPER_SRCS mtp_prepare_next_draft_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME mtp_greedy_commit
+  WRAPPER_SRCS mtp_greedy_commit_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME mtp_sparse_metadata_update
+  WRAPPER_SRCS mtp_sparse_metadata_update_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME spec_verify_token_update
   WRAPPER_SRCS spec_verify_token_update_wrapper.cpp
 )
@@ -188,6 +203,7 @@ cc_library(
   HDRS
     dispatch_registry.h
     tilelang_ops_api.h
+    mtp_prepare_next_draft.h
   SRCS
     ${TILELANG_KERNEL_SRCS}
   DEPS

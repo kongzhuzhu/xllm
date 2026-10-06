@@ -13,12 +13,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "core/kernels/npu/tilelang/mtp_prepare_next_draft.h"
+
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
-
-#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
 namespace {
@@ -81,6 +81,93 @@ TEST_F(MtpPrepareNextDraftTest, ProducesExpectedOutputsForMixedAcceptance) {
   EXPECT_TRUE(torch::equal(output->positions.cpu(), expected_positions));
   EXPECT_TRUE(torch::equal(output->kv_seq_lens.cpu(), expected_kv_seq_lens));
   EXPECT_TRUE(torch::equal(output->cache_slots.cpu(), expected_slots));
+
+  // Compact rank-2 inputs carry only previous/current hidden rows. The
+  // rejected-first previous row must still use the placeholder, not row 0.
+  const torch::Tensor compact = torch::stack({accepted_embeddings_cpu[0][2],
+                                              accepted_embeddings_cpu[0][3],
+                                              accepted_embeddings_cpu[1][0],
+                                              accepted_embeddings_cpu[1][1],
+                                              accepted_embeddings_cpu[2][0],
+                                              accepted_embeddings_cpu[2][0]});
+  MtpPrepareNextDraftWorkspace workspace;
+  for (const torch::ScalarType dtype : {torch::kBFloat16, torch::kFloat16}) {
+    const auto compact_output =
+        try_mtp_prepare_next_draft(accepted_tokens_cpu.to(npu_device),
+                                   compact.to(dtype).to(npu_device),
+                                   placeholder_cpu.to(dtype).to(npu_device),
+                                   base_positions_cpu.to(npu_device),
+                                   base_kv_seq_lens_cpu.to(npu_device),
+                                   block_tables_cpu.to(npu_device),
+                                   kBlockSize,
+                                   &workspace);
+    ASSERT_TRUE(compact_output.has_value());
+    EXPECT_TRUE(torch::equal(compact_output->token_ids.cpu(), expected_tokens));
+    EXPECT_TRUE(torch::equal(compact_output->embeddings.cpu(),
+                             expected_embeddings.to(dtype)));
+    EXPECT_TRUE(
+        torch::equal(compact_output->positions.cpu(), expected_positions));
+    EXPECT_TRUE(
+        torch::equal(compact_output->cache_slots.cpu(), expected_slots));
+    EXPECT_TRUE(
+        torch::equal(compact_output->kv_seq_lens.cpu(),
+                     torch::tensor({8, 9, 10, 11, 13, 14}, torch::kInt)));
+  }
+}
+
+TEST_F(MtpPrepareNextDraftTest, ReusesOutputsAndConvertsInt64Metadata) {
+  const torch::Device device("npu:0");
+  const torch::Tensor tokens =
+      torch::tensor({{10, 11, 12, 13}}, torch::kLong).to(device);
+  const torch::Tensor hidden = torch::arange(32, torch::kFloat)
+                                   .reshape({2, 16})
+                                   .to(torch::kFloat16)
+                                   .to(device);
+  const torch::Tensor placeholder = torch::full({16}, -7, hidden.options());
+  const torch::Tensor positions = torch::tensor({126}, torch::kLong).to(device);
+  const torch::Tensor lengths = torch::tensor({127}, torch::kLong).to(device);
+  const torch::Tensor tables =
+      torch::tensor({{10, 20}}, torch::kLong).to(device);
+  MtpPrepareNextDraftWorkspace workspace;
+  const auto first = try_mtp_prepare_next_draft(tokens,
+                                                hidden,
+                                                placeholder,
+                                                positions,
+                                                lengths,
+                                                tables,
+                                                /*block_size=*/128,
+                                                &workspace);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_TRUE(torch::equal(first->cache_slots.cpu(),
+                           torch::tensor({2561, 2562}, torch::kInt)));
+  // Reuse the captured output addresses while changing acceptance and
+  // exercising the zero slot for an out-of-range cache position.
+  tokens.slice(/*dim=*/1, /*start=*/1).fill_(-1);
+  positions.fill_(256);
+  const auto second = try_mtp_prepare_next_draft(tokens,
+                                                 hidden,
+                                                 placeholder,
+                                                 positions,
+                                                 lengths,
+                                                 tables,
+                                                 /*block_size=*/128,
+                                                 &workspace);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(first->token_ids.data_ptr(), second->token_ids.data_ptr());
+  EXPECT_EQ(first->embeddings.data_ptr(), second->embeddings.data_ptr());
+  EXPECT_EQ(first->positions.data_ptr(), second->positions.data_ptr());
+  EXPECT_EQ(first->kv_seq_lens.data_ptr(), second->kv_seq_lens.data_ptr());
+  EXPECT_EQ(first->cache_slots.data_ptr(), second->cache_slots.data_ptr());
+  EXPECT_TRUE(torch::equal(second->token_ids.cpu(),
+                           torch::tensor({10, 10}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(second->embeddings[0].cpu(), placeholder.cpu()));
+  EXPECT_TRUE(torch::equal(second->embeddings[1].cpu(), hidden[1].cpu()));
+  EXPECT_TRUE(torch::equal(second->positions.cpu(),
+                           torch::tensor({256, 257}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(second->kv_seq_lens.cpu(),
+                           torch::tensor({127, 128}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(second->cache_slots.cpu(), torch::zeros({2}, torch::kInt)));
 }
 
 TEST_F(MtpPrepareNextDraftTest, RejectsUnsupportedHostInputs) {
