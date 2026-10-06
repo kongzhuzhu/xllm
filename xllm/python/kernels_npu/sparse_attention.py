@@ -407,10 +407,10 @@ def sparse_flash_attention(
     Returns:
         Attention output with the shape and dtype of ``query``.
 
-    Both MLA flavours share this entry point and route through the CANN
-    ``npu_sparse_flash_attention`` op with ``attention_mode=2`` (MLA-absorb:
-    KV is a single shared tensor, the decoupled MLA contract). The RoPE part
-    is carried out-of-band in ``query_rope``/``key_rope``:
+    Both MLA flavours use ``attention_mode=2`` (MLA-absorb: KV is a single
+    shared tensor). RoPE inputs use the dedicated xLLM LSE interface to avoid
+    the incompatible legacy custom ``aclnnSparseFlashAttention`` symbol.
+    The RoPE part is carried out-of-band in ``query_rope``/``key_rope``:
 
     * Absorbed / NoPE MLA (GLM-5.3-Flash): ``query_rope`` and ``key_rope``
       are both ``None`` (no rotary part at all).
@@ -418,18 +418,12 @@ def sparse_flash_attention(
       ``query_rope``/``key_rope``; the op applies it within the absorbed
       MLA contract.
     """
-    # attention_mode=2 = MLA-absorb. query_rope/key_rope carry the decoupled
-    # RoPE for DeepSeek/GLM-5.2 (None for GLM-5.3 NoPE). On older CANN this
-    # combination raised 561002 for the RoPE case; on current CANN the op
-    # supports out-of-band RoPE in absorb mode. If 561002 reappears, fall
-    # back to attention_mode=0 for the RoPE case.
-    attention_mode = 2
-    output, _, _ = torch.ops.npu.npu_sparse_flash_attention(
+    output, _, _ = sparse_flash_attention_lse(
         query,
         key,
         value,
         sparse_indices,
-        scale_value,
+        scale_value=scale_value,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
@@ -439,7 +433,7 @@ def sparse_flash_attention(
         layout_query=layout_query,
         layout_kv=layout_kv,
         sparse_mode=sparse_mode,
-        attention_mode=attention_mode,
+        attention_mode=2,
         return_softmax_lse=False,
     )
     return output
@@ -463,16 +457,14 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
-    # attention_mode=2 = MLA-absorb; the caller passes the decoupled RoPE via
-    # query_rope/key_rope (None for NoPE models). The npu op returns a fresh
-    # output tensor; copy it into the caller-provided ``output`` buffer to
-    # preserve the _out in-place contract.
-    npu_out, _, _ = torch.ops.npu.npu_sparse_flash_attention(
+    # Preserve the caller-owned graph buffer while sharing the same backend
+    # selection as the allocating entry point.
+    npu_out = sparse_flash_attention(
         query,
         key,
         value,
         sparse_indices,
-        scale_value,
+        scale_value=scale_value,
         block_table=block_table,
         actual_seq_lengths_query=actual_seq_lengths_query,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
@@ -482,8 +474,6 @@ def sparse_flash_attention_out(
         layout_query=layout_query,
         layout_kv=layout_kv,
         sparse_mode=sparse_mode,
-        attention_mode=2,
-        return_softmax_lse=False,
     )
     output.copy_(npu_out)
     return output
@@ -511,10 +501,35 @@ def sparse_flash_attention_lse(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attend to selected blocks and optionally return softmax max/sum for LSE merge.
 
-    Routes through the CANN ``npu_sparse_flash_attention`` op
-    (``return_softmax_lse`` maps 1:1); the legacy ``xllm_ops`` op is
-    deprecated on newer CANN builds.
+    Select the interface before execution. The custom RoPE operator has a
+    distinct ACLNN symbol; the same-name legacy SFA symbol has a shorter ABI
+    than the native CANN interface and can shadow it in custom OPP installs.
+    NoPE models keep the native interface because the custom LSE kernel
+    requires RoPE tensors.
     """
+    if (query_rope is None) != (key_rope is None):
+        raise ValueError("query_rope and key_rope must both be present or absent")
+    if query_rope is not None:
+        return torch.ops.xllm_ops.sparse_flash_attention_lse(
+            query,
+            key,
+            value,
+            sparse_indices,
+            block_table,
+            actual_seq_lengths_query,
+            actual_seq_lengths_kv,
+            query_rope,
+            key_rope,
+            scale_value,
+            sparse_block_size,
+            layout_query,
+            layout_kv,
+            sparse_mode,
+            pre_tokens,
+            next_tokens,
+            attention_mode,
+            return_softmax_lse,
+        )
     output, softmax_max, softmax_sum = torch.ops.npu.npu_sparse_flash_attention(
         query,
         key,

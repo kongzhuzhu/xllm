@@ -597,6 +597,26 @@ AttentionMetadata build_attention_metadata(
 
 }  // namespace
 
+AttentionMetadata AttentionMetadataBuilder::build_mtp_sparse_decode(
+    const torch::Tensor& block_table,
+    const torch::Tensor& kv_seq_lens,
+    const torch::Tensor& slots,
+    int32_t block_size) {
+  CHECK_EQ(block_table.dim(), 2);
+  CHECK_EQ(kv_seq_lens.dim(), 1);
+  CHECK_EQ(slots.dim(), 1);
+  CHECK_EQ(block_table.size(0), kv_seq_lens.numel());
+  CHECK_EQ(slots.numel(), kv_seq_lens.numel());
+  CHECK_GT(block_size, 0);
+  AttentionMetadata metadata{};
+  metadata.block_table = block_table;
+  metadata.kv_seq_lens = kv_seq_lens;
+  metadata.slot_mapping = slots;
+  metadata.max_query_len = 1;
+  metadata.max_seq_len = block_table.size(1) * block_size;
+  return metadata;
+}
+
 AttentionMetadata AttentionMetadataBuilder::build(
     const ModelInputParams& params,
     bool enable_mla,

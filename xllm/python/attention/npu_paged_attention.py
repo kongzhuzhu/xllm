@@ -235,6 +235,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._page_size: int | None = None
         self._metadata: AttentionMetadata | _PreparedMlaAttention | None = None
         self._paged_graph_state: PagedAttentionGraphState | None = None
+        self._graph_metadata_updated_in_place = False
         self._use_expanded_decode = False
         self._block_table_i32: torch.Tensor | None = None
         self._block_attention_masks: dict[tuple[int, int] | None, torch.Tensor] = {}
@@ -264,10 +265,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._materialized_block_table: torch.Tensor | None = None
         self._sfa_page_layout: _SfaPageLayout | None = None
         self._graph_index_history_max_kv: int | None = None
+        self._causal_mask: torch.Tensor | None = None
 
-        self._causal_mask = (
-            torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1).to(torch.int8).contiguous().to(device)
-        )
+    def _get_causal_mask(self) -> torch.Tensor:
+        # Sparse MLA never consumes this 4 MiB allocation. Masked attention
+        # requests it on its first eager/warmup forward, before graph capture,
+        # and subsequent forwards reuse the same storage.
+        if self._causal_mask is None:
+            self._causal_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.int8), 1).to(self.device)
+        return self._causal_mask
 
     @property
     def supports_linear_spec_verify_graph(self) -> bool:
@@ -458,15 +464,20 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             )
         return _PreparedPagedAttention(block_table, list(query_ends), actual_seq_q, actual_seq_kv)
 
+    def prepare_owned_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        self.prepare(metadata, graph_mode=True, owned_metadata=True)
+
     def prepare(
         self,
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
+        owned_metadata: bool = False,
     ) -> None:
         # Device KV lengths can change between forwards while the prepared
         # Slot binding stays the same. Masks are shared only within a forward.
         self._block_attention_masks.clear()
+        self._graph_metadata_updated_in_place = False
         prepared = getattr(metadata, "prepared_attention_state", None)
         if isinstance(prepared, _PreparedMlaAttention):
             if not self._is_mla or (graph_mode and (prepared.is_prefill or prepared.is_chunked_prefill)):
@@ -604,7 +615,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             else:
                 batch = kv_seq_lens.size(0)
                 actual_seq_q = torch.arange(1, batch + 1, dtype=torch.int32, device=mla_device)
-            if graph_mode:
+            if graph_mode and not owned_metadata:
                 graph_batch = int(actual_seq_kv.numel())
                 self._mla_actual_seq_q = get_execution_buffer(
                     ("MLA_ACTUAL_SEQ_Q", graph_batch),
@@ -659,6 +670,25 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._mla_max_seqlen_k = 0
 
         self._prepare_kv_shard_materialization(metadata)
+        # MTP's role owns these int32 tensors and updates them in place before
+        # replay. The backend already borrows the same storage; copying it to
+        # itself again adds Host dispatch without changing any captured input.
+        # Converted, expanded, Host-length and sharded layouts still need the
+        # regular update path. Query ends in this sparse layout are constant.
+        self._graph_metadata_updated_in_place = (
+            graph_mode
+            and owned_metadata
+            and self._uses_sparse_mla
+            and not self._use_expanded_decode
+            and not metadata.is_prefill
+            and not metadata.is_chunked_prefill
+            and not getattr(metadata, "has_kv_shard", False)
+            and metadata.q_cu_seq_lens is None
+            and block_table is not None
+            and block_table.dtype == torch.int32
+            and kv_seq_lens is not None
+            and kv_seq_lens.dtype == torch.int32
+        )
 
     def _prepare_paged_graph(self, *, workspace_kv_length: int | None = None) -> None:
         if self._block_table_i32 is None:
@@ -673,15 +703,27 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if workspace_kv_length is not None:
                 workspace_actual_seq_kv = [workspace_kv_length] * graph_batch_size
             state = PagedAttentionGraphState(
-                workspace=self._allocate_graph_workspace(
-                    graph_batch_size,
-                    self._block_table_i32,
-                    actual_seq_kv=workspace_actual_seq_kv,
+                workspace=get_execution_buffer(
+                    ("FIA_WORKSPACE", graph_batch_size, tuple(self._actual_seq_q), tuple(workspace_actual_seq_kv)),
+                    lambda: self._allocate_graph_workspace(
+                        graph_batch_size,
+                        self._block_table_i32,
+                        actual_seq_kv=workspace_actual_seq_kv,
+                    ),
+                    shared=True,
                 ),
-                output=torch.empty(
-                    graph_batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device
+                output=get_execution_buffer(
+                    ("FIA_OUTPUT", graph_batch_size),
+                    lambda: torch.empty(
+                        graph_batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device
+                    ),
+                    shared=True,
                 ),
-                lse=torch.empty(0, dtype=self.dtype, device=self.device),
+                lse=get_execution_buffer(
+                    ("FIA_LSE", graph_batch_size),
+                    lambda: torch.empty(0, dtype=self.dtype, device=self.device),
+                    shared=True,
+                ),
                 block_table=self._block_table_i32,
                 query=[],
                 kv=[],
@@ -694,6 +736,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._paged_graph_state = state
         self._actual_seq_q = state.query
         self._actual_seq_kv = state.kv
+
+    @property
+    def graph_metadata_updated_in_place(self) -> bool:
+        """Whether all dynamic graph metadata borrows the role's owned storage."""
+        return self._graph_metadata_updated_in_place
 
     def _allocate_graph_workspace(
         self,
@@ -1409,7 +1456,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             actual_seq_q = self._mla_actual_seq_q
         if actual_seq_kv is None:
             actual_seq_kv = self._mla_actual_seq_kv
-        out = torch.empty_like(q_latent)
+        out = get_execution_buffer(
+            ("SFA_OUTPUT", layer_id) + tuple(q_latent.shape),
+            lambda: torch.empty_like(q_latent),
+            shared=True,
+        )
         return kernels.sparse_flash_attention_out(
             q_latent,
             nope_cache,
@@ -1488,7 +1539,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             query_rope=q_pe,
             key_rope=rope_flat,
             pse_shift=None,
-            atten_mask=self._causal_mask if is_prefill else None,
+            atten_mask=self._get_causal_mask() if is_prefill else None,
             actual_seq_qlen=self._mla_actual_seq_q_host,
             actual_seq_kvlen=self._mla_actual_seq_kv_host,
             block_table=block_table,
@@ -1530,7 +1581,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             "query_rope": q_pe,
             "key_rope": rope_flat,
             "pse_shift": None,
-            "atten_mask": self._causal_mask if is_prefill else None,
+            "atten_mask": self._get_causal_mask() if is_prefill else None,
             "actual_seq_qlen": self._mla_actual_seq_q_host,
             "actual_seq_kvlen": self._mla_actual_seq_kv_host,
             "block_table": block_table,
@@ -1576,10 +1627,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 )
                 self._mla_graph_workspaces[output_key] = workspace
         else:
-            output = get_execution_buffer(output_key, lambda: torch.empty_like(q_latent))
+            output = get_execution_buffer(output_key, lambda: torch.empty_like(q_latent), shared=True)
             softmax_lse = get_execution_buffer(
                 ("MLA_DENSE_LSE", layer_id) + tuple(q_latent.shape),
                 lambda: torch.empty(0, dtype=q_latent.dtype, device=q_latent.device),
+                shared=True,
             )
             workspace = get_execution_buffer(
                 ("MLA_DENSE_WORKSPACE", layer_id) + tuple(q_latent.shape),
@@ -1589,6 +1641,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     nope_flat,
                     **common_kwargs,
                 ),
+                shared=True,
             )
 
         stream = graph_context.stream
@@ -1660,7 +1713,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     ) -> torch.Tensor:
         actual_seq = self._cumulative_seq_lens(metadata, num_tokens)
         use_attention_mask = layer.causal or layer.fia_use_attention_mask
-        atten_mask = self._causal_mask if use_attention_mask else None
+        atten_mask = self._get_causal_mask() if use_attention_mask else None
         sparse_mode = layer.fia_sparse_mode
         if sparse_mode is None:
             sparse_mode = _SPARSE_MODE_RIGHT_DOWN_CAUSAL if layer.causal else _SPARSE_MODE_NONE
@@ -1811,7 +1864,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             kv_prefix_k,
             kv_prefix_v,
             pse_shift=None,
-            atten_mask=self._causal_mask,
+            atten_mask=self._get_causal_mask(),
             actual_seq_lengths=cp_context.q_cu_seqlens,
             actual_seq_lengths_kv=cp_context.kv_cu_seqlens,
             num_heads=self.num_heads,

@@ -102,6 +102,26 @@ def _prepared_metadata() -> SimpleNamespace:
     )
 
 
+def test_unified_dcp_rejects_owned_metadata_before_warmup(
+    prepared_backend: SfaDcpAttentionBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare = MagicMock(side_effect=AssertionError("unsupported Unified metadata reached DCP preparation"))
+    monkeypatch.setattr(prepared_backend, "prepare", prepare)
+    with pytest.raises(NotImplementedError, match="Unified MTP graphs do not support DCP"):
+        prepared_backend.prepare_owned_graph_metadata(_prepared_metadata())
+    prepare.assert_not_called()
+
+
+def test_dcp_derived_buffers_are_not_direct_metadata_consumers(prepared_backend: SfaDcpAttentionBackend) -> None:
+    metadata = _prepared_metadata()
+    metadata.q_cu_seq_lens = None
+    with forward_context(_cpu_context(AclGraphExecutionState({}))):
+        prepared_backend.prepare(metadata, graph_mode=True, owned_metadata=True)
+    assert not prepared_backend.graph_metadata_updated_in_place
+    assert prepared_backend._local_slot_mapping.data_ptr() != metadata.slot_mapping.data_ptr()
+    assert prepared_backend._sfa_metadata.dcp_context.seq_lens.data_ptr() != metadata.kv_seq_lens.data_ptr()
+
+
 def test_prepare_metadata_preserves_active_dcp_forward(
     prepared_backend: SfaDcpAttentionBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -364,9 +384,32 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes(prepared_backe
     assert torch.equal(expanded[0, :4], torch.tensor([4, 5, 6, 7], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("owned_metadata", [False, True])
 @pytest.mark.parametrize("first_kv_len", [3, 511])
-def test_prepare_uses_expanded_rows_for_mtp_verify(prepared_backend: SfaDcpAttentionBackend, first_kv_len: int) -> None:
-    backend = prepared_backend
+def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int, owned_metadata: bool) -> None:
+    backend = SfaDcpAttentionBackend(
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=256,
+        scale=0.1,
+        sliding_window=0,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        dcp_group=_FakeDcpGroup(),
+        index_topk=2048,
+        max_num_reqs=8,
+    )
+    page_size = 128
+    backend.bind_kv_caches(
+        [
+            LayerCache(
+                key=torch.empty(16, page_size, 1, 512),
+                value=torch.empty(16, page_size, 1, 64),
+                index=torch.empty(64, page_size, 1, 128),
+            )
+        ]
+    )
+
     captured: dict[str, object] = {}
 
     class _Builder:
@@ -405,7 +448,10 @@ def test_prepare_uses_expanded_rows_for_mtp_verify(prepared_backend: SfaDcpAtten
     )
 
     with forward_context(_cpu_context(AclGraphExecutionState({}))):
-        backend.prepare(metadata, graph_mode=True)
+        if owned_metadata:
+            backend.prepare_owned_graph_metadata(metadata)
+        else:
+            backend.prepare(metadata, graph_mode=True)
 
     assert captured["num_reqs"] == 4
     assert captured["num_input_tokens"] == 4

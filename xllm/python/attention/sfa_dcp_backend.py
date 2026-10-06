@@ -127,13 +127,20 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             max_num_reqs=max(self._max_num_reqs, 1),
         )
 
+    def prepare_owned_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        """Reject Unified warmup until DCP derivations are part of its graph."""
+        raise NotImplementedError("Unified MTP graphs do not support DCP-derived metadata")
+
     def prepare(
         self,
         metadata: AttentionMetadata,
         *,
         graph_mode: bool = False,
+        owned_metadata: bool = False,
     ) -> None:
-        super().prepare(metadata, graph_mode=graph_mode)
+        super().prepare(metadata, graph_mode=graph_mode, owned_metadata=owned_metadata)
+        # DCP derives separate buffers; updating the source arena is insufficient.
+        self._graph_metadata_updated_in_place = False
         self._sfa_metadata = None
         if self._kv_layout is None or self._builder is None:
             return
@@ -295,6 +302,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         topk: torch.Tensor | None = None,
         cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
+        """Run sparse MLA, optionally reusing cache data prepared by the fused path."""
         if topk is None:
             raise NotImplementedError("dense MLA (topk=None) is not supported on SfaDcpAttentionBackend")
         if self._impl is None or self._kv_layout is None:

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -40,6 +41,14 @@ struct AttentionMetadataBuildOptions {
 // allowing attention_metadata.h to not depend on model_input_params.h.
 class AttentionMetadataBuilder {
  public:
+  // One sparse decode row per token. No compact CSR or Host length mirrors:
+  // page crossings change values, not the graph's allocation contract.
+  static AttentionMetadata build_mtp_sparse_decode(
+      const torch::Tensor& block_table,
+      const torch::Tensor& kv_seq_lens,
+      const torch::Tensor& slots,
+      int32_t block_size);
+
   // Build AttentionMetadata from ModelInputParams with default compute_dtype
   // ("float").
   static AttentionMetadata build(
