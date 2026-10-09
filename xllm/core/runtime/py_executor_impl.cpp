@@ -26,14 +26,12 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
-#include "core/framework/kv_cache/kv_shard_layout.h"
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
-#include "core/layers/common/kv_shard_batch_metadata.h"
 #include "core/runtime/py_attention_metadata.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
@@ -399,16 +397,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         layer::AttentionMetadataBuilder::build(
             params, enable_mla_, std::nullopt, device_));
   }
-  if (enable_mla_ && py_causal_lm_->cp_size() > 1 &&
-      py_causal_lm_->kv_split_size() > 1 &&
-      (attn_metadata->is_prefill || attn_metadata->is_chunked_prefill)) {
-    const KVShardLayout layout(options_.block_size(),
-                               py_causal_lm_->kv_split_size(),
-                               py_causal_lm_->kv_split_rank());
-    attn_metadata->kv_shard_batch_metadata =
-        layer::build_kv_shard_batch_metadata(*attn_metadata, layout);
-  }
-
   py::gil_scoped_acquire gil;
 
   // Prepared input already bound and checked KV caches during Prepare.

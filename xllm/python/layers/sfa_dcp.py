@@ -167,9 +167,20 @@ class AscendSFADCPMetadataBuilder:
     def _build_compact_kv_gather_metadata(
         self,
         dcp_block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        valid_block_ids, compact_block_table = dcp_block_table.flatten().unique(return_inverse=True)
-        compact_block_table = compact_block_table.view_as(dcp_block_table)
+        # Request rows can contain padded -1 or stale page IDs. Gather only
+        # pages visible to a request, then retain its original table shape.
+        page_counts = torch.div(
+            seq_lens.to(device=dcp_block_table.device, dtype=torch.int64) + self.layout.logical_block_size - 1,
+            self.layout.logical_block_size,
+            rounding_mode="floor",
+        )
+        columns = torch.arange(dcp_block_table.shape[1], device=dcp_block_table.device)
+        valid = (columns.unsqueeze(0) < page_counts.unsqueeze(1)) & (dcp_block_table >= 0)
+        valid_block_ids, compact_ids = torch.unique(dcp_block_table[valid], sorted=True, return_inverse=True)
+        compact_block_table = torch.zeros_like(dcp_block_table, dtype=torch.int64)
+        compact_block_table[valid] = compact_ids
         num_blocks = valid_block_ids.shape[0]
         remapped_block_table = (
             compact_block_table.unsqueeze(-1) + (self.dcp_rank_arange * num_blocks).view(1, 1, -1).to(dcp_block_table)
@@ -208,7 +219,9 @@ class AscendSFADCPMetadataBuilder:
         kv_gather_block_ids = None
         kv_gather_block_table = None
         if num_prefills > 0:
-            kv_gather_block_ids, kv_gather_block_table = self._build_compact_kv_gather_metadata(dcp_block_table)
+            kv_gather_block_ids, kv_gather_block_table = self._build_compact_kv_gather_metadata(
+                dcp_block_table, seq_lens[:num_reqs]
+            )
         return AscendSFADCPMetadata(
             num_prefills=num_prefills,
             dcp_context=DCPContext(
@@ -500,6 +513,8 @@ class AscendSFADCPImpl:
         attn_metadata: AscendSFADCPMetadata,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        *,
+        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dcp_context = attn_metadata.dcp_context
         is_prefill = attn_metadata.num_prefills > 0
@@ -508,8 +523,12 @@ class AscendSFADCPImpl:
         assert gather_context is not None
         if is_prefill:
             gathered_kv_cache = self._finish_dcp_gather(gather_context)
-            block_table = dcp_context.kv_gather_block_table
+            if block_table is None:
+                block_table = dcp_context.kv_gather_block_table
             assert block_table is not None
+            # Empty CP shards still finish the collective before skipping SFA.
+            if ql_nope.shape[0] == 0:
+                return torch.zeros_like(ql_nope)
             return self._npu_sparse_flash_attention(
                 ql_nope,
                 q_pe,

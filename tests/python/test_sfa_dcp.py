@@ -112,7 +112,7 @@ def test_mla_index_context_uses_expanded_table_and_preserves_cp_context() -> Non
     materialized_scale = torch.empty(2)
     materialized_block_table = torch.tensor([[5, 7]], dtype=torch.int32)
     materialize_index_cache = MagicMock(return_value=(materialized_cache, materialized_scale, materialized_block_table))
-    cp_context = MagicMock()
+    cp_context = SimpleNamespace(segment_seq_indices=torch.tensor([0, 0]))
     base_context = MlaIndexContext(
         index_cache=index_cache,
         slot_mapping=torch.tensor([0], dtype=torch.int32),
@@ -133,11 +133,12 @@ def test_mla_index_context_uses_expanded_table_and_preserves_cp_context() -> Non
     ):
         remapped_context = backend.mla_index_context(MagicMock())
 
-    assert remapped_context.block_table is expanded_block_table
+    expected_table = expanded_block_table.repeat(2, 1)
+    torch.testing.assert_close(remapped_context.block_table, expected_table)
     actual_cache, actual_scale, materialized_table = remapped_context.materialize_index_cache()
     assert actual_cache is materialized_cache
     assert actual_scale is materialized_scale
-    assert materialized_table is expanded_block_table
+    assert materialized_table is remapped_context.block_table
     materialize_index_cache.assert_called_once_with()
     for field in fields(MlaIndexContext):
         if field.name in {"block_table", "materialize_index_cache"}:
@@ -468,3 +469,47 @@ def test_npu_sparse_flash_attention_passes_none_rope() -> None:
     kwargs = fake_ops.sparse_flash_attention_lse.call_args.kwargs
     assert kwargs["query_rope"] is None
     assert kwargs["key_rope"] is None
+
+
+def test_prefill_gather_ignores_padded_and_stale_pages() -> None:
+    builder = _builder()
+    ids, table = builder._build_compact_kv_gather_metadata(
+        torch.tensor([[3, -1, 999], [5, 3, 888]], dtype=torch.int32),
+        torch.tensor([7, 9], dtype=torch.int32),
+    )
+    assert ids.tolist() == [3, 5]
+    assert table[:, :2].tolist() == [[0, 2], [1, 3]]
+    assert table[1, 2:4].tolist() == [0, 2]
+
+
+def test_empty_cp_query_finishes_kv_collective_before_returning() -> None:
+    impl = _dcp_impl()
+    metadata = _builder().build(
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([[1]], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        num_reqs=1,
+        num_input_tokens=1,
+        num_prefills=1,
+    )
+    cache = torch.zeros(2, 4, 1, 4)
+    metadata.dcp_context.gather_context = SimpleNamespace(handle=MagicMock())
+    query = torch.empty(0, 2, 4)
+    with (
+        patch.object(impl, "_finish_dcp_gather", return_value=(cache, None)) as finish,
+        patch.object(impl, "_npu_sparse_flash_attention") as kernel,
+    ):
+        output = impl._execute_sparse_flash_attention_process(
+            query,
+            None,
+            (cache,),
+            torch.empty(0, 1, 4, dtype=torch.int32),
+            metadata,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            block_table=torch.empty(0, 2, dtype=torch.int32),
+        )
+    finish.assert_called_once()
+    kernel.assert_not_called()
+    assert output.shape == query.shape
+    assert metadata.dcp_context.gather_context is None

@@ -790,13 +790,23 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
 
 
 @pytest.mark.parametrize(
-    ("ep_size", "ep_rank", "moe_tp_size", "moe_tp_rank"),
-    [(4, 0, 1, 0), (4, 2, 1, 0), (4, 3, 1, 0), (2, 1, 2, 1)],
+    ("ep_size", "ep_rank", "moe_tp_size", "moe_tp_rank", "cp_size"),
+    [
+        (4, 0, 1, 0, 1),
+        (4, 2, 1, 0, 1),
+        (4, 3, 1, 0, 1),
+        (2, 1, 2, 1, 1),
+        (1, 0, 4, 0, 2),
+        (1, 0, 4, 3, 2),
+        (1, 0, 8, 7, 4),
+    ],
 )
 def test_glm_weight_loader_reads_only_local_ep_experts(
-    monkeypatch: pytest.MonkeyPatch, ep_size: int, ep_rank: int, moe_tp_size: int, moe_tp_rank: int
+    monkeypatch: pytest.MonkeyPatch, ep_size: int, ep_rank: int, moe_tp_size: int, moe_tp_rank: int, cp_size: int
 ) -> None:
     values = _config(ep_size=ep_size, ep_rank=ep_rank, moe_tp_size=moe_tp_size, moe_tp_rank=moe_tp_rank)
+    if cp_size > 1:
+        values.update(cp_size=cp_size, cp_rank=moe_tp_rank // 2, dp_size=1, world_size=2 * cp_size)
     model = Glm52ForCausalLM(values)
     moe = model.model.layers[0].mlp
     model.model.layers[0].self_attn.process_weights_after_loading = MagicMock()

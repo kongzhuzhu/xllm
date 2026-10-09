@@ -84,15 +84,6 @@ def _validate_npu_cp_model_config(config: dict, num_decoding_tokens: int) -> Non
     kv_split = int(config.get("kv_split_size", 0)) or int(config["cp_size"])
     if model_type == "deepseek_v4" and kv_split != 1:
         raise NotImplementedError("Python DeepSeek-V4 CP requires replicated KV caches; use kv_split_size=1")
-    if (is_glm_mtp_draft or (model_type == "glm_moe_dsa" and speculative and algorithm == "mtp")) and kv_split != 1:
-        # Verification and draft decode keep global rows on each CP rank, so
-        # their paged caches must retain every token written by CP prefill.
-        raise NotImplementedError("Python GLM CP with MTP requires replicated KV caches; use kv_split_size=1")
-    if model_type == "glm_moe_dsa" and kv_split > 1:
-        if not config.get("enable_disagg_pd", False) or role != "PREFILL":
-            raise NotImplementedError(
-                "Python GLM CP with kv_split_size > 1 requires disaggregated PD with the PREFILL role"
-            )
 
 
 def _create_attention_backend(
@@ -123,7 +114,11 @@ def _create_attention_backend(
         )
     if current_platform.is_npu():
         dcp_group = distributed.dcp_group(device)
-        if int(config.get("cp_size", 1)) == 1 and dcp_group is not None and dcp_group.size() > 1:
+        if (
+            dcp_group is not None
+            and dcp_group.size() > 1
+            and (int(config.get("cp_size", 1)) == 1 or model_type in ("glm_moe_dsa", "glm_moe_dsa_mtp"))
+        ):
             from xllm.python.attention.sfa_dcp_backend import (
                 SfaDcpAttentionBackend,
                 dcp_layer_options,
@@ -336,26 +331,14 @@ class ModelExecutor:
         prepared_kv_split = int(config.get("kv_split_size", 0)) or cp_size
         dcp_group = distributed.dcp_group(device) if current_platform.is_npu() else None
         dcp_size = dcp_group.size() if dcp_group is not None else 1
-        # A configured split alone is insufficient: prepared DCP requires the
-        # same runtime group that selected the SFA backend for this device.
-        prepared_dcp = (
+        prepared_glm_parallel = (
             current_platform.is_npu()
             and config.get("model_type") in ("glm_moe_dsa", "glm_moe_dsa_mtp")
             and dp_size == 1
-            and cp_size == 1
-            and prepared_kv_split > 1
-            and dcp_size == prepared_kv_split
         )
-        # GLM prefill shards query rows in EagerRunner and gathers every KV
-        # write into replicated caches. Prepared MTP and ACL decode retain
-        # their global rows and never install a prefill CP context.
-        prepared_cp = (
-            current_platform.is_npu()
-            and config.get("model_type") in ("glm_moe_dsa", "glm_moe_dsa_mtp")
-            and cp_size > 1
-            and dp_size == 1
-            and prepared_kv_split == 1
-            and dcp_size == 1
+        # Sharded KV requires the live group that selected the SFA backend.
+        prepared_kv = dcp_size == prepared_kv_split and (
+            prepared_kv_split == 1 or (prepared_kv_split > 1 and prepared_glm_parallel)
         )
         self._supports_prepared_metadata = (
             self.attention_backend.supports_prepared_metadata
@@ -363,9 +346,9 @@ class ModelExecutor:
                 config.get("model_type") in ("qwen3", "glm_moe_dsa", "glm_moe_dsa_mtp")
                 or (self._prepared_block_draft and graph_backend in ("", "off", "none", "0"))
             )
-            and ((prepared_kv_split == 1 and dcp_size == 1) or prepared_dcp)
+            and prepared_kv
             and graph_backend in ("", "off", "none", "0", "aclgraph")
-            and (cp_size == 1 or prepared_cp)
+            and (cp_size == 1 or prepared_glm_parallel)
             and self.layerwise_split_size == 1
         )
         if dp_size > 1 and graph_backend not in (

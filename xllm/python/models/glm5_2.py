@@ -319,9 +319,11 @@ class Glm52Config:
         if self.ep_size > 1:
             if self.n_routed_experts % self.ep_size:
                 raise ValueError("n_routed_experts must be divisible by ep_size")
+        if self.ep_size > 1 or self.cp_size > 1:
             if self.moe_tp_size * self.ep_size != self.world_size:
                 raise ValueError("world_size must equal moe_tp_size * ep_size")
-        if self.moe_intermediate_size % moe_shard(self)[0]:
+        moe_world = self.moe_tp_size if self.cp_size > 1 else moe_shard(self)[0]
+        if self.moe_intermediate_size % moe_world:
             raise ValueError("moe_intermediate_size must be divisible by moe_tp_size")
         if not 0 <= self.tp_rank < self.tp_size:
             raise ValueError("tp_rank must be in [0, tp_size)")
@@ -888,7 +890,12 @@ class Glm52Indexer(DeepseekV3Indexer):
 
 
 class Glm52MoE(DeepseekV3MoE):
-    """EP MoE with CP rows materialized before expert reduction."""
+    """MoE with independent expert sharding and aligned CP token rows."""
+
+    def _weight_shard(self) -> tuple[int, int]:
+        if self.cfg.cp_size > 1:
+            return self.cfg.moe_tp_size, self.cfg.moe_tp_rank
+        return super()._weight_shard()
 
     def __init__(
         self,
@@ -935,7 +942,7 @@ class Glm52MoE(DeepseekV3MoE):
             )
         else:
             final = routed + shared
-        if getattr(self.cfg, "enable_attn_dp_weight_sharding", False):
+        if self.cfg.cp_size > 1 or getattr(self.cfg, "enable_attn_dp_weight_sharding", False):
             if self.moe_tp_size > 1:
                 distributed.all_reduce_(final, "moe_tp")
             return final
@@ -955,9 +962,11 @@ class Glm52MoE(DeepseekV3MoE):
                 self._run_routed_experts(hidden, use_mega_moe), self._run_shared_experts(hidden), use_mega_moe
             )
         cp_context = get_forward_context().cp_context
-        if cp_context is None or self.ep_size == 1:
+        if cp_context is None:
             return super().forward(hidden)
 
+        # MoE TP/EP groups span CP peers even at EP1. Every rank must reduce
+        # the same token rows before returning to attention's local CP view.
         global_hidden = cp_gather_kv(hidden, cp_context)
         global_output = super().forward(global_hidden)
         return cp_shard_rows(global_output, cp_context)

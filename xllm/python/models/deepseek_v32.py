@@ -1571,7 +1571,7 @@ class DeepseekV3MoE(nn.Module):
         self.dp_rank = cfg.dp_rank
         self.moe_tp_size = cfg.moe_tp_size
 
-        tp = moe_shard(cfg)[0]
+        tp = self._weight_shard()[0]
         assert self.moe_inter % tp == 0
         self.inter_local = self.moe_inter // tp
 
@@ -1778,9 +1778,12 @@ class DeepseekV3MoE(nn.Module):
             )
         self.process_experts_w2_after_loading()
 
+    def _weight_shard(self) -> tuple[int, int]:
+        return moe_shard(self.cfg)
+
     def load_from_checkpoint(self, loader: W8A8WeightLoader, mlp_prefix: str) -> None:
         """Load this routed-MoE layer: experts, router gate, and shared experts."""
-        world, rank = moe_shard(self.cfg)
+        world, rank = self._weight_shard()
         self.load_experts(loader, mlp_prefix + "experts.", world=world, rank=rank)
         loader.copy_replicated(mlp_prefix + "gate.weight")
         loader.copy_in(

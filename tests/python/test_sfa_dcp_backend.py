@@ -189,6 +189,29 @@ def test_prepared_dcp_uses_live_device_lengths_and_slots(
         assert next_context.slot_mapping.data_ptr() == first_context.slot_mapping.data_ptr()
 
 
+def test_ordinary_dcp_graph_replay_updates_static_metadata(prepared_backend: SfaDcpAttentionBackend) -> None:
+    backend = prepared_backend
+    metadata = _prepared_metadata()
+    state = AclGraphExecutionState({})
+    with forward_context(_cpu_context(state)):
+        backend.prepare(metadata, graph_mode=True)
+        captured = backend._sfa_metadata.dcp_context
+        indexer_table = backend._expanded_indexer_block_table
+        metadata.kv_seq_lens.copy_(torch.tensor([512, 513, 640, 641], dtype=torch.int32))
+        metadata.kv_seq_lens_host_values[:] = [512, 513, 640, 641]
+        metadata.slot_mapping.copy_(torch.tensor([511, 512, 639, 640], dtype=torch.int32))
+        metadata.block_table.fill_(3)
+        backend.prepare_graph_replay(metadata)
+
+    replay = backend._sfa_metadata.dcp_context
+    assert replay.seq_lens.data_ptr() == captured.seq_lens.data_ptr()
+    assert replay.slot_mapping.data_ptr() == captured.slot_mapping.data_ptr()
+    assert backend._expanded_indexer_block_table is indexer_table
+    assert replay.seq_lens.tolist() == [128, 129, 256, 256]
+    assert replay.slot_mapping.tolist() == [-1, 128, 255, -1]
+    assert indexer_table[0].tolist() == [12, 13, 14, 15] * 2
+
+
 def test_dcp_graph_replay_reuses_isolated_entry_buffers(
     prepared_backend: SfaDcpAttentionBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -305,7 +328,8 @@ def test_prepared_prefill_keeps_compact_kv_gather(prepared_backend: SfaDcpAttent
     context = backend._sfa_metadata.dcp_context
     assert context.seq_lens.tolist() == [128, 128, 128, 129]
     assert context.kv_gather_block_ids.tolist() == [0, 1]
-    assert context.kv_gather_block_table[0].tolist() == [0, 2, 4, 6, 1, 3, 5, 7]
+    assert context.kv_gather_block_table[0, :4].tolist() == [0, 2, 4, 6]
+    assert context.kv_gather_block_table[-1].tolist() == [0, 2, 4, 6, 1, 3, 5, 7]
     assert backend.mla_preprocess_context(SimpleNamespace(layer_id=0)) is None
 
 
@@ -385,35 +409,14 @@ def test_graph_prepare_keeps_valid_indexer_pages_for_padded_lanes(prepared_backe
 
 
 @pytest.mark.parametrize("first_kv_len", [3, 511])
-def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
-    backend = SfaDcpAttentionBackend(
-        num_heads=8,
-        num_kv_heads=1,
-        head_dim=256,
-        scale=0.1,
-        sliding_window=0,
-        device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        dcp_group=_FakeDcpGroup(),
-        index_topk=2048,
-        max_num_reqs=8,
-    )
-    page_size = 128
-    backend.bind_kv_caches(
-        [
-            LayerCache(
-                key=torch.empty(16, page_size, 1, 512),
-                value=torch.empty(16, page_size, 1, 64),
-                index=torch.empty(64, page_size, 1, 128),
-            )
-        ]
-    )
-
+@pytest.mark.parametrize("graph_mode,chunked", [(True, False), (False, True)])
+def test_prepare_uses_expanded_rows_for_mtp_verify(
+    prepared_backend: SfaDcpAttentionBackend, first_kv_len: int, chunked: bool, graph_mode: bool
+) -> None:
+    backend = prepared_backend
     captured: dict[str, object] = {}
 
     class _Builder:
-        dcp_local_seq_lens_buf = torch.empty(8)
-
         @staticmethod
         def build(**kwargs: object) -> SimpleNamespace:
             captured.update(kwargs)
@@ -443,11 +446,12 @@ def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
             kv_seq_lens_host_values=[first_kv_len + offset for offset in (0, 1, 4, 5)],
         ),
         is_prefill=False,
-        is_chunked_prefill=False,
+        is_chunked_prefill=chunked,
+        has_kv_shard=False,
     )
 
     with forward_context(_cpu_context(AclGraphExecutionState({}))):
-        backend.prepare(metadata, graph_mode=True)
+        backend.prepare(metadata, graph_mode=graph_mode)
 
     assert captured["num_reqs"] == 4
     assert captured["num_input_tokens"] == 4
@@ -459,7 +463,9 @@ def test_prepare_uses_expanded_rows_for_mtp_verify(first_kv_len: int) -> None:
         (first_kv_len + 4, [20, 21]),
         (first_kv_len + 5, [20, 21]),
     ]
-    assert backend._mla_max_seqlen_k == 1024
+    assert backend._mla_max_seqlen_k == (1024 if graph_mode else first_kv_len + 5)
+
+    assert captured["num_prefills"] == 0
 
 
 def test_bind_kv_caches_accepts_missing_nope_rope_cache() -> None:
@@ -624,3 +630,93 @@ def test_gather_index_history_dcp_covers_tokens_in_one_logical_page() -> None:
     assert packed.shape == (1, kv_len, width)
     assert torch.equal(packed[0, :page_size, -1], torch.zeros(page_size))
     assert torch.equal(packed[0, page_size:kv_len, -1], torch.ones(page_size))
+
+
+@pytest.mark.parametrize("cp_size,cp_rank,query_lengths", [(2, 0, [5, 3]), (2, 1, [5, 3]), (4, 3, [1])])
+@pytest.mark.parametrize("owner", [0, 1])
+def test_cp_prefill_writes_global_rows_to_kv2_owners(
+    cp_size: int, cp_rank: int, query_lengths: list[int], owner: int
+) -> None:
+    from xllm.python.model_executor.cp_utils import build_cp_context, cp_shard_rows
+
+    backend = SfaDcpAttentionBackend(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        scale=0.5,
+        sliding_window=0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        dcp_group=SimpleNamespace(size=lambda: 2, rank=lambda: owner),
+        index_topk=4,
+        max_num_reqs=8,
+    )
+    cache = LayerCache(
+        key=torch.zeros(8, 4, 1, 4),
+        value=torch.zeros(8, 4, 1, 2),
+        index=torch.zeros(16, 4, 1, 4),
+    )
+    backend.bind_kv_caches([cache])
+    kv_lengths = [length + 7 for length in query_lengths]
+    cp = build_cp_context(query_lengths, kv_lengths, cp_size, cp_rank, torch.device("cpu"))
+    # Non-contiguous pages and cached prefixes exercise request segmentation,
+    # page ownership, and differing CP query/cache row counts together.
+    table = torch.tensor([[1, 4], [2, 6]], dtype=torch.int32)[: len(query_lengths)]
+    global_slots = torch.cat(
+        [
+            table[i, torch.arange(7, length + 7) // 8] * 8 + torch.arange(7, length + 7) % 8
+            for i, length in enumerate(query_lengths)
+        ]
+    ).to(torch.int32)
+    lengths = torch.tensor(query_lengths, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        slot_mapping=global_slots,
+        block_table=table,
+        kv_seq_lens=torch.tensor(kv_lengths, dtype=torch.int32),
+        kv_seq_lens_host_values=kv_lengths,
+        q_seq_lens=lengths,
+        q_cu_seq_lens=lengths.cumsum(0, dtype=torch.int32),
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=False,
+        has_kv_shard=False,
+        expanded_decode_metadata=None,
+    )
+    backend.prepare(metadata)
+    global_key = torch.arange(sum(query_lengths) * 4, dtype=torch.float32).view(-1, 1, 4)
+    global_rope = global_key[..., :2].contiguous()
+    local_key = cp_shard_rows(global_key, cp)
+    local_rope = cp_shard_rows(global_rope, cp)
+    query = local_key.repeat(1, 2, 1)
+    query_rope = local_rope.repeat(1, 2, 1)
+    topk = torch.zeros(cp.total_local, 1, 4, dtype=torch.int32)
+    context = ForwardContext(backend, torch.device("cpu"), metadata, [cache], cp_context=cp)
+    with (
+        forward_context(context),
+        patch("xllm.python.attention.sfa_dcp_backend.cp_gather_kv", side_effect=[global_key, global_rope]),
+        patch("xllm.python.attention.sfa_dcp_backend.write_mla_paged_cache") as write,
+        patch.object(backend._impl, "_record_dcp_kv_gather_context") as gather,
+        patch.object(
+            backend._impl, "_execute_sparse_flash_attention_process", side_effect=lambda q, *args, **kwargs: q + 10
+        ) as attention,
+    ):
+        index_context = backend.mla_index_context(SimpleNamespace(layer_id=0))
+        assert index_context.slot_mapping is global_slots
+        expected_index_pages = (table.unsqueeze(-1) * 2 + torch.arange(2, dtype=torch.int32)).flatten(1)
+        torch.testing.assert_close(
+            index_context.block_table,
+            expected_index_pages.index_select(0, cp.segment_seq_indices),
+        )
+        assert index_context.materialize_index_cache()[0] is cache.index
+        output = backend.execute_mla(query, query_rope, local_key, local_rope, SimpleNamespace(layer_id=0), topk)
+    slots, keys, ropes, *_ = write.call_args.args
+    expected_slots = [s // 8 * 4 + s % 4 if s % 8 // 4 == owner else -1 for s in global_slots.tolist()]
+    assert slots.tolist() == expected_slots
+    torch.testing.assert_close(keys, global_key)
+    torch.testing.assert_close(ropes, global_rope)
+    gather.assert_called_once()
+    assert attention.call_args.args[5] is cp.q_cu_seqlens_tensor
+    assert attention.call_args.args[6] is cp.segment_kv_seq_lens_tensor
+    expected_output = torch.zeros_like(query)
+    expected_output[cp.query_index] = query[cp.query_index] + 10
+    torch.testing.assert_close(output, expected_output)

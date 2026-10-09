@@ -271,7 +271,9 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
                          cp_group_index);
     }
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
-    if (!is_deepseek_v4 && cp_size_ == 1 && kv_split_size > 1) {
+    const bool is_glm_dsa = model_args_.model_type() == "glm_moe_dsa" ||
+                            model_args_.model_type() == "glm_moe_dsa_mtp";
+    if (!is_deepseek_v4 && (cp_size_ == 1 || is_glm_dsa) && kv_split_size > 1) {
       const int32_t dcp_rank = parallel_args.kv_split_rank();
       const int32_t dcp_group_index =
           global_rank % (global_world_size / kv_split_size);

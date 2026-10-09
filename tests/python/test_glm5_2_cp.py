@@ -247,10 +247,11 @@ def test_cp_one_preserves_aux_hidden_capture() -> None:
     )
 
 
-def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
+@pytest.mark.parametrize("ep_size", [1, 4])
+def test_cp_moe_materializes_global_rows_before_expert_reduction(ep_size: int) -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
-    moe.ep_size = 4
+    moe.ep_size = ep_size
     moe.cfg = SimpleNamespace(enable_attn_dp_weight_sharding=False)
     cp_context = object()
     local_hidden = torch.tensor([[30.0], [10.0]])
@@ -275,19 +276,20 @@ def test_cp_ep_moe_materializes_global_rows_before_expert_reduction() -> None:
     torch.testing.assert_close(output, torch.tensor([[130.0], [110.0]]))
 
 
-def test_glm_ep1_moe_reduces_only_on_ordinary_tp_group() -> None:
+@pytest.mark.parametrize(("cp_size", "group"), [(1, "tp"), (2, "moe_tp")])
+def test_glm_ep1_moe_reduction_matches_weight_sharding(cp_size: int, group: str) -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
     moe.ep_size = 1
     moe.moe_tp_size = 4
-    moe.cfg = SimpleNamespace(tp_size=2)
+    moe.cfg = SimpleNamespace(tp_size=2, cp_size=cp_size)
     routed = torch.tensor([[1.0], [2.0]])
     shared = torch.tensor([[10.0], [20.0]])
 
     with patch.object(glm5_2.distributed, "all_reduce_", create=True) as reduce:
         output = moe._combine_expert_outputs(routed, shared, False)
 
-    reduce.assert_called_once_with(output, "tp")
+    reduce.assert_called_once_with(output, group)
     torch.testing.assert_close(output, routed + shared)
 
 
@@ -421,6 +423,7 @@ def test_glm_moe_finalize_orders_stream_dependencies(gate_overlap: bool) -> None
     moe.moe_tp_size = 1
     moe.cfg = SimpleNamespace(
         tp_size=1,
+        cp_size=1,
         enable_attn_dp_weight_sharding=False,
         norm_topk_prob=True,
     )
@@ -513,12 +516,13 @@ def test_glm_moe_finalize_orders_stream_dependencies(gate_overlap: bool) -> None
     assert [event[0] for event in events] == expected
 
 
-def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce() -> None:
+@pytest.mark.parametrize("cp_size,group", [(1, "tp"), (2, "moe_tp")])
+def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce(cp_size: int, group: str) -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
     moe.ep_size = 1
-    moe.moe_tp_size = 1
-    moe.cfg = SimpleNamespace(tp_size=2)
+    moe.moe_tp_size = cp_size
+    moe.cfg = SimpleNamespace(tp_size=2, cp_size=cp_size)
     moe._enable_moe_finalize_routing = True
     permuted = torch.tensor([[1.0], [2.0], [3.0]])
     probs = torch.tensor([[0.25], [0.5], [0.75]])
@@ -555,7 +559,7 @@ def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce() -> No
     assert reduce.call_count == 1
     reduce_args = reduce.call_args.args
     torch.testing.assert_close(reduce_args[0], finalized)
-    assert reduce_args[1] == "tp"
+    assert reduce_args[1] == group
     torch.testing.assert_close(output, finalized)
 
 

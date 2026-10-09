@@ -77,13 +77,14 @@ Worker::Worker(const ParallelArgs& parallel_args,
     CHECK(!options.enable_graph() || !execution.disable_graph_warmup())
         << "Task pipeline ACL graphs require initialization warmup.";
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
-    CHECK(parallel_args.cp_size() == 1 ||
-          (Platform::is_npu() && parallel_args.dp_size() == 1 &&
-           kv_split_size == 1 &&
-           (!options.enable_speculative_decode() ||
-            SpeculativeConfig::is_mtp_algorithm(
-                options.speculative_algorithm()))))
-        << "Task pipeline prefill CP requires NPU, DP=1, replicated KV caches "
+    CHECK(
+        parallel_args.cp_size() == 1 ||
+        (Platform::is_npu() && parallel_args.dp_size() == 1 &&
+         (kv_split_size > 0 && parallel_args.cp_size() % kv_split_size == 0) &&
+         (!options.enable_speculative_decode() ||
+          SpeculativeConfig::is_mtp_algorithm(
+              options.speculative_algorithm()))))
+        << "Task pipeline prefill CP requires NPU, DP=1, KV split dividing CP "
            "and ordinary or fixed MTP decoding.";
     CHECK(kv_split_size == 1 ||
           (kv_split_size > 1 && parallel_args.dp_size() == 1 &&

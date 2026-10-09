@@ -262,39 +262,11 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
                                                 "qwen3",
                                                 /*global_world_size=*/16)
                    .has_value());
-  EXPECT_EQ(validate_context_parallel_config(options,
-                                             EngineType::LLM,
-                                             "glm_moe_dsa",
-                                             /*global_world_size=*/16),
-            std::optional<std::string>(
-                "Python GLM CP with kv_split_size > 1 requires "
-                "disaggregated PD with the PREFILL role; set "
-                "enable_disagg_pd=true and instance_role=PREFILL"));
-
-  options.enable_disagg_pd(true);
   EXPECT_FALSE(validate_context_parallel_config(options,
                                                 EngineType::LLM,
                                                 "glm_moe_dsa",
                                                 /*global_world_size=*/16)
                    .has_value());
-  EXPECT_EQ(validate_context_parallel_config(options,
-                                             EngineType::SSM,
-                                             "glm_moe_dsa",
-                                             /*global_world_size=*/16),
-            std::optional<std::string>(
-                "Python GLM CP with MTP requires replicated KV caches; use "
-                "kv_split_size=1"));
-
-  options.instance_role(InstanceRole::DEFAULT);
-  EXPECT_EQ(validate_context_parallel_config(options,
-                                             EngineType::LLM,
-                                             "glm_moe_dsa",
-                                             /*global_world_size=*/16),
-            std::optional<std::string>(
-                "Python GLM CP with kv_split_size > 1 requires "
-                "disaggregated PD with the PREFILL role; set "
-                "enable_disagg_pd=true and instance_role=PREFILL"));
-  options.instance_role(InstanceRole::PREFILL);
 
   parallel_config.kv_split_size(1);
   EXPECT_EQ(validate_context_parallel_config(options,
@@ -333,13 +305,13 @@ TEST(NpuCpCapabilityTest, PythonGlmMtpSupportsCpWithDecodeAclGraph) {
   });
   model_config.model_impl("python");
   execution_config.python_graph_backend("aclgraph");
-  parallel_config.cp_size(2).kv_split_size(1);
+  parallel_config.cp_size(2).kv_split_size(2);
 
   Options options;
   options.task_type("generate")
       .cp_size(2)
       .dp_size(1)
-      .ep_size(16)
+      .ep_size(1)
       .instance_role(InstanceRole::DEFAULT)
       .enable_graph(true)
       .speculative_algorithm("MTP");
@@ -349,17 +321,15 @@ TEST(NpuCpCapabilityTest, PythonGlmMtpSupportsCpWithDecodeAclGraph) {
                                                 /*global_world_size=*/16)
                    .has_value());
 
-  // The automatic KV split follows CP and cannot provide the replicated
-  // cache required by MTP verification, even on a disaggregated prefill node.
+  // The automatic KV split follows CP and uses the same DCP owners during
+  // prefill, target verification and draft decoding.
   options.instance_role(InstanceRole::PREFILL).enable_disagg_pd(true);
   parallel_config.kv_split_size(0);
-  EXPECT_EQ(validate_context_parallel_config(options,
-                                             EngineType::SSM,
-                                             "glm_moe_dsa",
-                                             /*global_world_size=*/16),
-            std::optional<std::string>(
-                "Python GLM CP with MTP requires replicated KV caches; use "
-                "kv_split_size=1"));
+  EXPECT_FALSE(validate_context_parallel_config(options,
+                                                EngineType::SSM,
+                                                "glm_moe_dsa",
+                                                /*global_world_size=*/16)
+                   .has_value());
 }
 
 }  // namespace

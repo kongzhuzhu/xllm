@@ -212,8 +212,8 @@ std::optional<std::string> validate_context_parallel_config(
     //
     // Native spec-verify chunked prefill still follows the admission guard in
     // AclGraphExecutorImpl::run(). Python handles expanded MTP verification as
-    // replicated decode without CP row sharding, so it requires complete KV
-    // caches as checked below.
+    // global query rows without CP row sharding. GLM can use DCP to merge
+    // attention over owner-local KV caches during this phase.
     if (options.instance_role() != InstanceRole::DEFAULT &&
         options.instance_role() != InstanceRole::PREFILL) {
       return "Model-side CP supports only DEFAULT or PREFILL roles";
@@ -270,22 +270,6 @@ std::optional<std::string> validate_context_parallel_config(
       if (model_type == "deepseek_v4" && kv_split != 1) {
         return "Python DeepSeek-V4 CP requires replicated KV caches; use "
                "kv_split_size=1";
-      }
-      if (model_type == "glm_moe_dsa" && engine_type == EngineType::SSM &&
-          SpeculativeConfig::is_mtp_algorithm(
-              options.speculative_algorithm()) &&
-          kv_split != 1) {
-        // Prefill gathers the CP shards into each rank's full cache. MTP
-        // verification and draft decode then retain the global token rows.
-        return "Python GLM CP with MTP requires replicated KV caches; use "
-               "kv_split_size=1";
-      }
-      if (model_type == "glm_moe_dsa" && kv_split > 1 &&
-          (!options.enable_disagg_pd() ||
-           options.instance_role() != InstanceRole::PREFILL)) {
-        return "Python GLM CP with kv_split_size > 1 requires disaggregated "
-               "PD with the PREFILL role; set enable_disagg_pd=true and "
-               "instance_role=PREFILL";
       }
       return std::nullopt;
     }

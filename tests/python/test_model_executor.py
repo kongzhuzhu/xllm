@@ -336,7 +336,8 @@ class TestCreateAttentionBackend:
         "xllm.python.attention.npu_paged_attention.NpuPagedAttentionBackend",
         StubAttentionBackend,
     )
-    def test_prefill_cp_uses_npu_backend_with_dcp_group(self, _mock_is_npu: MagicMock) -> None:
+    @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm_moe_dsa_mtp", "qwen3"])
+    def test_prefill_cp_selects_model_backend(self, _mock_is_npu: MagicMock, model_type: str) -> None:
         attn = _make_attention_layer(num_kv_heads=1, head_dim=256)
         dcp_group = MagicMock()
         dcp_group.size.return_value = 2
@@ -355,12 +356,15 @@ class TestCreateAttentionBackend:
                 attn,
                 torch.device("npu"),
                 torch.float16,
-                {"cp_size": 4, "enable_mla": True},
+                {"cp_size": 4, "enable_mla": True, "model_type": model_type},
             )
 
-        assert isinstance(backend, StubAttentionBackend)
-        assert backend.init_kwargs["is_mla"] is True
-        sfa_module.SfaDcpAttentionBackend.assert_not_called()
+        if model_type == "qwen3":
+            assert isinstance(backend, StubAttentionBackend)
+            sfa_module.SfaDcpAttentionBackend.assert_not_called()
+        else:
+            assert backend is sfa_module.SfaDcpAttentionBackend.return_value
+            sfa_module.SfaDcpAttentionBackend.assert_called_once()
 
     @patch(
         "xllm.python.model_executor.executor.current_platform.is_npu",
@@ -1274,7 +1278,7 @@ class TestBindKvCaches:
     ],
 )
 @pytest.mark.parametrize("kv_split", [0, 1, 2])
-def test_cp_admission_requires_replicated_kv(
+def test_cp_admission_preserves_model_specific_kv_support(
     model_type: str,
     is_draft: bool,
     speculative_tokens: int,
@@ -1290,7 +1294,7 @@ def test_cp_admission_requires_replicated_kv(
         "instance_role": "PREFILL",
         "enable_disagg_pd": True,
     }
-    if kv_split == 1:
+    if model_type != "deepseek_v4" or kv_split == 1:
         _validate_npu_cp_model_config(config, decoding_tokens)
     else:
         with pytest.raises(NotImplementedError, match="requires replicated KV caches"):
@@ -1518,9 +1522,13 @@ def test_eager_runner_rejects_mixed_cp_before_collective() -> None:
     assert not runner.attention_backend._prepared
 
 
-@pytest.mark.parametrize("cp_size", [2, 4])
-@pytest.mark.parametrize("prefill_flags", [(False, True), (True, False), (False, False)])
-def test_eager_runner_keeps_spec_verify_rows_replicated(cp_size: int, prefill_flags: tuple[bool, bool]) -> None:
+@pytest.mark.parametrize(
+    "cp_size,prefill_flags,explicit_spec_verify",
+    [(2, (False, True), True), (2, (False, True), False), (4, (True, False), False)],
+)
+def test_eager_runner_keeps_spec_verify_rows_replicated(
+    cp_size: int, prefill_flags: tuple[bool, bool], explicit_spec_verify: bool
+) -> None:
     runner = _make_eager_runner()
     runner.cp_size = cp_size
     runner.cp_rank = cp_size - 1
@@ -1532,7 +1540,12 @@ def test_eager_runner_keeps_spec_verify_rows_replicated(cp_size: int, prefill_fl
         is_prefill=prefill_flags[0],
         is_chunked_prefill=prefill_flags[1],
         is_mixed=False,
-        is_spec_verify=True,
+        is_spec_verify=explicit_spec_verify,
+        expanded_decode_metadata=(
+            None
+            if explicit_spec_verify
+            else _mtp_graph_metadata([2, 3, 4, 6, 7, 8], True, torch.device("cpu")).expanded_decode_metadata
+        ),
         q_seq_lens_host=torch.tensor([3, 3], dtype=torch.int32),
         kv_seq_lens_host=torch.tensor([129, 10], dtype=torch.int32),
         slot_mapping=torch.tensor([254, 255, 384, 519, 520, 521], dtype=torch.int32),
@@ -1876,22 +1889,25 @@ def test_executor_rejects_prepared_glm_split_topologies(split: str) -> None:
 
 @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm_moe_dsa_mtp"])
 @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
-@pytest.mark.parametrize("cp_size", [2, 4])
-def test_executor_accepts_prepared_glm_prefill_cp(model_type: str, graph_backend: str, cp_size: int) -> None:
+@pytest.mark.parametrize("cp_size,kv_split", [(2, 2), (4, 1)])
+def test_executor_accepts_prepared_glm_prefill_cp(
+    model_type: str, graph_backend: str, cp_size: int, kv_split: int
+) -> None:
     config = {
         "model_type": model_type,
         "is_draft_engine": model_type == "glm_moe_dsa_mtp",
         "num_speculative_tokens": 2,
         "speculative_algorithm": "mtp",
-        "kv_split_size": 1,
+        "kv_split_size": kv_split,
         "cp_size": cp_size,
         "cp_rank": cp_size - 1,
         "enable_task_pipeline": True,
         "python_graph_backend": graph_backend,
     }
+    group = SimpleNamespace(size=lambda: kv_split) if kv_split > 1 else None
     with (
         patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
+        patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=group),
         patch(
             "xllm.python.model_executor.executor._create_attention_backend",
             return_value=_PreparedStubAttentionBackend(),

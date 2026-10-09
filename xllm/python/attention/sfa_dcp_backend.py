@@ -44,6 +44,7 @@ from xllm.python.layers.sfa_dcp import (
     AscendSFADCPMetadataBuilder,
     DCPContext,
 )
+from xllm.python.model_executor.cp_utils import cp_gather_kv
 from xllm.python.model_executor.forward_context import (
     copy_into_execution_buffer,
     get_forward_context,
@@ -198,7 +199,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             )
 
         num_prefills = 0
-        if not graph_mode and (metadata.is_prefill or metadata.is_chunked_prefill):
+        if not graph_mode and not self._use_expanded_decode and (metadata.is_prefill or metadata.is_chunked_prefill):
             num_prefills = num_reqs
 
         if isinstance(prepared, _PreparedMlaAttention) and num_prefills == 0:
@@ -214,13 +215,7 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             )
             return
 
-        if num_reqs > self._builder.dcp_local_seq_lens_buf.shape[0]:
-            raise RuntimeError(
-                "SFA DCP builder buffer is too small; "
-                f"max_num_reqs={self._builder.dcp_local_seq_lens_buf.shape[0]}, "
-                f"num_reqs={num_reqs}"
-            )
-        attn_metadata = self._builder.build(
+        self._sfa_metadata = self._builder.build(
             slot_mapping=local_slots,
             block_table=block_table,
             seq_lens=seq_lens,
@@ -229,12 +224,14 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             dcp_local_seq_lens=local_seq_lens,
             num_prefills=num_prefills,
         )
-        self._sfa_metadata = attn_metadata
 
     def prepare_graph_replay(self, metadata: AttentionMetadata) -> None:
         prepared = getattr(metadata, "prepared_attention_state", None)
         if not isinstance(prepared, _PreparedMlaAttention):
-            raise ValueError("prepared DCP graph replay requires prepared MLA metadata")
+            # Ordinary decode graphs update their static inputs before replay.
+            # Only prepared graphs capture the DCP metadata transforms.
+            super().prepare_graph_replay(metadata)
+            return
         execution_state = get_forward_context().execution_state
         if execution_state is None:
             raise RuntimeError("prepared DCP graph replay requires an execution state")
@@ -281,6 +278,8 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
         indexer_table = self._expanded_indexer_block_table
         if indexer_table is None:
             return context
+        if context.cp_context is not None:
+            indexer_table = self._segment_block_table(indexer_table, context.cp_context)
 
         def materialize_index_cache() -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
             index_cache, index_cache_scale, _ = context.materialize_index_cache()
@@ -327,10 +326,16 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
             )
 
         attn_metadata.dcp_context.gather_context = None
-
+        cp_context = ctx.cp_context
+        if cp_context is not None and cache_is_preprocessed:
+            raise RuntimeError("CP prefill requires unfused MLA cache inputs")
         if not cache_is_preprocessed:
             if k_latent_3d is None:
                 raise RuntimeError("SFA DCP requires K tensors unless MLA preprocessing wrote the cache")
+            if cp_context is not None:
+                # Restore global token order before each owner writes its slots.
+                k_latent_3d = cp_gather_kv(k_latent_3d, cp_context).contiguous()
+                k_pe_3d = cp_gather_kv(k_pe_3d, cp_context).contiguous() if k_pe_3d is not None else None
             write_mla_paged_cache(
                 attn_metadata.dcp_context.slot_mapping,
                 k_latent_3d,
@@ -341,6 +346,25 @@ class SfaDcpAttentionBackend(NpuPagedAttentionBackend):
 
         kv_cache = (nope_cache, rope_cache)
         self._impl._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+        if cp_context is not None:
+            query_index = cp_context.query_index
+            block_table = attn_metadata.dcp_context.kv_gather_block_table
+            if block_table is None:
+                raise RuntimeError("CP prefill requires DCP KV gather metadata")
+            output = self._impl._execute_sparse_flash_attention_process(
+                q_latent.index_select(0, query_index).contiguous(),
+                q_pe.index_select(0, query_index).contiguous() if q_pe is not None else None,
+                kv_cache,
+                topk.index_select(0, query_index).contiguous(),
+                attn_metadata,
+                cp_context.q_cu_seqlens_tensor,
+                cp_context.segment_kv_seq_lens_tensor,
+                block_table=self._segment_block_table(block_table, cp_context),
+            )
+            local_output = torch.zeros_like(q_latent)
+            local_output.index_copy_(0, query_index, output)
+            return local_output
+
         self._impl._record_query_gather_context(q_latent, q_pe, attn_metadata)
         return self._impl._execute_sparse_flash_attention_process(
             q_latent,

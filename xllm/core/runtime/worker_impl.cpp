@@ -2126,7 +2126,8 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
       static_cast<int64_t>(options.block_size()) * kv_split_size;
   if (parallel_args_.cp_size() > 1 &&
       (!Platform::is_npu() || args.model_type() != "glm_moe_dsa" ||
-       !args.enable_mla() || kv_split_size != 1 ||
+       !args.enable_mla() || kv_split_size <= 0 ||
+       parallel_args_.cp_size() % kv_split_size != 0 ||
        parallel_args_.dp_size() != 1 ||
        parallel_args_.layerwise_split_size() != 1 ||
        parallel_args_.tp_group_ == nullptr ||
@@ -2138,20 +2139,20 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
          options.enable_adaptive_speculative_decode())))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
-        "Task pipeline prefill CP requires an NPU GLM DSA target, replicated "
-        "KV caches, DP/layerwise sizes of one, orthogonal TP/CP groups and "
+        "Task pipeline prefill CP requires an NPU GLM DSA target, KV split "
+        "dividing CP, DP/layerwise sizes of one, orthogonal TP/CP groups and "
         "ordinary or fixed MTP decoding.");
   }
   if (kv_split_size > 1 &&
       (args.model_type() != "glm_moe_dsa" || !args.enable_mla() ||
-       parallel_args_.cp_size() != 1 || parallel_args_.dp_size() != 1 ||
+       parallel_args_.dp_size() != 1 ||
        parallel_args_.layerwise_split_size() != 1 ||
        (options.enable_speculative_decode() &&
         !SpeculativeConfig::is_mtp_algorithm(
             options.speculative_algorithm())))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
-        "Task pipeline DCP requires a GLM DSA target with CP/DP/layerwise "
+        "Task pipeline DCP requires a GLM DSA target with DP/layerwise "
         "sizes of one and ordinary or fixed MTP decoding.");
   }
   if (positions <= 0 || positions > std::numeric_limits<int32_t>::max() ||

@@ -17,6 +17,7 @@ from __future__ import annotations
 import torch
 
 from xllm.python.attention.backend import AttentionMetadata
+from xllm.python.attention.expanded_decode_metadata import resolve_expanded_decode_metadata
 from xllm.python.model_executor.cp_utils import build_cp_context
 from xllm.python.model_executor.forward_context import (
     ForwardContext,
@@ -68,11 +69,12 @@ class EagerRunner(BaseRunner):
         is_dummy = bool(getattr(metadata, "is_dummy", False))
         # Speculative verification can carry chunked-prefill metadata, but its
         # rows already describe the global verification batch. Keep it on the
-        # same replicated-cache path as decode, including eager graph misses.
+        # same attention path as decode, including DCP and eager graph misses.
         use_cp_context = (
             not is_dummy
             and self.cp_size > 1
             and not metadata.is_spec_verify
+            and resolve_expanded_decode_metadata(metadata) is None
             and (metadata.is_prefill or (is_mla and metadata.is_chunked_prefill))
         )
         if use_cp_context and is_mla and metadata.is_mixed:
