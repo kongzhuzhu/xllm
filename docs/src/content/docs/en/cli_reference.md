@@ -181,7 +181,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 |:----------|:-----|:--------|:------------|
 | `draft_model` | `string` | `""` | Draft model path. See [MTP](/en/features/mtp/) for MTP usage. |
 | `num_speculative_tokens` | `int32` | `0` | Number of speculative tokens generated per speculative decoding step. |
-| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding algorithm. Supported values: `MTP`, `Eagle3`, `Suffix`, `DFlash`, `DSpark`. |
+| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding algorithm. Supported values: `MTP`, `Eagle3`, `Suffix`, `DFlash`, `DFlash2` (NPU only), `DSpark`. |
 | `speculative_suffix_cache_max_depth` | `int32` | `64` | Maximum suffix-tree depth for suffix speculative decoding. |
 | `speculative_suffix_max_spec_factor` | `double` | `1.0` | Maximum suffix speculation token factor relative to match length. |
 | `speculative_suffix_max_spec_offset` | `double` | `0.0` | Maximum additive token offset for suffix speculation. |
@@ -212,6 +212,7 @@ xLLM uses gflags to manage service startup parameters. `--model <PATH>` is the o
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
 | `enable_graph` | `bool` | `false` | Whether to enable graph execution for the decode phase to reduce kernel-launch overhead and device idle time. Supports CUDA Graph, ACL Graph (NPU), MLU Graph, and DCU Graph. See [Graph Mode](/en/features/graph_mode/). |
+| `enable_unified_mtp_graph` | `bool` | `false` | Route supported NPU speculative decode requests through a unified Python graph. Supports GLM DSA MTP and `DFlash`/`DFlash2`/`DSpark` with a GLM DSA target model. Requires `enable_graph=true`; `DFlash`/`DFlash2`/`DSpark` also require `enable_task_pipeline=true`. Disabling this flag leaves ordinary model graph execution unchanged. |
 | `enable_graph_double_buffer` | `bool` | `true` | Whether to enable double-buffered ACL graph persistent params and graph instances for NPU schedule-overlap decode. |
 | `enable_graph_mode_decode_no_padding` | `bool` | `false` | Whether decode graph capture uses the actual `num_tokens` instead of a padded shape. |
 | `enable_prefill_piecewise_graph` | `bool` | `false` | Whether to enable piecewise CUDA graph for the prefill phase. Attention runs in eager mode while other operations are captured in CUDA graphs. |

@@ -21,14 +21,17 @@ limitations under the License.
 #include <array>
 #include <limits>
 
+#include "core/common/metrics.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/dflash2_sampling.h"
+#include "core/framework/sampling/dspark_sampling.h"
 #include "core/framework/sampling/gumbel_sampling.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "core/runtime/decode_graph_bucket.h"
+#include "core/runtime/py_executor_impl.h"
 #include "core/runtime/task_execution_pipeline.h"
 
 namespace xllm {
@@ -176,6 +179,30 @@ uint64_t state_bytes(const MtpContextTensors& state) {
 }
 
 }  // namespace
+
+bool supports_unified_block_graph(const SpeculativeTaskCapacity& capacity,
+                                  uint32_t rows,
+                                  const LlmForwardInput& input) {
+  const auto& sampling = input.sampling_params;
+  return capacity.unified_graph && capacity.kind != SpeculativeTaskKind::MTP &&
+         rows > 0 &&
+         static_cast<uint64_t>(rows) *
+                 (static_cast<uint64_t>(capacity.num_speculative_tokens) + 1) <=
+             capacity.common.max_graph_batch_size &&
+         input.input_params.meta.batch_forward_type.is_decode() &&
+         !input.input_params.meta.is_graph_warmup &&
+         input.json_object_states.empty() &&
+         input.input_params.multi_block_tables.empty() &&
+         sampling.all_greedy_sample && !sampling.use_beam_search &&
+         !sampling.logprobs && !sampling.return_probs &&
+         !sampling.temperatures.defined() && !sampling.top_k.defined() &&
+         !sampling.top_p.defined() && !sampling.min_p.defined() &&
+         !sampling.logits_bias.defined() &&
+         !sampling.frequency_penalties.defined() &&
+         !sampling.presence_penalties.defined() &&
+         !sampling.repetition_penalties.defined() &&
+         !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined();
+}
 
 Status TaskExecutionPipeline::create(
     ThreadPool& state_executor,
@@ -1109,6 +1136,8 @@ Status TaskExecutionPipeline::prepare_speculative(
                                    input.sampling_params.logprobs);
   CHECK(status.ok()) << status.message();
   slot.is_warmup = input.input_params.meta.is_graph_warmup;
+  slot.unified_graph =
+      supports_unified_block_graph(*speculative_capacity_, slot.rows, input);
   if (speculative_capacity_->common.dp_size > 1) {
     VLOG(1)
         << "MTP DP task batch=" << batch.batch_id
@@ -1411,6 +1440,9 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
 void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   context_gather(*slot.state);
   apply_bootstrap(slot);
+  if (launch_unified_block(slot)) {
+    return;
+  }
   const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
   if (block_draft()) {
     launch_block_draft(slot);
@@ -1545,6 +1577,34 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   context_publish(*slot.state);
 }
 
+bool TaskExecutionPipeline::launch_unified_block(SpeculativeSlot& slot) {
+  if (!slot.unified_graph) {
+    return false;
+  }
+  auto& draft = *slot.drafts.front()->input;
+  auto& target = *slot.validate_input;
+  SlotBuffer::patch_mtp_decode(draft, *slot.state);
+  SlotBuffer::patch_mtp_decode(target, *slot.state);
+  const auto& result = slot.target_prefill->device_result();
+  slot.target_output.aux_hidden_states =
+      executor_.python_impl()->run_unified_block(
+          *draft_->executor.python_impl(),
+          target,
+          draft,
+          result,
+          speculative_capacity_->kind == SpeculativeTaskKind::DSPARK,
+          capacity_.sampling_group);
+  const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
+  context_advance(*slot.state,
+                  result.tokens,
+                  result.lengths,
+                  slot.target_output.aux_hidden_states.view(
+                      {slot.rows, width, context_hidden_size()}));
+  context_publish(*slot.state);
+  COUNTER_INC(speculative_unified_graph_executions_total);
+  return true;
+}
+
 void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
   auto& invocation = *slot.drafts.front();
   SlotBuffer::patch_mtp_decode(*invocation.input, *slot.state);
@@ -1595,43 +1655,22 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
     slot.proposal.copy_(sampled.token_ids);
     invocation.sampled.probs = std::move(sampled.dense_probs);
   } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
-    // DSpark's proposals form a Markov chain: row zero predicts from the
-    // anchor, and each later row consumes the preceding sampled proposal.
-    selector_sampling.logprobs = false;
-    selector_sampling.max_top_logprobs = 0;
-    selector_sampling.use_beam_search = false;
-    selector_sampling.selected_token_idxes =
-        prefix(slot.draft_sample_indices, /*rows=*/0);
-    selector_sampling.sample_idxes = selector_sampling.selected_token_idxes;
-    selector_sampling.return_probs =
-        speculative_capacity_->draft_sampling_mode ==
-            DraftSamplingMode::PROBABILISTIC &&
-        !selector_sampling.all_greedy_sample;
-    const auto base_logits = invocation.logits.view(
-        {slot.rows, steps, speculative_capacity_->common.vocab_size});
-    auto previous_tokens = slot.state->tokens_;
-    std::vector<torch::Tensor> probabilities;
-    if (selector_sampling.return_probs) {
-      probabilities.reserve(steps);
-    }
-    for (int64_t step = 0; step < steps; ++step) {
-      const auto bias = draft_->model.dspark_markov_bias(previous_tokens);
-      CHECK(bias.sizes() == base_logits.select(1, step).sizes());
-      auto step_logits = base_logits.select(1, step) + bias;
-      auto sampled = sampler_.forward(step_logits, selector_sampling);
-      // Reuse the existing consensus policy. Greedy TP logits are already
-      // replicated; random/CP proposals must agree before the next lookup.
-      synchronize_tokens(sampled.next_tokens,
-                         selector_sampling.all_greedy_sample);
-      slot.proposal.select(1, step).copy_(sampled.next_tokens);
-      previous_tokens = sampled.next_tokens;
-      if (selector_sampling.return_probs) {
-        probabilities.emplace_back(std::move(sampled.probs));
-      }
-    }
-    invocation.sampled.probs = selector_sampling.return_probs
-                                   ? torch::stack(probabilities, /*dim=*/1)
-                                   : torch::Tensor();
+    auto sampled = sample_dspark_block(
+        invocation.logits.view(
+            {slot.rows, steps, speculative_capacity_->common.vocab_size}),
+        slot.state->tokens_.to(torch::kInt64),
+        selector_sampling,
+        /*need_draft_probs=*/speculative_capacity_->draft_sampling_mode ==
+                DraftSamplingMode::PROBABILISTIC &&
+            !selector_sampling.all_greedy_sample,
+        [this](const torch::Tensor& previous) {
+          return draft_->model.dspark_markov_bias(previous);
+        },
+        [this, &selector_sampling](torch::Tensor& tokens) {
+          synchronize_tokens(tokens, selector_sampling.all_greedy_sample);
+        },
+        slot.proposal);
+    invocation.sampled.probs = sampled.draft_probs().value_or(torch::Tensor());
   } else {
     invocation.sampled = sample(*invocation.sampling, invocation.logits);
     slot.proposal.copy_(

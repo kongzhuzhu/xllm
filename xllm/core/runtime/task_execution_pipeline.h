@@ -93,6 +93,7 @@ struct SpeculativeTaskCapacity {
   bool reuse_topk = false;
   DraftSamplingMode draft_sampling_mode = DraftSamplingMode::GREEDY;
   bool fused_rejection = false;
+  bool unified_graph = false;
 };
 
 struct MtpContextStorage;
@@ -300,6 +301,7 @@ class TaskExecutionPipeline final {
   void launch_empty_shard(SpeculativeSlot& slot);
   void launch_prefill(SpeculativeSlot& slot);
   void launch_decode(SpeculativeSlot& slot);
+  bool launch_unified_block(SpeculativeSlot& slot);
   void launch_block_draft(SpeculativeSlot& slot);
   void write_block_context(SpeculativeSlot& slot, bool prefill);
   void synchronize_samples(const TokenResultTensors& result);

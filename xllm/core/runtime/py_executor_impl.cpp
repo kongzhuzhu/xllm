@@ -32,10 +32,12 @@ limitations under the License.
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
+#include "core/runtime/slot_buffer.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
 #include "models/vlm/utils/multimodal_utils.h"
@@ -192,6 +194,11 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
+  if (block_graph_registry_ && Py_IsInitialized()) {
+    py::gil_scoped_acquire gil;
+    block_graph_registry_.attr("close")();
+  }
+  clear_python_object(block_graph_registry_);
   if (PyCausalLM::active_instance() == py_causal_lm_) {
     PyCausalLM::set_active_instance(nullptr);
   }
@@ -257,6 +264,60 @@ py::object PyExecutorImpl::create_mtp_graph_variant_registry(
                                   const torch::Tensor& slots) {
             return mtp_sparse_attention_metadata_view(table, lengths, slots);
           }));
+}
+
+torch::Tensor PyExecutorImpl::run_unified_block(
+    PyExecutorImpl& draft_executor,
+    SlotBuffer& target,
+    SlotBuffer& draft,
+    const TokenResultTensors& result,
+    bool dspark,
+    ProcessGroup* sampling_group) {
+#if defined(USE_NPU)
+  py::gil_scoped_acquire gil;
+  if (!block_graph_registry_) {
+    auto module = py::module_::import(
+        "xllm.python.model_executor.runners.unified_block_acl_graph");
+    block_graph_registry_ = module.attr("UnifiedBlockGraphRegistry")(
+        py_executor_,
+        draft_executor.py_executor_,
+        py::cpp_function(
+            [this]() { PyCausalLM::set_active_instance(py_causal_lm_); }),
+        py::cpp_function([model = draft_executor.py_causal_lm_]() {
+          PyCausalLM::set_active_instance(model);
+        }),
+        py::cpp_function([sampling_group](torch::Tensor tokens) {
+          if (sampling_group != nullptr && sampling_group->world_size() > 1) {
+            sampling_group->broadcast(tokens, /*root_rank=*/0);
+          }
+        }),
+        py::cpp_function(
+            [device_index = device_.index()](const py::object& runner) {
+              py::gil_scoped_release release;
+              auto& capture_lock =
+                  npu::DeviceCaptureLock::get_instance().get_lock(device_index);
+              std::lock_guard<std::mutex> lock(capture_lock);
+              py::gil_scoped_acquire acquire;
+              runner.attr("capture")();
+            }));
+  }
+  const auto binding = [](SlotBuffer& input) {
+    return py::make_tuple(
+        input.tokens(),
+        input.positions(),
+        input.model_params().python_attention_metadata->value());
+  };
+  return block_graph_registry_
+      .attr("execute")(binding(target),
+                       binding(draft),
+                       result.tokens,
+                       result.lengths,
+                       dspark)
+      .cast<torch::Tensor>();
+#else
+  LOG(FATAL) << "Unified block graphs require NPU.";
+  return {};
+#endif
 }
 
 void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {

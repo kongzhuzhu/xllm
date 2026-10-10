@@ -37,9 +37,10 @@ DEFINE_bool(
 DEFINE_bool(
     enable_unified_mtp_graph,
     false,
-    "Whether to route supported NPU MTP decode requests through the unified "
-    "Python graph path. When disabled, MTP uses the legacy ACL graph/decode "
-    "route while ordinary graph execution remains enabled.");
+    "Whether to route supported NPU speculative decode requests through a "
+    "unified Python graph. Supports GLM MTP and task-pipeline "
+    "DFlash/DFlash2/DSpark. "
+    "When disabled, ordinary model graph execution remains unchanged.");
 
 DEFINE_bool(disable_graph_warmup,
             false,

@@ -36,6 +36,55 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+TEST(UnifiedBlockAdmissionTest, HonorsGraphSwitchAndExpandedBatchLimit) {
+  SpeculativeTaskCapacity capacity;
+  capacity.kind = SpeculativeTaskKind::DSPARK;
+  capacity.unified_graph = true;
+  capacity.num_speculative_tokens = 8;
+  LlmForwardInput input;
+  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  // Worker task_capacity leaves max_graph_batch_size zero if
+  // enable_graph=false.
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+  capacity.common.max_graph_batch_size = 8 * 9;
+  EXPECT_TRUE(supports_unified_block_graph(capacity, 8, input));
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 9, input));
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 0, input));
+  EXPECT_FALSE(supports_unified_block_graph(
+      capacity, std::numeric_limits<uint32_t>::max(), input));
+  capacity.unified_graph = false;
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+}
+
+TEST(UnifiedBlockAdmissionTest, RejectsNonGreedyAndTransformedRequests) {
+  SpeculativeTaskCapacity capacity;
+  capacity.kind = SpeculativeTaskKind::DFLASH2;
+  capacity.unified_graph = true;
+  capacity.num_speculative_tokens = 7;
+  capacity.common.max_graph_batch_size = 8;
+  LlmForwardInput input;
+  input.input_params.meta.batch_forward_type = BatchForwardType::DECODE;
+  EXPECT_TRUE(supports_unified_block_graph(capacity, 1, input));
+  input.sampling_params.logprobs = true;
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+  input.sampling_params.logprobs = false;
+  input.sampling_params.all_greedy_sample = false;
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+  input.sampling_params.all_greedy_sample = true;
+  for (auto* transform : {&input.sampling_params.top_k,
+                          &input.sampling_params.min_p,
+                          &input.sampling_params.logits_bias}) {
+    *transform = torch::tensor({1});
+    EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+    *transform = torch::Tensor();
+  }
+  input.input_params.meta.is_graph_warmup = true;
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+  input.input_params.meta.is_graph_warmup = false;
+  input.input_params.meta.batch_forward_type = BatchForwardType::PREFILL;
+  EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
+}
+
 // Encode the consumed token in the hidden state. The real pipeline must patch
 // draft inputs and publish accepted context correctly to keep counting upward.
 class CountingModel final : public CausalLM {
@@ -100,7 +149,9 @@ class CountingModel final : public CausalLM {
       const torch::Tensor& previous_tokens) override {
     markov_inputs.emplace_back(previous_tokens.clone());
     auto bias = torch::full({previous_tokens.numel(), 32}, -100.0, options_);
-    bias.scatter_(1, (previous_tokens + markov_increment).view({-1, 1}), 100.0);
+    const int64_t increment = markov_increments[(markov_inputs.size() - 1) %
+                                                markov_increments.size()];
+    bias.scatter_(1, (previous_tokens + increment).view({-1, 1}), 100.0);
     return bias;
   }
 
@@ -114,7 +165,7 @@ class CountingModel final : public CausalLM {
 
   std::atomic<int32_t> logits_calls{0};
   bool block_draft = false;
-  int64_t markov_increment = 1;
+  std::vector<int64_t> markov_increments{1};
   std::vector<torch::Tensor> markov_inputs;
   std::vector<torch::Tensor> forward_inputs;
   std::vector<torch::Tensor> forward_positions;
@@ -1053,6 +1104,56 @@ TEST_F(SpeculativePipelineTest,
                            torch::tensor({{4, 5, 6}}, torch::kInt64)));
 }
 
+TEST_F(SpeculativePipelineTest, DSparkPartialAcceptanceAdvancesAcrossTwoSlots) {
+  capacity_.kind = SpeculativeTaskKind::DSPARK;
+  capacity_.common.model.max_sequences = 1;
+  capacity_.common.slot_count = 2;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  draft_->block_draft = true;
+  draft_->markov_increments = {1, 2};
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  execute(input(false));
+  // Keep both results unconsumed while submitting, so the second task must
+  // use Slot 1 and consume Slot 0's device-published accepted context.
+  const auto first_submission = pipeline_->submit(input(true));
+  ASSERT_TRUE(first_submission.status.ok());
+  const auto second_submission =
+      pipeline_->submit(input(true, /*token=*/-1, /*position=*/3));
+  ASSERT_TRUE(second_submission.status.ok());
+  auto first_result =
+      pipeline_->take_result_async(first_submission.task_id).get();
+  auto second_result =
+      pipeline_->take_result_async(second_submission.task_id).get();
+  ASSERT_TRUE(first_result.status.ok());
+  ASSERT_TRUE(second_result.status.ok());
+  const auto& first = first_result.output;
+  const auto& second = second_result.output;
+  ASSERT_EQ(draft_->forward_inputs.size(), 2U);
+  ASSERT_EQ(draft_->context_slots.size(), 3U);
+  EXPECT_TRUE(torch::equal(first.sample_output.next_tokens,
+                           torch::tensor({{4, 5, -1}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs.front().cpu(),
+                           torch::tensor({3, 0}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(draft_->context_slots[1].cpu(),
+                           torch::tensor({2, 3, -1}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(second.sample_output.next_tokens,
+                           torch::tensor({{6, 7, -1}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs.back().cpu(),
+                           torch::tensor({5, 0}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(draft_->forward_positions.back().cpu(),
+                           torch::tensor({4, 5}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(draft_->context_slots.back().cpu(),
+                           torch::tensor({4, 5, -1}, torch::kInt32)));
+  const auto reused = execute(input(true, /*token=*/-1, /*position=*/4));
+  EXPECT_TRUE(torch::equal(reused.sample_output.next_tokens,
+                           torch::tensor({{8, 9, -1}}, torch::kInt64)));
+  // Reusing Slot 0 must not overwrite its already consumed result.
+  EXPECT_TRUE(torch::equal(first.sample_output.next_tokens,
+                           torch::tensor({{4, 5, -1}}, torch::kInt64)));
+}
+
 TEST_F(SpeculativePipelineTest,
        DSparkGraphWarmupPlansDraftBindingsOnlyForDecode) {
   capacity_.kind = SpeculativeTaskKind::DSPARK;
@@ -1151,7 +1252,7 @@ TEST_F(SpeculativePipelineTest,
   capacity_.context_hidden_size = 2;
   capacity_.mask_token_id = 0;
   draft_->block_draft = true;
-  draft_->markov_increment = 2;
+  draft_->markov_increments = {2};
   create();
   execute(input(false));
   const auto rejected = execute(input(true));

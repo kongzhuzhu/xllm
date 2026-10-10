@@ -20,6 +20,7 @@ cc_library(
   NAME 
     sampler
   HDRS
+    dspark_sampling.h
     dflash2_sampling.h
     draft_proposal.h
     draft_sampling_mode.h
@@ -32,6 +33,7 @@ cc_library(
     beam_searcher.h
     rec_constrained_decoding.h
   SRCS
+    dspark_sampling.cpp
     dflash2_sampling.cpp
     sampling_params.cpp
     logits_utils.cpp

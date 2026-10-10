@@ -181,7 +181,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 |:---------|:-----|:-------|:---------|
 | `draft_model` | `string` | `""` | draft 模型路径；MTP 使用方式详见 [MTP](/zh/features/mtp/)。 |
 | `num_speculative_tokens` | `int32` | `0` | 每轮 speculative decoding 生成的 speculative token 数。 |
-| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding 算法，支持 `MTP`、`Eagle3`、`Suffix`、`DFlash`、`DSpark`。 |
+| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding 算法，支持 `MTP`、`Eagle3`、`Suffix`、`DFlash`、`DFlash2`（仅 NPU）、`DSpark`。 |
 | `speculative_suffix_cache_max_depth` | `int32` | `64` | Suffix speculative decoding 的后缀树最大深度。 |
 | `speculative_suffix_max_spec_factor` | `double` | `1.0` | Suffix speculation 相对于匹配长度的最大 token 系数。 |
 | `speculative_suffix_max_spec_offset` | `double` | `0.0` | Suffix speculation 的最大 token 加性偏移。 |
@@ -212,6 +212,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | 参数名称 | 类型 | 默认值 | 参数含义 |
 |:---------|:-----|:-------|:---------|
 | `enable_graph` | `bool` | `false` | 是否在 decode 阶段启用图执行以降低 kernel launch 开销和设备空闲时间；支持 CUDA Graph、ACL Graph（NPU）、MLU Graph 和 DCU Graph，详见 [图执行](/zh/features/graph_mode/)。 |
+| `enable_unified_mtp_graph` | `bool` | `false` | 将支持的 NPU speculative decode 请求交由统一 Python graph 执行。支持 GLM DSA MTP，以及以 GLM DSA 为目标模型的 `DFlash`/`DFlash2`/`DSpark`。要求 `enable_graph=true`；`DFlash`/`DFlash2`/`DSpark` 还要求 `enable_task_pipeline=true`。关闭此开关不影响普通模型的图执行。 |
 | `enable_graph_double_buffer` | `bool` | `true` | 是否为 NPU schedule-overlap decode 启用双缓冲 ACL graph 持久化参数与 graph 实例。 |
 | `enable_graph_mode_decode_no_padding` | `bool` | `false` | decode 阶段是否按实际 `num_tokens` 捕获 graph，而不是按 padding 后 shape 捕获。 |
 | `enable_prefill_piecewise_graph` | `bool` | `false` | 是否在 prefill 阶段启用 piecewise CUDA graph；attention 使用 eager 模式，其他操作捕获进 CUDA graph。 |

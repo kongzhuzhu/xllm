@@ -411,6 +411,15 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
   capacity.common.sampling_group = spec_broadcast_group(parallel_args_);
   capacity.draft_sampling_mode = draft_sampling_mode_;
   capacity.fused_rejection = enable_fused_kernel_;
+  capacity.unified_graph =
+      Platform::is_npu() && options_.enable_graph() &&
+      ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
+      impl_->context_.get_model_args().model_type() == "glm_moe_dsa" &&
+      (draft_args.model_type() == "DFlashDraftModel" ||
+       is_dflash2_draft_model_type(draft_args.model_type()) ||
+       draft_args.model_type() == "DSparkDraftModel") &&
+      parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
+      parallel_args_.kv_split_size_effective() == 1;
   status = TaskExecutionPipeline::create(threadpool_,
                                          impl_->task_model(),
                                          draft_impl_->task_model(),

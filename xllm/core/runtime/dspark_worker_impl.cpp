@@ -22,9 +22,9 @@ limitations under the License.
 #include <utility>
 
 #include "common/metrics.h"
+#include "core/framework/sampling/dspark_sampling.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "framework/parallel_state/process_group.h"
-#include "framework/sampling/sampler.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/timer.h"
 
@@ -141,20 +141,9 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
     const torch::Tensor& last_hidden,
     const torch::Tensor& anchor_token_ids,
     const SamplingParameters& sampling_params) const {
-  CHECK_EQ(base_logits.dim(), 3)
-      << "DSpark base_logits must be [num_reqs, n_spec, draft_vocab].";
-  CHECK_EQ(anchor_token_ids.dim(), 1)
-      << "DSpark anchor_token_ids must be [num_reqs].";
-  CHECK_EQ(anchor_token_ids.size(0), base_logits.size(0))
-      << "DSpark anchor token batch must match base_logits.";
-  CHECK_EQ(anchor_token_ids.scalar_type(), torch::kLong)
-      << "DSpark anchor_token_ids must use int64.";
-  CHECK_EQ(anchor_token_ids.device(), base_logits.device())
-      << "DSpark anchor_token_ids and base_logits must share a device.";
-
-  const int64_t num_reqs = base_logits.size(/*dim=*/0);
-  const int64_t num_speculative_tokens = base_logits.size(/*dim=*/1);
-  const int64_t draft_vocab_size = base_logits.size(/*dim=*/2);
+  CHECK_EQ(base_logits.dim(), 3);
+  const int64_t num_reqs = base_logits.size(0);
+  const int64_t num_speculative_tokens = base_logits.size(1);
   const bool with_confidence =
       last_hidden.defined() && draft_impl_->has_dspark_confidence_head();
   if (with_confidence) {
@@ -167,54 +156,19 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
   }
   const bool need_draft_probs = draft_probs_required(
       draft_sampling_mode_, sampling_params.all_greedy_sample);
-  SamplingParameters step_sampling_params = sampling_params;
-  const torch::TensorOptions index_options =
-      torch::TensorOptions().dtype(torch::kInt).device(base_logits.device());
-  step_sampling_params.selected_token_idxes = torch::empty({0}, index_options);
-  step_sampling_params.sample_idxes = torch::empty({0}, index_options);
-  step_sampling_params.return_probs = need_draft_probs;
-  step_sampling_params.logprobs = false;
-  step_sampling_params.max_top_logprobs = 0;
-  step_sampling_params.use_beam_search = false;
-
-  torch::Tensor token_ids = torch::empty(
-      {num_reqs, num_speculative_tokens},
-      torch::TensorOptions().dtype(torch::kLong).device(base_logits.device()));
-  std::vector<torch::Tensor> probs_steps;
-  if (need_draft_probs) {
-    probs_steps.reserve(num_speculative_tokens);
-  }
-  // Filled after the sample loop by a single batched ConfidenceHead call; stays
-  // undefined when confidence is disabled.
+  auto proposal = sample_dspark_block(
+      base_logits,
+      anchor_token_ids,
+      sampling_params,
+      need_draft_probs,
+      [this](const torch::Tensor& previous) {
+        return draft_impl_->dspark_markov_bias(previous);
+      },
+      [this, &sampling_params](torch::Tensor& tokens) {
+        synchronize_sampled_token_ids(tokens, sampling_params);
+      });
+  const auto& token_ids = proposal.token_ids();
   torch::Tensor confidence_probs;
-
-  using ISlice = torch::indexing::Slice;
-  Sampler sampler;
-  torch::Tensor previous_token_ids = anchor_token_ids;
-  for (int64_t token_idx = 0; token_idx < num_speculative_tokens; ++token_idx) {
-    torch::Tensor markov_bias =
-        draft_impl_->dspark_markov_bias(previous_token_ids);
-    CHECK_EQ(markov_bias.dim(), 2)
-        << "DSpark Markov bias must be [num_reqs, draft_vocab].";
-    CHECK_EQ(markov_bias.size(0), num_reqs)
-        << "DSpark Markov bias batch must match base_logits.";
-    CHECK_EQ(markov_bias.size(1), draft_vocab_size)
-        << "DSpark reduced-vocab drafts need draft-to-target remapping, not "
-           "yet implemented.";
-
-    torch::Tensor step_logits =
-        base_logits.select(/*dim=*/1, /*index=*/token_idx) + markov_bias;
-    SampleOutput sample_output =
-        sampler.forward(step_logits, step_sampling_params);
-    torch::Tensor sampled_token_ids = sample_output.next_tokens;
-    synchronize_sampled_token_ids(sampled_token_ids, step_sampling_params);
-
-    token_ids.index_put_({ISlice(), token_idx}, sampled_token_ids);
-    if (need_draft_probs) {
-      probs_steps.emplace_back(std::move(sample_output.probs));
-    }
-    previous_token_ids = sampled_token_ids;
-  }
 
   // ConfidenceHead over the whole block, batched. Equivalent to computing it
   // per step inside the loop on (last_hidden[:, k], prev_k) — prev_k is the
@@ -236,10 +190,7 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
         << "batched confidence probs n_spec mismatch";
   }
 
-  return {need_draft_probs ? DraftProposal(std::move(token_ids),
-                                           torch::stack(probs_steps, /*dim=*/1))
-                           : DraftProposal(std::move(token_ids)),
-          std::move(confidence_probs)};
+  return {std::move(proposal), std::move(confidence_probs)};
 }
 
 void DSparkWorkerImpl::synchronize_sampled_token_ids(

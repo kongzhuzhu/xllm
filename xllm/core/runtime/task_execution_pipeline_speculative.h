@@ -19,6 +19,11 @@ limitations under the License.
 
 namespace xllm {
 
+// Admission occurs before any graph execution mutates the task state.
+bool supports_unified_block_graph(const SpeculativeTaskCapacity& capacity,
+                                  uint32_t rows,
+                                  const LlmForwardInput& input);
+
 struct MtpContextTensors {
   torch::Tensor previous_tokens;
   torch::Tensor hidden;
@@ -106,6 +111,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   bool run_models = false;
   torch::Tensor dummy_hidden;
   bool is_warmup = false;
+  bool unified_graph = false;
   uint32_t rows = 0;
   uint32_t samples = 0;
   uint32_t model_tokens = 0;

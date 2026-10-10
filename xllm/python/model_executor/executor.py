@@ -176,23 +176,25 @@ def _configure_unified_mtp_graph(model: nn.Module, enabled: bool) -> None:
 
 
 def _unified_mtp_graph_enabled(config: dict) -> bool:
-    """Return whether this executor is one side of GLM's Unified MTP pair.
+    """Select GLM roles participating in a Unified speculative graph.
 
     The draft executor deliberately keeps ``num_speculative_tokens == 0``;
     that is its existing runtime contract, so executor width alone cannot be
     used to decide whether the MTP model should receive the Unified setting.
-    Ordinary non-MTP executors must remain unaffected by the process-wide
-    Unified flag.
+    DFlash/DFlash2/DSpark use GLM only on the target side and require native task Slots.
     """
     if not bool(config.get("enable_unified_mtp_graph", False)):
         return False
-    if str(config.get("speculative_algorithm", "mtp")).lower() != "mtp":
+    algorithm = str(config.get("speculative_algorithm", "mtp")).lower()
+    if algorithm not in ("mtp", "dflash", "dflash2", "dspark"):
+        return False
+    if algorithm != "mtp" and not (config.get("enable_task_pipeline", False) and config.get("enable_graph", False)):
         return False
 
     model_type = config.get("model_type")
     is_draft_engine = bool(config.get("is_draft_engine", False))
     if model_type == "glm_moe_dsa_mtp":
-        return is_draft_engine
+        return is_draft_engine and algorithm == "mtp"
     return model_type == "glm_moe_dsa" and not is_draft_engine and int(config.get("num_speculative_tokens", 0)) > 0
 
 

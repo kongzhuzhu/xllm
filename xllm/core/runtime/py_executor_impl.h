@@ -32,6 +32,9 @@ limitations under the License.
 namespace xllm {
 
 class PyCausalLM;
+class SlotBuffer;
+class ProcessGroup;
+struct TokenResultTensors;
 
 class __attribute__((visibility("hidden"))) PyExecutorImpl final
     : public ExecutorImpl {
@@ -69,6 +72,13 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
       PyExecutorImpl& draft_executor,
       int32_t max_variants);
 
+  torch::Tensor run_unified_block(PyExecutorImpl& draft_executor,
+                                  SlotBuffer& target,
+                                  SlotBuffer& draft,
+                                  const TokenResultTensors& result,
+                                  bool dspark,
+                                  ProcessGroup* sampling_group);
+
  private:
   // Caller holds the GIL. First binding occurs on Prepare for pipeline input.
   void bind_kv_caches(std::vector<KVCache>& kv_caches);
@@ -80,6 +90,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   bool enable_mla_ = false;
 
   pybind11::object py_executor_;
+  pybind11::object block_graph_registry_;
   bool supports_prepared_metadata_ = false;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;

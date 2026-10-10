@@ -9,6 +9,7 @@ cc_test(
   NAME
     sampler_test
   SRCS
+    dspark_sampling_test.cpp
     dflash2_sampling_test.cpp
     gumbel_sampling_test.cpp
     rejection_sampler_test.cpp
