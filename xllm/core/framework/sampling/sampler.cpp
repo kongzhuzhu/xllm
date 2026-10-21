@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 
 #if defined(USE_NPU)
@@ -61,6 +62,21 @@ void Sampler::apply_sampling_penalties(torch::Tensor& logits,
                                        const SamplingParameters& params) {
   if (params.logits_bias.defined()) {
     logits.add_(params.logits_bias);
+  }
+  if (params.min_token_ids.defined()) {
+    CHECK(params.min_tokens_remaining.defined());
+    CHECK_EQ(params.min_token_ids.dim(), 2);
+    CHECK_EQ(params.min_token_ids.size(0), logits.size(0));
+    CHECK_EQ(params.min_tokens_remaining.numel(), logits.size(0));
+    const auto& ids = params.min_token_ids;
+    const auto active = torch::logical_and(
+        ids.ge(0), params.min_tokens_remaining.gt(0).unsqueeze(1));
+    const auto bias =
+        torch::zeros(ids.sizes(), logits.options())
+            .masked_fill(active, -std::numeric_limits<float>::infinity());
+    // Additive scatter keeps a real stop id 0 blocked even when padding also
+    // maps to index 0. Scatter assignment would race and could restore EOS.
+    logits.scatter_add_(/*dim=*/1, ids.clamp_min(0), bias);
   }
   // Apply repetition before frequency and presence penalties.
   if (params.repetition_penalties.defined()) {

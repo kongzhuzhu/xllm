@@ -43,4 +43,36 @@ TEST(SamplingParamsTest, NormalizesGreedyAndSmallTemperatureRows) {
   EXPECT_FALSE(params.sampling_mode == SamplingMode::GREEDY);
 }
 
+TEST(SamplingParamsTest, MinimumConstraintsExpandForVerifyAndStayOffDrafts) {
+  SamplingParameters params;
+  params.selected_token_idxes = torch::arange(2, torch::kInt32);
+  params.min_token_positions = torch::tensor({100, 200}, torch::kInt64);
+  params.min_tokens_remaining = torch::tensor({3, 4}, torch::kInt64);
+  params.min_token_ids = torch::tensor({{7, -1}, {8, 9}}, torch::kInt64);
+  EXPECT_TRUE(params.has_sampling_fields());
+  expand_sampling_params_for_verify(params,
+                                    /*repeats=*/3,
+                                    /*total_num_val_tokens=*/6,
+                                    torch::Device(torch::kCPU));
+  EXPECT_TRUE(torch::equal(
+      params.min_token_positions,
+      torch::tensor({100, 100, 100, 200, 200, 200}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(params.min_tokens_remaining,
+                           torch::tensor({3, 3, 3, 4, 4, 4}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(
+      params.min_token_ids,
+      torch::tensor({{7, -1}, {7, -1}, {7, -1}, {8, 9}, {8, 9}, {8, 9}},
+                    torch::kInt64)));
+  for (const DraftSamplingMode mode :
+       {DraftSamplingMode::GREEDY, DraftSamplingMode::PROBABILISTIC}) {
+    SamplingParameters draft = params;
+    prepare_draft_sampling(mode, draft);
+    EXPECT_FALSE(draft.min_token_positions.defined());
+    EXPECT_FALSE(draft.min_tokens_remaining.defined());
+    EXPECT_FALSE(draft.min_token_ids.defined());
+    EXPECT_FALSE(draft.has_sampling_fields());
+  }
+  EXPECT_TRUE(params.min_token_ids.defined());
+}
+
 }  // namespace xllm

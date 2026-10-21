@@ -2721,6 +2721,9 @@ inline void deserialize_forward_input_payload(
     read_tensor(context, sampling_params.top_p, stream);
     read_tensor(context, sampling_params.min_p, stream);
     read_tensor(context, sampling_params.logits_bias, stream);
+    read_tensor(context, sampling_params.min_token_positions, stream);
+    read_tensor(context, sampling_params.min_tokens_remaining, stream);
+    read_tensor(context, sampling_params.min_token_ids, stream);
     read_tensor(context, sampling_params.seeds, stream);
     read_tensor(context, sampling_params.seed_offsets, stream);
     read_tensor(context, sampling_params.top_k, stream);
@@ -3049,6 +3052,9 @@ inline void serialize_forward_input_sections(
     write_tensor(context, sampling_params.top_p);
     write_tensor(context, sampling_params.min_p);
     write_tensor(context, sampling_params.logits_bias);
+    write_tensor(context, sampling_params.min_token_positions);
+    write_tensor(context, sampling_params.min_tokens_remaining);
+    write_tensor(context, sampling_params.min_token_ids);
     write_tensor(context, sampling_params.seeds);
     write_tensor(context, sampling_params.seed_offsets);
     write_tensor(context, sampling_params.top_k);

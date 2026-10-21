@@ -117,8 +117,8 @@ TokenResultTensors bind_result_views(const TokenResultTensors& storage,
 struct InputField {
   torch::Tensor SamplingParameters::* member;
   torch::ScalarType dtype;
-  // History fields are 2-D [rows, unique_tokens]; all other fields are 1-D
-  // per-row tensors sized by max_sample_rows.
+  // History fields are 2-D [rows, unique_tokens]. Stop IDs use a separate
+  // growable 2-D buffer; other fields are 1-D per-row tensors.
   bool history;
 };
 
@@ -127,7 +127,7 @@ struct InputField {
 // Staging-side registry of SamplingParameters' tensor members (adds the
 // per-sequence tensors; carries no seeds/seed_offsets/logits_bias — see
 // kSamplingFields in sampling_params.h for the roles each member plays).
-constexpr std::array<InputField, 12> kFields = {{
+constexpr std::array<InputField, 15> kFields = {{
     {&SamplingParameters::selected_token_idxes, torch::kInt32, false},
     {&SamplingParameters::frequency_penalties, torch::kFloat32, false},
     {&SamplingParameters::presence_penalties, torch::kFloat32, false},
@@ -135,6 +135,9 @@ constexpr std::array<InputField, 12> kFields = {{
     {&SamplingParameters::temperatures, torch::kFloat32, false},
     {&SamplingParameters::top_p, torch::kFloat32, false},
     {&SamplingParameters::min_p, torch::kFloat32, false},
+    {&SamplingParameters::min_token_positions, torch::kInt64, false},
+    {&SamplingParameters::min_tokens_remaining, torch::kInt64, false},
+    {&SamplingParameters::min_token_ids, torch::kInt64, false},
     {&SamplingParameters::top_k, torch::kInt64, false},
     {&SamplingParameters::unique_token_ids, torch::kInt64, true},
     {&SamplingParameters::unique_token_counts, torch::kInt32, true},
@@ -151,6 +154,9 @@ bool parameter_type(torch::ScalarType dtype) {
 
 uint64_t capacity_elements(const InputField& field,
                            const SlotBufferCapacity& capacity) {
+  if (field.member == &SamplingParameters::min_token_ids) {
+    return 0;  // Grow stop-ID storage outside the model graph.
+  }
   return field.history ? static_cast<uint64_t>(capacity.max_sample_rows) *
                              capacity.max_unique_tokens
                        : capacity.max_sample_rows;
@@ -647,9 +653,14 @@ Status SlotBuffer::validate_sampling(const SamplingParameters& input,
                                    ? parameter_type(tensor.scalar_type())
                                    : tensor.scalar_type() == field.dtype;
     const bool history = field.history;
+    const bool stop = field.member == &SamplingParameters::min_token_ids;
     if (!tensor.device().is_cpu() || !tensor.is_contiguous() ||
-        !dtype_matches || tensor.dim() != (history ? 2 : 1) ||
+        !dtype_matches || tensor.dim() != ((history || stop) ? 2 : 1) ||
         tensor.size(0) != rows) {
+      return invalid_input();
+    }
+    if (stop && (tensor.size(1) < 1 || tensor.size(1) > capacity_.vocab_size ||
+                 tensor.numel() > std::numeric_limits<int32_t>::max())) {
       return invalid_input();
     }
     if (history) {
@@ -660,6 +671,23 @@ Status SlotBuffer::validate_sampling(const SamplingParameters& input,
       }
       width = tensor.size(1);
     }
+  }
+  const bool minimum = input.min_token_ids.defined();
+  if (minimum != input.min_token_positions.defined() ||
+      minimum != input.min_tokens_remaining.defined()) {
+    return invalid_input();
+  }
+  if (minimum &&
+      (!all_values<int64_t>(input.min_token_ids,
+                            [this](int64_t token) {
+                              return token >= -1 &&
+                                     token < capacity_.vocab_size;
+                            }) ||
+       !all_values<int64_t>(input.min_token_positions,
+                            [](int64_t value) { return value >= 0; }) ||
+       !all_values<int64_t>(input.min_tokens_remaining,
+                            [](int64_t value) { return value >= 0; }))) {
+    return invalid_input();
   }
   const bool history = input.unique_token_ids.defined();
   if (history != input.unique_token_counts.defined() ||
@@ -1003,6 +1031,14 @@ void SlotBuffer::prepare_sampling(const SamplingParameters& input) {
       if (!source.defined()) {
         continue;
       }
+      if (field.member == &SamplingParameters::min_token_ids &&
+          (sampling_host_.*field.member).numel() < source.numel()) {
+        const auto options = torch::TensorOptions().dtype(field.dtype);
+        sampling_host_.*field.member = torch::empty(
+            {source.numel()}, options.device(torch::kCPU).pinned_memory(true));
+        sampling_device_.*field.member =
+            torch::empty({source.numel()}, options.device(device_));
+      }
       torch::Tensor host = (sampling_host_.*field.member)
                                .narrow(/*dim=*/0, /*start=*/0, source.numel());
       torch::Tensor device =
@@ -1018,6 +1054,18 @@ void SlotBuffer::prepare_sampling(const SamplingParameters& input) {
     prepared.max_top_logprobs = input.max_top_logprobs;
   }
   sampling_params_ = std::move(prepared);
+}
+
+void SlotBuffer::refresh_min_tokens() {
+  auto& params = sampling_params_;
+  if (!params.min_token_positions.defined()) {
+    return;
+  }
+  const auto selected_positions = positions().index_select(
+      /*dim=*/0, params.selected_token_idxes.to(torch::kInt64));
+  torch::sub_out(params.min_tokens_remaining,
+                 params.min_token_positions,
+                 selected_positions);
 }
 
 void SlotBuffer::prepare_previous_tokens(const ModelInputHostView& model) {
@@ -1221,6 +1269,9 @@ uint64_t SlotBuffer::pinned_bytes() const {
   uint64_t bytes = (host_buffer_.defined() ? host_buffer_.nbytes() : 0) +
                    auxiliary_bytes_ +
                    (host_indices_.defined() ? host_indices_.nbytes() : 0);
+  bytes += sampling_host_.min_token_ids.defined()
+               ? sampling_host_.min_token_ids.nbytes()
+               : 0;
   bytes += input_scratch_ ? input_scratch_->pinned_bytes_ : 0;
   return bytes;
 }
@@ -1231,6 +1282,9 @@ uint64_t SlotBuffer::device_bytes() const {
        {&device_indices_, &gathered_int64_, &gathered_int32_}) {
     bytes += tensor->defined() ? tensor->nbytes() : 0;
   }
+  bytes += sampling_device_.min_token_ids.defined()
+               ? sampling_device_.min_token_ids.nbytes()
+               : 0;
   bytes += input_scratch_ ? input_scratch_->device_bytes_ : 0;
   return bytes;
 }

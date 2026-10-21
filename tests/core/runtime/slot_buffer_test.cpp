@@ -730,8 +730,10 @@ constexpr uint64_t kFloatingSamplingFieldCount = 6;
 // dtypes of the 1-D non-floating staging fields, mirroring the non-history,
 // non-float entries of kFields in slot_buffer.cpp (which has
 // internal linkage). The byte assertions below catch a registry drift.
-constexpr std::array<torch::ScalarType, 4> kPerRowNonFloatDtypes = {
+constexpr std::array<torch::ScalarType, 6> kPerRowNonFloatDtypes = {
     torch::kInt32,  // selected_token_idxes
+    torch::kInt64,  // min_token_positions
+    torch::kInt64,  // min_tokens_remaining
     torch::kInt64,  // top_k
     torch::kInt32,  // unique_token_ids_lens
     torch::kBool};  // do_sample
@@ -897,6 +899,35 @@ class SlotSamplingInputTest
   std::unique_ptr<Stream> launch_;
   std::shared_ptr<StreamEvent> ready_;
 };
+
+TEST_P(SlotSamplingInputTest, MinimumUsesDevicePositionsAndOwnsStopStorage) {
+  SamplingParameters input;
+  input.selected_token_idxes = torch::arange(4, torch::kInt32);
+  input.min_token_positions = torch::full({4}, 203, torch::kInt64);
+  // Host output counts can lag when task scheduling overlaps execution.
+  input.min_tokens_remaining = torch::full({4}, 99, torch::kInt64);
+  input.min_token_ids = torch::tensor(
+      {{0, 7, -1}, {0, 7, -1}, {0, 7, -1}, {0, 7, -1}}, torch::kInt64);
+  ASSERT_TRUE(prepare_sampling(input, 8, *prepare_).ok());
+  input.min_token_ids.fill_(-1);
+  input.min_token_positions.zero_();
+  handoff();
+  {
+    auto guard = launch_->set_stream_guard();
+    const auto previous_binding = binding_->sampling_params();
+    binding_->refresh_min_tokens();
+    EXPECT_TRUE(torch::equal(previous_binding.min_tokens_remaining.cpu(),
+                             torch::tensor({2, 1, 0, -1}, torch::kInt64)));
+    auto logits = torch::zeros(
+        {4, 128}, torch::TensorOptions().dtype(GetParam()).device(device_));
+    logits.select(1, 0).fill_(10);
+    logits.select(1, 7).fill_(9);
+    logits.select(1, 3).fill_(8);
+    const auto output = Sampler().forward(logits, binding_->sampling_params());
+    EXPECT_TRUE(torch::equal(output.next_tokens.cpu(),
+                             torch::tensor({3, 3, 0, 0}, torch::kInt64)));
+  }
+}
 
 TEST_P(SlotSamplingInputTest, DoSampleBindingSurvivesInvalidReprepare) {
   const uint64_t pinned_bytes = binding_->pinned_bytes();

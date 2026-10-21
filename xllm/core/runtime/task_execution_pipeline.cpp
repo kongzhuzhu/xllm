@@ -772,6 +772,7 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
   if (params.num_sample_seqs() > 0) {
     slot.logits = model_.logits(slot.model_output.hidden_states,
                                 params.selected_token_idxes);
+    slot.buffer->refresh_min_tokens();
     slot.sample_output = sampler_.forward(slot.logits, params);
     const auto& result = slot.buffer->device_result();
     result.tokens.copy_(slot.sample_output.next_tokens);

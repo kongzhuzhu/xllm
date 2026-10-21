@@ -313,6 +313,9 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
   params.seed_offsets = safe_to(seed_offsets, device, true);
   params.seeds = safe_to(seeds, device, true);
   params.logits_bias = safe_to(logits_bias, device, true);
+  params.min_token_positions = safe_to(min_token_positions, device, true);
+  params.min_tokens_remaining = safe_to(min_tokens_remaining, device, true);
+  params.min_token_ids = safe_to(min_token_ids, device, true);
   params.top_k = safe_to(top_k, device, true);
 
   params.unique_token_ids = safe_to(unique_token_ids, device, true);
@@ -337,6 +340,10 @@ void prepare_draft_sampling(DraftSamplingMode mode,
   sampling_params.logprobs = false;
   sampling_params.max_top_logprobs = 0;
   sampling_params.use_beam_search = false;
+  // vLLM applies minimum length to target sampling, not draft proposals.
+  sampling_params.min_token_positions = torch::Tensor();
+  sampling_params.min_tokens_remaining = torch::Tensor();
+  sampling_params.min_token_ids = torch::Tensor();
   if (mode == DraftSamplingMode::GREEDY) {
     sampling_params.sampling_mode = SamplingMode::GREEDY;
     sampling_params.do_sample = torch::Tensor();

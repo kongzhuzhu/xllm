@@ -46,6 +46,8 @@ struct RequestSamplingParam {
   float min_p = 0.0;
   std::optional<int64_t> seed;
   uint32_t min_tokens = 0;
+  // Task execution advances accepted lengths on device, after input staging.
+  bool device_min_tokens = false;
   int64_t vocab_size = 0;
   std::unordered_map<int32_t, float> logit_bias;
   std::optional<std::vector<int32_t>> allowed_token_ids;
@@ -153,6 +155,12 @@ struct SamplingParameters {
 
   // Per-selected-row additive constraints and independent random streams.
   torch::Tensor logits_bias;
+  // Compact task minimum-length constraints. Limits are absolute logical
+  // input positions; remaining counts are refreshed before target sampling.
+  torch::Tensor min_token_positions;
+  torch::Tensor min_tokens_remaining;
+  // [selected_rows, stop_ids], int64; -1 pads unconstrained entries.
+  torch::Tensor min_token_ids;
   torch::Tensor seeds;
   torch::Tensor seed_offsets;
 
@@ -245,7 +253,7 @@ struct SamplingFieldDesc {
   bool post_penalty_transform;
 };
 
-inline constexpr std::array<SamplingFieldDesc, 15> kSamplingFields = {
+inline constexpr std::array<SamplingFieldDesc, 18> kSamplingFields = {
     {{&SamplingParameters::frequency_penalties, false, false},
      {&SamplingParameters::presence_penalties, false, false},
      {&SamplingParameters::repetition_penalties, false, false},
@@ -255,6 +263,9 @@ inline constexpr std::array<SamplingFieldDesc, 15> kSamplingFields = {
      {&SamplingParameters::seed_offsets, true, false},
      {&SamplingParameters::seeds, true, false},
      {&SamplingParameters::logits_bias, false, false},
+     {&SamplingParameters::min_token_positions, true, false},
+     {&SamplingParameters::min_tokens_remaining, true, false},
+     {&SamplingParameters::min_token_ids, true, false},
      {&SamplingParameters::top_k, true, true},
      {&SamplingParameters::unique_token_ids, false, false},
      {&SamplingParameters::unique_token_counts, false, false},

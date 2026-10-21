@@ -105,12 +105,16 @@ SamplingParameters SamplingInputBuilder::build() {
               token_lengths_);
   bool need_constraints = false;
   bool need_seed = false;
+  bool need_device_min_tokens = false;
   int64_t vocab_size = 0;
   for (const auto* params : params_) {
     need_constraints = need_constraints || !params->logit_bias.empty() ||
                        params->allowed_token_ids.has_value() ||
-                       params->min_tokens > 0 ||
+                       (params->min_tokens > 0 && !params->device_min_tokens) ||
                        !params->bad_words_token_ids.empty();
+    need_device_min_tokens =
+        need_device_min_tokens ||
+        (params->device_min_tokens && params->min_tokens > 0);
     need_seed = need_seed || params->seed.has_value();
     vocab_size = std::max(vocab_size, params->vocab_size);
   }
@@ -134,7 +138,7 @@ SamplingParameters SamplingInputBuilder::build() {
       }
       const size_t generated =
           sequence == nullptr ? 0 : sequence->num_generated_tokens();
-      if (generated < params.min_tokens) {
+      if (!params.device_min_tokens && generated < params.min_tokens) {
         for (int32_t token : params.all_stop_token_ids) {
           if (token >= 0 && token < vocab_size) {
             rows[row][token] = blocked;
@@ -156,6 +160,45 @@ SamplingParameters SamplingInputBuilder::build() {
         }
       }
     }
+  }
+  if (need_device_min_tokens) {
+    CHECK_GT(vocab_size, 0);
+    std::vector<int64_t> limits;
+    std::vector<int64_t> remaining;
+    std::vector<std::vector<int64_t>> stops;
+    limits.reserve(size());
+    remaining.reserve(size());
+    stops.reserve(size());
+    for (size_t row = 0; row < size(); ++row) {
+      const auto& params = *params_[row];
+      const Sequence* sequence = sequences_[row];
+      const int64_t minimum = params.device_min_tokens ? params.min_tokens : 0;
+      const int64_t generated =
+          sequence == nullptr ? 0 : sequence->num_generated_tokens();
+      const int64_t prompt_end =
+          sequence == nullptr
+              ? 0
+              : static_cast<int64_t>(sequence->num_prompt_tokens()) - 1;
+      limits.emplace_back(minimum == 0 ? 0 : prompt_end + minimum);
+      remaining.emplace_back(std::max<int64_t>(0, minimum - generated));
+      auto& ids = stops.emplace_back();
+      ids.reserve(params.all_stop_token_ids.size() + 1);
+      if (minimum > 0) {
+        for (int32_t token : params.all_stop_token_ids) {
+          if (token >= 0 && token < vocab_size) {
+            ids.emplace_back(token);
+          }
+        }
+      }
+      // Keep the compact tensor well-formed even without a configured EOS.
+      if (ids.empty()) {
+        ids.emplace_back(-1);
+      }
+    }
+    util::pad_2d_vector<int64_t>(stops, /*pad_value=*/-1);
+    result.min_token_positions = make_pinned_cpu_tensor(limits);
+    result.min_tokens_remaining = make_pinned_cpu_tensor(remaining);
+    result.min_token_ids = create_2d_tensor(stops, torch::kInt64);
   }
   if (need_seed) {
     std::vector<int64_t> seeds;

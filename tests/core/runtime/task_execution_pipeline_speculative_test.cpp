@@ -3399,6 +3399,22 @@ TEST_F(SpeculativePipelineTest, UnifiedTaskAdvancesJsonFromOwnedPriorTokens) {
             "new-json#0");
 }
 
+TEST_F(SpeculativePipelineTest, MinimumLengthConstrainsTargetButNotDraft) {
+  create();
+  execute(input(false));
+  auto decode = input(true);
+  decode.sampling_params.min_token_positions =
+      torch::tensor({100}, torch::kLong);
+  decode.sampling_params.min_tokens_remaining =
+      torch::tensor({100}, torch::kLong);
+  decode.sampling_params.min_token_ids = torch::tensor({{4, -1}}, torch::kLong);
+  const auto result = execute(decode);
+  // The first draft still proposes 4; the target must reject that blocked id.
+  ASSERT_GE(draft_->forward_inputs.size(), 3U);
+  EXPECT_EQ(draft_->forward_inputs[2].item<int32_t>(), 4);
+  EXPECT_EQ(result.sample_output.next_tokens[0][0].item<int64_t>(), 0);
+}
+
 class TargetPrefixLengthSpeculativePipelineTest
     : public SpeculativePipelineTest,
       public ::testing::WithParamInterface<int32_t> {};

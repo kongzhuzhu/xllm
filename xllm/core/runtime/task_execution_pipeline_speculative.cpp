@@ -2066,6 +2066,7 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
                                          kv_caches_,
                                          target_input.model_params());
   if (slot.samples != 0) {
+    slot.target_prefill->refresh_min_tokens();
     slot.target_logits = model_.logits(
         slot.target_output.hidden_states,
         slot.target_prefill->sampling_params().selected_token_idxes);
@@ -2204,6 +2205,7 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
       slot.validate_input->sampling_params().selected_token_idxes);
   // The executor returns raw logits; the rejection sampler must score the
   // request's transformed distribution.
+  slot.validate_input->refresh_min_tokens();
   Sampler::process_logits(slot.target_logits,
                           slot.validate_input->sampling_params());
   const auto& base = slot.target_prefill->sampling_params();

@@ -199,6 +199,9 @@ inline bool add_sampling_to_plan(const SamplingParameters& source,
          plan.add(source.top_p, &target.top_p) &&
          plan.add(source.min_p, &target.min_p) &&
          plan.add(source.logits_bias, &target.logits_bias) &&
+         plan.add(source.min_token_positions, &target.min_token_positions) &&
+         plan.add(source.min_tokens_remaining, &target.min_tokens_remaining) &&
+         plan.add(source.min_token_ids, &target.min_token_ids) &&
          plan.add(source.seeds, &target.seeds) &&
          plan.add(source.seed_offsets, &target.seed_offsets) &&
          plan.add(source.top_k, &target.top_k) &&

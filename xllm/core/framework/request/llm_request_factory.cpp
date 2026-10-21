@@ -231,6 +231,8 @@ RequestSamplingParam LLMRequestFactory::build_sampling_param(
   // Shared field mapping (and the best_of > n logprobs rule) lives on
   // RequestParams; layer the LLM-specific rules on top.
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
+  sampling_param.device_min_tokens =
+      options_->enable_task_pipeline() && sp.min_tokens > 0;
   sampling_param.json_object =
       ServiceConfig::get_instance().enable_json_object_output() &&
       sp.response_format == ResponseFormatType::JSON_OBJECT;
@@ -402,7 +404,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   RequestSamplingParam sampling_param = build_sampling_param(sp, best_of);
   const bool has_constraints = !sp.logit_bias.empty() ||
                                sp.allowed_token_ids.has_value() ||
-                               sp.min_tokens > 0 || !sp.bad_words.empty();
+                               !sp.bad_words.empty();
   if (options_->enable_task_pipeline() &&
       (has_constraints || sp.seed.has_value() || sp.top_logprobs == -1)) {
     CALLBACK_WITH_ERROR(
@@ -413,7 +415,9 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   if (options_->num_speculative_tokens() > 0 &&
-      (sp.seed.has_value() || sp.min_tokens > 0 || !sp.bad_words.empty())) {
+      (sp.seed.has_value() ||
+       (sp.min_tokens > 0 && !options_->enable_task_pipeline()) ||
+       !sp.bad_words.empty())) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
         "seed, min_tokens and bad_words require num_speculative_tokens=0",
