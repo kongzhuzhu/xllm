@@ -460,7 +460,11 @@ runtime::Options mtp_draft_options(const runtime::Options& options) {
   runtime::Options draft_options = options;
   draft_options.enable_schedule_overlap(false)
       .is_draft_engine(true)
-      .num_decoding_tokens(1)
+      // The task path also restores the verifier prefix (K+1 rows).
+      .num_decoding_tokens(
+          options.enable_task_pipeline()
+              ? std::max(2, options.num_speculative_tokens() + 1)
+              : 1)
       .num_speculative_tokens(0)
       .enable_graph_aux_hidden_states(true);
   return draft_options;
@@ -859,6 +863,7 @@ template <typename TargetInput>
   capacity.num_speculative_tokens = options_.num_speculative_tokens();
   capacity.index_topk = args.index_topk();
   capacity.reuse_topk = args.index_share_for_mtp_iteration();
+  capacity.refresh_target_prefix = capacity.num_speculative_tokens > 1;
   if (get_optimization_config().enable_spec_token_broadcast) {
     capacity.common.sampling_group = parallel_args_.tp_group_ != nullptr
                                          ? parallel_args_.tp_group_

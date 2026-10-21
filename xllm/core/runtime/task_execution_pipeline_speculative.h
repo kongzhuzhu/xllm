@@ -168,6 +168,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   std::optional<Sampling> target_sampling;
   std::unique_ptr<RejectionSampler> rejection;
   std::vector<std::unique_ptr<Draft>> drafts;
+  std::unique_ptr<Draft> prefix_refresh;
   std::vector<int32_t> upper_positions;
   std::vector<int32_t> upper_kv_lengths;
   SamplingParameters host_validate_sampling;

@@ -213,6 +213,11 @@ class CountingModel final : public CausalLM {
     forward_had_sync.emplace_back(params.parallel.layer_synchronizer !=
                                   nullptr);
     auto hidden = (block_draft ? positions : tokens).to(options_).view({-1, 1});
+    if (borrowed_hidden_storage.defined()) {
+      auto borrowed = borrowed_hidden_storage.narrow(0, 0, hidden.size(0));
+      borrowed.copy_(hidden);
+      hidden = borrowed;
+    }
     // Two columns exercise block drafts whose captured context is wider than
     // either model's hidden state. MTP ignores these auxiliary rows.
     auto auxiliary = torch::cat({hidden, hidden + 100}, /*dim=*/1);
@@ -266,10 +271,10 @@ class CountingModel final : public CausalLM {
 
   torch::Tensor logits(const torch::Tensor& hidden,
                        const torch::Tensor& selected) override {
-    ++logits_calls;
+    const int32_t call = logits_calls.fetch_add(1);
     const auto next =
         hidden.index_select(0, selected.to(torch::kInt64)).to(torch::kInt64) +
-        1;
+        logit_increments[call % logit_increments.size()];
     auto output = torch::full({selected.numel(), 32}, -20.0, options_);
     output.scatter_(/*dim=*/1, next, /*value=*/20.0);
     return output;
@@ -309,6 +314,8 @@ class CountingModel final : public CausalLM {
   void update_expert_weight(int32_t /*layer_id*/) override {}
 
   std::atomic<int32_t> logits_calls{0};
+  std::vector<int64_t> logit_increments{1};
+  torch::Tensor borrowed_hidden_storage;
   bool block_draft = false;
   std::vector<int64_t> markov_increments{1};
   bool stable_graph_outputs = false;
@@ -3390,6 +3397,99 @@ TEST_F(SpeculativePipelineTest, UnifiedTaskAdvancesJsonFromOwnedPriorTokens) {
   ASSERT_EQ(missing->json_object_errors.size(), 1U);
   EXPECT_EQ(missing->json_object_errors.front().sample_sequence_id,
             "new-json#0");
+}
+
+class TargetPrefixLengthSpeculativePipelineTest
+    : public SpeculativePipelineTest,
+      public ::testing::WithParamInterface<int32_t> {};
+
+TEST_P(TargetPrefixLengthSpeculativePipelineTest,
+       RefreshPairsEveryAcceptedTokenWithItsVerifierHidden) {
+  const int32_t accepted = GetParam();
+  capacity_.num_speculative_tokens = 3;
+  capacity_.refresh_target_prefix = true;
+  draft_->logit_increments.assign(3, 1);
+  if (accepted < 4) {
+    draft_->logit_increments[accepted - 1] = 2;
+  }
+  create();
+  execute(input(false));
+  const auto result = execute(input(true));
+  auto expected = torch::arange(4, 8, torch::kInt64);
+  expected.narrow(0, accepted, 4 - accepted).fill_(-1);
+  EXPECT_TRUE(
+      torch::equal(result.sample_output.next_tokens, expected.view({1, 4})));
+  ASSERT_EQ(draft_->forward_inputs.size(), 5U);
+  expected.clamp_min_(0);
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs.back().cpu(), expected));
+  EXPECT_TRUE(torch::equal(draft_->forward_positions.back().cpu(),
+                           torch::arange(2, 6, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      draft_->forward_embeddings.back().narrow(0, 0, accepted).cpu(),
+      torch::arange(3, 3 + accepted, torch::kFloat32).view({accepted, 1})));
+  EXPECT_EQ(draft_->logits_calls.load(), 3);
+}
+
+INSTANTIATE_TEST_SUITE_P(AcceptedLengths,
+                         TargetPrefixLengthSpeculativePipelineTest,
+                         ::testing::Values(1, 2, 3, 4));
+
+TEST_F(SpeculativePipelineTest,
+       PrefixRefreshPreservesContextBeforeAnotherBodyReusesThePool) {
+  capacity_.num_speculative_tokens = 3;
+  capacity_.refresh_target_prefix = true;
+  capacity_.common.slot_count = 2;
+  auto storage = torch::empty({16, 1}, target_->options());
+  for (auto* model : {target_.get(), draft_.get()}) {
+    model->borrowed_hidden_storage = storage;
+  }
+  create();
+  execute(input(false));
+  auto first = input(true);
+  auto second = input(true, -1, 3);
+  const auto a = pipeline_->submit(first);
+  const auto b = pipeline_->submit(second);
+  ASSERT_TRUE(a.status.ok()) << a.status.message();
+  ASSERT_TRUE(b.status.ok()) << b.status.message();
+  const auto ar = pipeline_->take_result_async(a.task_id).get();
+  const auto br = pipeline_->take_result_async(b.task_id).get();
+  ASSERT_TRUE(ar.status.ok()) << ar.status.message();
+  ASSERT_TRUE(br.status.ok()) << br.status.message();
+  EXPECT_TRUE(torch::equal(ar.output.sample_output.next_tokens,
+                           torch::tensor({{4, 5, 6, 7}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(br.output.sample_output.next_tokens,
+                           torch::tensor({{8, 9, 10, 11}}, torch::kInt64)));
+  ASSERT_EQ(draft_->forward_embeddings.size(), 9U);
+  EXPECT_TRUE(torch::equal(draft_->forward_embeddings[4].cpu(),
+                           torch::tensor({{3.f}, {4.f}, {5.f}, {6.f}})));
+  EXPECT_TRUE(torch::equal(draft_->forward_embeddings[5].cpu(),
+                           torch::tensor({{5.f}, {6.f}})));
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs[4].cpu(),
+                           torch::tensor({4, 5, 6, 7}, torch::kInt64)));
+}
+
+TEST_F(SpeculativePipelineTest, PrefixRefreshKeepsEmptyDpPeersInBodyOrder) {
+  capacity_.common.dp_size = 2;
+  capacity_.common.dp_rank = 1;
+  capacity_.num_speculative_tokens = 3;
+  capacity_.refresh_target_prefix = true;
+  create();
+  LlmForwardInput empty;
+  empty.token_ids = torch::empty({0}, torch::kInt32);
+  empty.positions = torch::empty({0}, torch::kInt32);
+  auto& p = empty.input_params;
+  p.meta.batch_forward_type = BatchForwardType::EMPTY;
+  p.attention.host.block_tables = torch::empty({0, 2}, torch::kInt32);
+  p.parallel.dp_global_token_nums = {1, 0};
+  p.parallel.raw_dp_global_token_nums = {1, 0};
+  p.parallel.dp_is_decode = {1, 0};
+  const auto result = execute(empty);
+  EXPECT_FALSE(result.sample_output.next_tokens.defined());
+  ASSERT_EQ(draft_->forward_inputs.size(), 4U);
+  EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{4, 0}));
+  EXPECT_EQ(draft_->logits_calls.load(), 0);
+  EXPECT_TRUE(torch::equal(draft_->forward_embeddings.back().cpu(),
+                           torch::zeros({1, 1})));
 }
 
 }  // namespace

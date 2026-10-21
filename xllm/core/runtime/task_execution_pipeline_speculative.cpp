@@ -304,6 +304,8 @@ Status TaskExecutionPipeline::create(
       common.hidden_size == 0 || common.logical_block_size == 0 ||
       common.logical_block_size > std::numeric_limits<int32_t>::max() ||
       common.vocab_size == 0 ||
+      (capacity.refresh_target_prefix &&
+       capacity.kind != SpeculativeTaskKind::MTP) ||
       (capacity.kind == SpeculativeTaskKind::MTP && !common.enable_mla) ||
       (capacity.kind != SpeculativeTaskKind::MTP &&
        (capacity.context_hidden_size == 0 || capacity.mask_token_id < 0 ||
@@ -552,6 +554,19 @@ Status TaskExecutionPipeline::initialize_speculative() {
       }
       slot->drafts.emplace_back(std::move(invocation));
     }
+    if (speculative_capacity_->refresh_target_prefix) {
+      auto refresh = std::make_unique<SpeculativeSlot::Draft>();
+      status = SlotBuffer::create_mtp_input(
+          validate_spec, hidden_dtype_, device_.unwrap(), refresh->input);
+      if (!status.ok()) {
+        return status;
+      }
+      refresh->hidden_storage =
+          torch::empty({expanded, c.hidden_size}, options);
+      refresh->graph_batch_sizes = graph_batch_sizes_;
+      refresh->captured_graph_batch_sizes.reserve(graph_batch_sizes_.size());
+      slot->prefix_refresh = std::move(refresh);
+    }
     task_slot->input_ready = reusable_event(device_.unwrap());
     task_slot->output_ready = reusable_event(device_.unwrap());
     task_slot->speculative = std::move(slot);
@@ -728,6 +743,10 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   }
   slot.validate_input->model_params().parallel =
       expanded_parallel(base_parallel, slot.decode ? width : 1, false);
+  if (slot.prefix_refresh) {
+    slot.prefix_refresh->input->model_params().parallel =
+        slot.validate_input->model_params().parallel;
+  }
   for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
     const uint32_t scale = !slot.decode ? 1
                            : block_draft()
@@ -748,6 +767,12 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   slot.target_padded_batch_size =
       task_graph_batch_size(slot.validate_input->model_params().parallel,
                             captured_graph_batch_sizes_);
+  if (slot.prefix_refresh) {
+    auto& refresh = *slot.prefix_refresh;
+    refresh.padded_batch_size =
+        task_graph_batch_size(refresh.input->model_params().parallel,
+                              refresh.captured_graph_batch_sizes);
+  }
   for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
     auto& draft = *slot.drafts[step];
     draft.padded_batch_size = task_graph_batch_size(
@@ -874,6 +899,13 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   for (auto& invocation : slot.drafts) {
     status =
         SlotBuffer::plan_mtp_decode(*invocation->input, conservative, batch);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  if (slot.prefix_refresh) {
+    status = SlotBuffer::plan_mtp_decode(
+        *slot.prefix_refresh->input, conservative, batch);
     if (!status.ok()) {
       return status;
     }
@@ -1521,8 +1553,11 @@ void TaskExecutionPipeline::warmup_draft_graphs(const LlmForwardInput& input) {
   const auto batch = model_batch(input);
   for (auto& task_slot : slots_) {
     auto* slot = task_slot->speculative.get();
-    for (uint32_t step = 0; step < slot->drafts.size(); ++step) {
-      auto& invocation = *slot->drafts[step];
+    const uint32_t forwards =
+        slot->drafts.size() + (slot->prefix_refresh ? 1U : 0U);
+    for (uint32_t step = 0; step < forwards; ++step) {
+      const bool refresh = step == slot->drafts.size();
+      auto& invocation = refresh ? *slot->prefix_refresh : *slot->drafts[step];
       const auto& parallel = invocation.input->model_params().parallel;
       const uint32_t padded_batch_size =
           task_graph_batch_size(parallel, invocation.graph_batch_sizes);
@@ -1552,7 +1587,11 @@ void TaskExecutionPipeline::warmup_draft_graphs(const LlmForwardInput& input) {
                                                         padded_batch_size);
       }
       CHECK(status.ok()) << status.message();
-      prepare_draft_state(*slot, step, /*warmup=*/true);
+      if (refresh) {
+        prepare_prefix_refresh_state(*slot, /*warmup=*/true);
+      } else {
+        prepare_draft_state(*slot, step, /*warmup=*/true);
+      }
       CHECK_EQ(prepare_stream_.synchronize(), 0);
       pad_task_parallel(binding.model_params().parallel, padded_batch_size);
       draft_->executor.prepare_attention_metadata(draft_->kv_caches,
@@ -1601,6 +1640,22 @@ void TaskExecutionPipeline::prepare_draft_state(SpeculativeSlot& slot,
     topk.narrow(/*dim=*/0, clear_from, physical_rows - clear_from).zero_();
     params.mtp_topk_state = MtpTopkState::from_tensor(std::move(topk));
   }
+}
+
+void TaskExecutionPipeline::prepare_prefix_refresh_state(SpeculativeSlot& slot,
+                                                         bool warmup) {
+  auto& refresh = *slot.prefix_refresh;
+  auto& binding = *refresh.input;
+  const int64_t logical =
+      slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
+  const int64_t physical = binding.tokens().numel();
+  auto& params = binding.model_params();
+  params.embedding.input_embedding = prefix(refresh.hidden_storage, physical);
+  params.mtp_topk_state.reset();
+  auto guard = prepare_stream_.set_stream_guard();
+  const int64_t clear_from = warmup ? 0 : logical;
+  params.embedding.input_embedding.narrow(0, clear_from, physical - clear_from)
+      .zero_();
 }
 
 Status TaskExecutionPipeline::prepare_speculative(
@@ -1825,6 +1880,21 @@ Status TaskExecutionPipeline::prepare_speculative(
       draft_->executor.prepare_attention_metadata(draft_->kv_caches,
                                                   binding.model_params());
     }
+    if (slot.prefix_refresh) {
+      auto& refresh = *slot.prefix_refresh;
+      status =
+          SlotBuffer::prepare_planned_mtp_decode(*refresh.input,
+                                                 conservative,
+                                                 batch,
+                                                 prepare_stream_,
+                                                 refresh.padded_batch_size);
+      CHECK(status.ok()) << status.message();
+      prepare_prefix_refresh_state(slot, /*warmup=*/false);
+      pad_task_parallel(refresh.input->model_params().parallel,
+                        refresh.padded_batch_size);
+      draft_->executor.prepare_attention_metadata(
+          draft_->kv_caches, refresh.input->model_params());
+    }
     auto& binding = *slot.validate_input;
 
     pad_task_parallel(binding.model_params().parallel,
@@ -1930,6 +2000,24 @@ void TaskExecutionPipeline::prepare_empty_shard(SpeculativeSlot& slot,
             slot.validate_input->model_params().parallel,
             TaskModel{model_, executor_, kv_caches_},
             /*draft=*/false);
+    if (slot.prefix_refresh) {
+      auto& refresh = *slot.prefix_refresh;
+      auto& binding = *refresh.input;
+      const auto status =
+          refresh.padded_batch_size == 0
+              ? binding.prepare_empty_shard(true, batch_id, prepare_stream_)
+              : binding.prepare_decode_padded(
+                    {},
+                    {BatchForwardType::EMPTY, 0, batch_id},
+                    refresh.padded_batch_size,
+                    prepare_stream_);
+      CHECK(status.ok()) << status.message();
+      prepare_prefix_refresh_state(slot, /*warmup=*/false);
+      pad_task_parallel(binding.model_params().parallel,
+                        refresh.padded_batch_size);
+      draft_->executor.prepare_attention_metadata(draft_->kv_caches,
+                                                  binding.model_params());
+    }
   } else {
     prepare(*slot.target_prefill,
             slot.target_prefill->model_params().parallel,
@@ -1957,6 +2045,9 @@ void TaskExecutionPipeline::launch_empty_shard(SpeculativeSlot& slot) {
     }
     slot.target_output =
         run(*slot.validate_input, TaskModel{model_, executor_, kv_caches_});
+    if (slot.prefix_refresh) {
+      launch_prefix_refresh(slot);
+    }
   } else {
     slot.target_output =
         run(*slot.target_prefill, TaskModel{model_, executor_, kv_caches_});
@@ -2014,6 +2105,15 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
                                                draft_->kv_caches,
                                                draft_input.model_params());
   context_publish(*slot.state);
+}
+
+void TaskExecutionPipeline::launch_prefix_refresh(SpeculativeSlot& slot) {
+  auto& refresh = *slot.prefix_refresh;
+  auto& binding = *refresh.input;
+  refresh.output = draft_->executor.forward(binding.tokens(),
+                                            binding.positions(),
+                                            draft_->kv_caches,
+                                            binding.model_params());
 }
 
 void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
@@ -2149,6 +2249,15 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   }
   const auto& context = block_draft() ? slot.target_output.aux_hidden_states
                                       : slot.target_output.hidden_states;
+  if (slot.prefix_refresh) {
+    auto& refresh = *slot.prefix_refresh;
+    // Snapshot before another body can reuse the verifier's output pool.
+    SlotBuffer::patch_mtp_decode(*refresh.input, *slot.state);
+    prefix(refresh.hidden_storage, slot.rows * width)
+        .copy_(slot.target_output.hidden_states);
+    auto tokens = refresh.input->tokens().narrow(0, 0, slot.rows * width);
+    tokens.copy_(result.tokens.reshape({-1})).clamp_min_(0);
+  }
   context_advance(
       *slot.state,
       result.tokens,
@@ -2156,6 +2265,9 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
       block_draft() ? torch::Tensor()
                     : context.view({slot.rows, width, context_hidden_size()}));
   context_publish(*slot.state);
+  if (slot.prefix_refresh) {
+    launch_prefix_refresh(slot);
+  }
 }
 
 bool TaskExecutionPipeline::launch_unified_block(SpeculativeSlot& slot) {
@@ -2674,6 +2786,9 @@ void TaskExecutionPipeline::release_outputs(SpeculativeSlot& slot) {
     invocation->sampled = SampleOutput();
     invocation->sampling.reset();
   }
+  if (slot.prefix_refresh) {
+    slot.prefix_refresh->output = ModelOutput();
+  }
   slot.host_validate_sampling = SamplingParameters();
   slot.block_gumbel = torch::Tensor();
 }
@@ -2694,6 +2809,9 @@ uint64_t TaskExecutionPipeline::speculative_pinned_bytes() const {
     }
     if (slot.adaptive) {
       bytes += slot.adaptive->host_feedback_storage.nbytes();
+    }
+    if (slot.prefix_refresh) {
+      bytes += slot.prefix_refresh->input->pinned_bytes();
     }
   }
   return bytes;
@@ -2723,6 +2841,10 @@ uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
            {&invocation->hidden_storage, &invocation->topk_storage}) {
         bytes += tensor->defined() ? tensor->nbytes() : 0;
       }
+    }
+    if (slot.prefix_refresh) {
+      bytes += slot.prefix_refresh->input->device_bytes() +
+               slot.prefix_refresh->hidden_storage.nbytes();
     }
     for (const auto* tensor : {&slot.context_slots_storage,
                                &slot.draft_block_indices,

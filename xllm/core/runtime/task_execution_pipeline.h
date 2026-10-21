@@ -93,6 +93,8 @@ struct SpeculativeTaskCapacity {
   uint32_t selector_top_k = 0;
   uint32_t index_topk = 0;
   bool reuse_topk = false;
+  // Restore committed draft KV from verifier hidden states before reuse.
+  bool refresh_target_prefix = false;
   DraftSamplingMode draft_sampling_mode = DraftSamplingMode::GREEDY;
   bool unified_graph = false;
   bool adaptive_dspark = false;
@@ -308,6 +310,8 @@ class TaskExecutionPipeline final {
   void apply_bootstrap(SpeculativeSlot& slot);
   void warmup_draft_graphs(const LlmForwardInput& input);
   void prepare_draft_state(SpeculativeSlot& slot, uint32_t step, bool warmup);
+  void prepare_prefix_refresh_state(SpeculativeSlot& slot, bool warmup);
+  void launch_prefix_refresh(SpeculativeSlot& slot);
   void prepare_empty_shard(SpeculativeSlot& slot, uint64_t batch_id);
   void launch_empty_shard(SpeculativeSlot& slot);
   void launch_prefill(SpeculativeSlot& slot);
