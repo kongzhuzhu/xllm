@@ -152,6 +152,7 @@ def _mtp_body() -> tuple[glm5_2_mtp.Glm52MtpModel, _DecoderLayer]:
     body.rot = nn.Identity()
     body.enorm = nn.Identity()
     body.hnorm = nn.Identity()
+    body.norm = nn.Identity()
     layer = _DecoderLayer()
     body.layers = nn.ModuleList([layer])
     body.rotary = deepseek_v32.DeepseekYarnRotaryEmbedding(
@@ -255,17 +256,35 @@ def test_mtp_load_rejects_missing_required_weights() -> None:
         draft.load_weights([], tp_rank=0, tp_size=1)
 
 
-def test_mtp_compute_logits_normalizes_without_changing_recurrent_hidden() -> None:
+def test_mtp_body_normalizes_recurrent_hidden_once_for_logits_and_recycle() -> None:
+    body, _ = _mtp_body()
+    body.norm = _ScaleNorm()
+
+    class PreviousHidden(nn.Module):
+        def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+            return hidden[:, 2:]
+
+    body.eh_proj = PreviousHidden()
     draft = glm5_2_mtp.Glm52MtpForCausalLM.__new__(glm5_2_mtp.Glm52MtpForCausalLM)
     nn.Module.__init__(draft)
-    draft.model = _NormBody()
+    draft.cfg = glm5_2_mtp.Glm52Config.from_dict(_config())
+    body.cfg = draft.cfg
+    draft.model = body
     draft.lm_head = nn.Identity()
-    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-
-    logits = draft.compute_logits(hidden, torch.tensor([1]))
-
-    assert torch.equal(logits, torch.tensor([[6.0, 8.0]]))
-    assert torch.equal(hidden, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    previous = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    with (
+        forward_context(ForwardContext(None, torch.device("cpu"), None, [], cp_context=None)),
+        patch.object(glm5_2_mtp, "record_layer_event"),
+        patch.object(body.norm, "forward", wraps=body.norm.forward) as norm,
+    ):
+        first, _, _ = body(torch.tensor([1, 2]), torch.tensor([5, 6]), previous)
+        second, _, _ = body(torch.tensor([3, 4]), torch.tensor([6, 7]), first)
+        logits = draft.compute_logits(second, torch.tensor([1]))
+        assert norm.call_count == 2
+    assert torch.equal(first, previous * 2)
+    assert torch.equal(second, previous * 4)
+    assert torch.equal(logits, torch.tensor([[12.0, 16.0]]))
+    assert torch.equal(previous, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
 
 
 @pytest.mark.parametrize(

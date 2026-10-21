@@ -97,14 +97,14 @@ class Glm52MtpModel(DeepseekV32MtpModel):
     def _recurrent_hidden(self, hidden: torch.Tensor, residual: torch.Tensor | None) -> torch.Tensor:
         return hidden if residual is None else hidden + residual
 
-    def _prepare_logits_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.norm(hidden)
-
     def _format_mtp_output(
         self, hidden: torch.Tensor, topk: torch.Tensor | None
     ) -> tuple[torch.Tensor, None, torch.Tensor | None]:
         if self.cfg.enable_attn_dp_weight_sharding:
             hidden = _attn_dp_owner_rows(hidden, self.cfg)
+        # Both recurrence and the vocabulary head consume post-norm hidden.
+        if hidden.shape[0] > 0:
+            hidden = self.norm(hidden)
         return hidden, None, topk if self.cfg.index_share_for_mtp_iteration else None
 
 
@@ -119,9 +119,7 @@ class Glm52MtpForCausalLM(Glm52ForCausalLM):
         return _compute_mtp_logits(self.model, self.lm_head, hidden, selected_idxes)
 
     def compute_greedy_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
-        normalized = self.model.norm(hidden)
-        assert isinstance(normalized, torch.Tensor)
-        return super().compute_greedy_tokens(normalized)
+        return super().compute_greedy_tokens(hidden)
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> None:
         _load_mtp_weights(self, super().load_weights, state_dicts, tp_rank, tp_size)

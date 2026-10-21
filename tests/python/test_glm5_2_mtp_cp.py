@@ -82,6 +82,7 @@ def _mtp_body() -> glm5_2_mtp.Glm52MtpModel:
     body.rot = nn.Identity()
     body.enorm = nn.Identity()
     body.hnorm = nn.Identity()
+    body.norm = nn.Identity()
     body.layers = nn.ModuleList([_RowDecoder()])
     body.rotary = deepseek_v32.DeepseekYarnRotaryEmbedding(
         4, 32, 1.0, 10000.0, 32, 1, 1.0, 1.0, dtype=torch.float32, device=torch.device("cpu")
