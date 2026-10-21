@@ -1343,11 +1343,13 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
         spec.kind != MtpInvocationKind::DRAFT
             ? spec.num_speculative_tokens + (spec.sample_from_anchor ? 0U : 1U)
             : (spec.draft_step == 0 ? 2U : 1U);
+    // Draft positions follow target hidden states, one token behind target.
     view.first_offset_ =
         spec.kind != MtpInvocationKind::DRAFT
             ? 0
-            : (spec.draft_step == 0 ? -1
-                                    : static_cast<int32_t>(spec.draft_step));
+            : (spec.draft_step == 0
+                   ? -2
+                   : static_cast<int32_t>(spec.draft_step) - 1);
     const uint64_t rows = static_cast<uint64_t>(spec.model.max_sequences) *
                           view.rows_per_sequence_;
     if (rows > std::numeric_limits<int32_t>::max()) {
@@ -1469,23 +1471,26 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
   const int64_t capacity_positions =
       static_cast<int64_t>(base.block_table_width) *
       view.spec_.logical_block_size;
+  const bool first_draft =
+      view.spec_.kind == MtpInvocationKind::DRAFT && view.spec_.draft_step == 0;
   for (uint64_t row = 0; row < count; ++row) {
-    const int64_t first_position =
-        static_cast<int64_t>(base.positions[row]) + view.first_offset_;
+    const int64_t first_position = std::max<int64_t>(
+        first_draft ? 0 : -1,
+        static_cast<int64_t>(base.positions[row]) + view.first_offset_);
     const int64_t last_position =
         static_cast<int64_t>(base.positions[row]) + max_offset;
-    const int64_t first_kv_length =
-        static_cast<int64_t>(base.kv_seq_lens[row]) + view.first_offset_;
+    const int64_t first_kv_length = std::max<int64_t>(
+        first_draft ? 1 : 0,
+        static_cast<int64_t>(base.kv_seq_lens[row]) + view.first_offset_);
     const int64_t last_kv_length =
         static_cast<int64_t>(base.kv_seq_lens[row]) + max_offset;
-    const int64_t repair_position =
-        static_cast<int64_t>(base.positions[row]) + 1;
-    if (first_position < 0 || first_kv_length <= 0 ||
-        last_position >= capacity_positions ||
+    const int64_t repair_position = base.positions[row];
+    if (first_position < 0 || first_kv_length <= 0 || last_position < 0 ||
+        last_position >= capacity_positions || last_kv_length <= 0 ||
         last_kv_length > capacity_positions ||
         last_position > std::numeric_limits<int32_t>::max() ||
         last_kv_length > std::numeric_limits<int32_t>::max() ||
-        (view.first_offset_ == -1 &&
+        (first_draft &&
          (repair_position >= capacity_positions ||
           repair_position > std::numeric_limits<int32_t>::max()))) {
       return invalid(
@@ -1521,13 +1526,15 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
                                         MtpInvocationKind::BLOCK_DRAFT
                                     ? view.spec_.mask_token_id
                                     : 0);
-      view.positions_.emplace_back(base.positions[row] + offset);
+      view.positions_.emplace_back(
+          std::max<int32_t>(base.positions[row] + offset, 0));
       view.slots_.emplace_back(0);
       if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
         continue;
       }
       view.q_lengths_.emplace_back(1);
-      view.kv_lengths_.emplace_back(base.kv_seq_lens[row] + offset);
+      view.kv_lengths_.emplace_back(
+          std::max<int32_t>(base.kv_seq_lens[row] + offset, 1));
       view.query_ends_.emplace_back(static_cast<int32_t>(view.tokens_.size()));
       view.block_tables_.insert(
           view.block_tables_.end(), blocks.begin(), blocks.end());
@@ -1770,9 +1777,18 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
                    state.kv_seq_lens.unsqueeze(/*dim=*/1),
                    view.offsets_);
   }
+  const bool first_draft =
+      view.spec_.kind == MtpInvocationKind::DRAFT && view.spec_.draft_step == 0;
+  if (first_draft) {
+    // A one-token prompt has no predecessor; keep its unused repair row valid.
+    view.positions_view_.clamp_min_(0);
+    view.kv_lengths_view_.clamp_min_(1);
+  }
   view.cache_positions_.copy_(view.positions_view_);
-  if (view.first_offset_ == -1) {
-    view.future_positions_.copy_(state.positions).add_(/*other=*/1);
+  if (first_draft) {
+    // MTP consumes token t with target hidden t-1, matching shifted prefill.
+    // Its current cache row is t-1; redirect unused repair writes to t.
+    view.future_positions_.copy_(state.positions);
     torch::where_out(view.cache_first_column_,
                      state.repair_required,
                      view.model_first_column_,
@@ -1780,7 +1796,7 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
     view.tokens_view_.select(/*dim=*/1, /*index=*/0)
         .copy_(state.previous_tokens);
     view.tokens_view_.select(/*dim=*/1, /*index=*/1).copy_(binding.tokens_);
-  } else if (view.first_offset_ == 0) {
+  } else if (view.spec_.kind != MtpInvocationKind::DRAFT) {
     view.tokens_view_.select(/*dim=*/1, /*index=*/0).copy_(binding.tokens_);
   }
   // Each expanded row owns its duplicated block table. Indices and outputs

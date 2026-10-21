@@ -1459,10 +1459,11 @@ TEST_F(SpeculativePipelineTest, DcpMtpKeepsLogicalPagesAcrossPendingSlots) {
   EXPECT_TRUE(torch::equal(target_->forward_slots[2].cpu(),
                            torch::tensor({18, 19, 20}, torch::kInt32)));
   ASSERT_EQ(draft_->forward_slots.size(), 5U);
+  // Draft pairs use the target-hidden position, one before target decode.
   EXPECT_TRUE(torch::equal(draft_->forward_slots[1].cpu(),
-                           torch::tensor({16, 63}, torch::kInt32)));
+                           torch::tensor({63, 62}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(draft_->forward_slots[3].cpu(),
-                           torch::tensor({17, 18}, torch::kInt32)));
+                           torch::tensor({16, 17}, torch::kInt32)));
 
   const auto reused = execute(dcp_input(true, /*token=*/-1, /*position=*/19));
   ASSERT_TRUE(reused.sample_output.next_tokens.defined());

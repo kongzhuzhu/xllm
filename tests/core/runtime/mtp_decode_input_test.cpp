@@ -373,15 +373,15 @@ TEST_F(MtpDecodeInputTest, FirstDraftRepairsOnlyFullAcceptance) {
   EXPECT_TRUE(torch::equal(model.tokens().cpu(),
                            torch::tensor({41, 42, 51, 52}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(model.positions().cpu(),
-                           torch::tensor({6, 7, 14, 15}, torch::kInt32)));
+                           torch::tensor({5, 6, 13, 14}, torch::kInt32)));
   EXPECT_TRUE(
       torch::equal(model.model_params().attention.device.kv_seq_lens.cpu(),
-                   torch::tensor({7, 8, 15, 16}, torch::kInt32)));
+                   torch::tensor({6, 7, 14, 15}, torch::kInt32)));
   EXPECT_TRUE(
       torch::equal(model.model_params().attention.device.new_cache_slots.cpu(),
-                   torch::tensor({22, 23, 64, 63}, torch::kInt32)));
+                   torch::tensor({21, 22, 63, 62}, torch::kInt32)));
   EXPECT_EQ(model.model_params().attention.host.kv_seq_lens,
-            std::vector<int32_t>({10, 11, 18, 19}));
+            std::vector<int32_t>({9, 10, 17, 18}));
   EXPECT_TRUE(torch::equal(
       model.model_params().attention.device.block_tables.cpu(),
       torch::tensor({{2, 3, 4, 5}, {2, 3, 4, 5}, {6, 7, 8, 9}, {6, 7, 8, 9}},
@@ -703,12 +703,41 @@ TEST_F(MtpDecodeInputTest, LaterDraftLeavesSampledTokenToItsProducer) {
   EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*binding).rows_per_sequence_,
             1U);
   EXPECT_TRUE(torch::equal(model.positions().cpu(),
-                           torch::tensor({9, 17}, torch::kInt32)));
+                           torch::tensor({8, 16}, torch::kInt32)));
   EXPECT_TRUE(
       torch::equal(model.model_params().attention.device.new_cache_slots.cpu(),
-                   torch::tensor({25, 65}, torch::kInt32)));
+                   torch::tensor({24, 64}, torch::kInt32)));
   EXPECT_TRUE(
       torch::equal(model.tokens().cpu(), torch::zeros({2}, torch::kInt32)));
+}
+
+TEST_F(MtpDecodeInputTest, OneTokenPromptKeepsUnusedRepairOutsideValidKv) {
+  spec_.model.max_sequences = 4;
+  positions_ = {1, 1};
+  kv_lengths_ = {2, 2};
+  state_->state_.positions.fill_(1);
+  state_->state_.kv_seq_lens.fill_(2);
+  state_->state_.repair_required.zero_();
+  ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+  for (const uint32_t padded_batch_size : {0U, 8U}) {
+    SCOPED_TRACE(padded_batch_size);
+    std::unique_ptr<SlotBuffer> binding;
+    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                    spec_, torch::kBFloat16, device_, binding)
+                    .ok());
+    run(*binding, padded_batch_size);
+    EXPECT_TRUE(torch::equal(
+        binding->positions().cpu().narrow(/*dim=*/0, /*start=*/0, 4),
+        torch::zeros({4}, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(
+        binding->model_params().attention.device.kv_seq_lens.cpu().narrow(
+            /*dim=*/0, /*start=*/0, 4),
+        torch::ones({4}, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(
+        binding->model_params().attention.device.new_cache_slots.cpu().narrow(
+            /*dim=*/0, /*start=*/0, 4),
+        torch::tensor({17, 16, 49, 48}, torch::kInt32)));
+  }
 }
 
 TEST_F(MtpDecodeInputTest, DcpFirstDraftRepairsAcrossLogicalPages) {
@@ -719,8 +748,8 @@ TEST_F(MtpDecodeInputTest, DcpFirstDraftRepairsAcrossLogicalPages) {
   blocks_ = {3, 1, 2, 0, 2, 0, 3, 1};
   positions_ = {19, 18};
   kv_lengths_ = {20, 19};
-  state_->state_.positions.copy_(torch::tensor({16, 15}, torch::kInt32));
-  state_->state_.kv_seq_lens.copy_(torch::tensor({17, 16}, torch::kInt32));
+  state_->state_.positions.copy_(torch::tensor({17, 16}, torch::kInt32));
+  state_->state_.kv_seq_lens.copy_(torch::tensor({18, 17}, torch::kInt32));
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
 
   for (const uint32_t padded_batch_size : {0U, 8U}) {
@@ -790,7 +819,7 @@ TEST_F(MtpDecodeInputTest, DcpValidateAndLaterDraftUseLogicalPageOffsets) {
     const auto slots =
         binding->model_params().attention.device.new_cache_slots.cpu();
     EXPECT_TRUE(torch::equal(slots.narrow(/*dim=*/0, /*start=*/0, 2),
-                             torch::tensor({18, 1}, torch::kInt32)));
+                             torch::tensor({17, 0}, torch::kInt32)));
     EXPECT_TRUE(torch::equal(
         slots.slice(/*dim=*/0, /*start=*/2),
         torch::full({padded_batch_size == 0 ? 0 : 2}, -1, torch::kInt32)));
@@ -834,8 +863,8 @@ TEST_F(MtpDecodeInputTest, DraftGraphPaddingSurvivesStatePatching) {
             /*dim=*/0, logical_rows),
         torch::full({padded_batch_size - logical_rows}, -1, torch::kInt32)));
     const auto expected_positions =
-        step == 0 ? torch::tensor({6, 7, 14, 15}, torch::kInt32)
-                  : torch::tensor({9, 17}, torch::kInt32);
+        step == 0 ? torch::tensor({5, 6, 13, 14}, torch::kInt32)
+                  : torch::tensor({8, 16}, torch::kInt32);
     EXPECT_TRUE(torch::equal(
         model.positions().cpu().narrow(/*dim=*/0, /*start=*/0, logical_rows),
         expected_positions));
@@ -859,7 +888,7 @@ TEST_F(MtpDecodeInputTest, InvalidPreparationPreservesPreviousInput) {
   const void* address = binding->positions().data_ptr();
   Stream prepare(device_);
   positions_[1] =
-      31;  // The inactive repair row still needs a reserved scratch position.
+      32;  // The inactive repair row still needs a reserved scratch position.
   EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_decode(
                    *binding, input(), batch_, prepare)
                    .ok());
